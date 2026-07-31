@@ -612,7 +612,7 @@ def _fetch_board_page(ticker: str, page: int) -> list[dict]:
 @st.cache_data(ttl=1800)
 def fetch_community_posts(ticker: str, count: int = 60) -> pd.DataFrame:
     all_posts: list[dict] = []
-    max_pages = 20
+    max_pages = min(30, count // 20 + 2)
     for page in range(1, max_pages + 1):
         posts = _fetch_board_page(ticker, page)
         if not posts:
@@ -646,7 +646,8 @@ def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
     거래량·관심도가 낮은 종목은 검색 결과가 적거나 없을 수 있다."""
     posts: list[dict] = []
     seen_no: set[str] = set()
-    for page in range(1, 21):
+    max_pages = min(30, count // 20 + 2)
+    for page in range(1, max_pages + 1):
         params = {"id": DC_GALLERY_ID, "s_type": "search_subject_memo", "s_keyword": keyword, "page": str(page)}
         try:
             resp = requests.get(DC_GALLERY_LIST_URL, params=params, headers=DC_HEADERS, timeout=10)
@@ -710,13 +711,23 @@ def extract_korean_word_freq(texts: list[str], min_len: int = 2) -> Counter:
     return Counter(t for t in tokens if t not in KOREAN_STOPWORDS)
 
 
+def _wordcloud_sentiment_color(word, font_size, position, orientation, random_state=None, **kwargs):
+    if any(kw in word for kw in POSITIVE_KEYWORDS):
+        return "green"
+    if any(kw in word for kw in NEGATIVE_KEYWORDS):
+        return "red"
+    return "gray"
+
+
 def render_wordcloud_image(word_freq: Counter, max_words: int = 80):
+    """단어 크기는 언급 빈도에 비례하고(WordCloud 기본 동작), 호재 키워드가 포함된 단어는 초록색,
+    악재 키워드가 포함된 단어는 빨간색, 나머지는 회색으로 칠한다."""
     font_path = _find_korean_font()
     if font_path is None or not word_freq:
         return None
     wc = WordCloud(
         font_path=font_path, width=900, height=450, background_color="white",
-        max_words=max_words, colormap="tab10",
+        max_words=max_words, color_func=_wordcloud_sentiment_color,
     ).generate_from_frequencies(word_freq)
     return wc.to_image()
 
@@ -1917,7 +1928,7 @@ with tabs[8]:
     community_summary = "커뮤니티 심리 데이터를 가져오지 못함"
 
     community_post_count = st.slider(
-        "게시글 조회 개수 (네이버·디시인사이드 공통)", min_value=20, max_value=300, value=DEFAULT_COMMUNITY_POST_COUNT, step=20,
+        "게시글 조회 개수 (네이버·디시인사이드 공통)", min_value=20, max_value=600, value=DEFAULT_COMMUNITY_POST_COUNT, step=20,
     )
 
     st.subheader("커뮤니티 심리 (네이버 종목토론방)")
@@ -1987,6 +1998,7 @@ with tabs[8]:
             wc_image = render_wordcloud_image(word_freq)
             if wc_image is not None:
                 st.markdown("**워드클라우드 (게시글 제목 기반)**")
+                st.caption("단어가 클수록 자주 언급된 것이고, 초록색은 호재 키워드, 빨간색은 악재 키워드가 포함된 단어입니다 (키워드 기반 단순 분류).")
                 st.image(wc_image, use_container_width=True)
             else:
                 st.caption("한글 폰트를 찾지 못해 워드클라우드를 표시할 수 없습니다 (서버에 한글 폰트 설치가 필요합니다).")
