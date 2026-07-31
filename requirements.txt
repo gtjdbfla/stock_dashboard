@@ -1,0 +1,9 @@
+streamlit>=1.38,<2.0
+requests>=2.31,<3.0
+pandas>=2.0,<3.0
+numpy>=1.26,<3.0
+plotly>=5.20,<6.0
+lxml>=5.0,<6.0
+beautifulsoup4>=4.12,<5.0
+google-genai>=2.0,<3.0
+scipy>=1.11,<2.0
