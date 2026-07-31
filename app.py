@@ -1,5 +1,7 @@
 import datetime as dt
 import os
+import re
+from collections import Counter
 from io import StringIO
 
 import numpy as np
@@ -11,6 +13,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from google import genai
 from plotly.subplots import make_subplots
+from wordcloud import WordCloud
 
 DEFAULT_TICKER = "000660"
 DEFAULT_STOCK_NAME = "SK하이닉스"
@@ -27,6 +30,26 @@ YAHOO_SYMBOLS = {
 DRAMEXCHANGE_URL = "https://www.dramexchange.com/"
 MEMORY_SEMICONDUCTOR_TICKERS = {"000660": "SK하이닉스", "005930": "삼성전자"}
 
+DC_GALLERY_ID = "krstock"
+DC_GALLERY_LIST_URL = "https://gall.dcinside.com/mgallery/board/lists/"
+DC_GALLERY_VIEW_URL = "https://gall.dcinside.com/mgallery/board/view/"
+DC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Referer": f"https://gall.dcinside.com/mgallery/board/lists/?id={DC_GALLERY_ID}",
+}
+KOREAN_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "C:/Windows/Fonts/malgun.ttf",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+]
+KOREAN_STOPWORDS = {
+    "그리고", "그런데", "그래서", "근데", "이거", "저거", "그거", "여기", "저기", "거기",
+    "진짜", "완전", "이제", "오늘", "내일", "어제", "우리", "너네", "자기", "이번", "저번",
+    "다음", "하고", "해서", "해도", "하지만", "그냥", "조금", "엄청", "너무", "정말",
+    "이런", "저런", "그런", "이렇게", "저렇게", "그렇게", "때문", "지금", "아니", "근대",
+    "뭐임", "뭐냐", "그럼", "이제는", "습니다", "합니다", "됩니다",
+}
+
 POSITIVE_KEYWORDS = [
     "상승", "오른다", "올랐", "급등", "떡상", "가즈아", "가보자", "존버", "매수",
     "저점매수", "반등", "호재", "강세", "상한가", "신고가", "돌파", "추매", "줍줍", "익절",
@@ -36,6 +59,8 @@ NEGATIVE_KEYWORDS = [
     "악재", "약세", "하한가", "신저가", "붕괴", "패닉", "팔아", "매도", "손실", "탈출",
     "폭락", "마이너스", "마이나스", "개미눈물",
 ]
+DEFAULT_LOOKBACK_DAYS = 30
+DEFAULT_COMMUNITY_POST_COUNT = 60
 DRAM_HISTORY_FILE = os.environ.get("DRAM_HISTORY_FILE", "data/dram_spot_history.csv")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -81,8 +106,6 @@ with st.sidebar:
     st.divider()
     st.header("설정")
     refresh_sec = st.slider("시세 갱신 주기(초)", min_value=5, max_value=120, value=5, step=5)
-    lookback_days = st.slider("수급 분석 기간(일)", min_value=10, max_value=180, value=30, step=10)
-    community_post_count = st.slider("커뮤니티 게시글 조회 개수", min_value=20, max_value=300, value=60, step=20)
 
 TICKER = st.session_state.ticker
 STOCK_NAME = st.session_state.stock_name
@@ -616,6 +639,125 @@ def classify_sentiment(posts_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=1800)
+def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
+    """디시인사이드 주식갤러리(krstock)에서 keyword가 제목/본문에 포함된 게시글을 검색한다.
+    krstock은 특정 종목 전용 갤러리가 아니라 국내 주식 전반을 다루는 갤러리라,
+    거래량·관심도가 낮은 종목은 검색 결과가 적거나 없을 수 있다."""
+    posts: list[dict] = []
+    seen_no: set[str] = set()
+    for page in range(1, 21):
+        params = {"id": DC_GALLERY_ID, "s_type": "search_subject_memo", "s_keyword": keyword, "page": str(page)}
+        try:
+            resp = requests.get(DC_GALLERY_LIST_URL, params=params, headers=DC_HEADERS, timeout=10)
+            resp.raise_for_status()
+        except requests.RequestException:
+            break
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", class_="gall_list")
+        if table is None:
+            break
+        rows = table.find("tbody").find_all("tr", class_="us-post")
+        if not rows:
+            break
+        for tr in rows:
+            title_td = tr.find("td", class_="gall_tit")
+            a = title_td.find("a") if title_td else None
+            if a is None:
+                continue
+            m = re.search(r"no=(\d+)", a.get("href", ""))
+            if not m:
+                continue
+            post_no = m.group(1)
+            if post_no in seen_no:
+                continue
+            seen_no.add(post_no)
+            date_td = tr.find("td", class_="gall_date")
+            date_text = (date_td.get("title") if date_td else None) or (date_td.get_text(strip=True) if date_td else "")
+            count_td = tr.find("td", class_="gall_count")
+            recommend_td = tr.find("td", class_="gall_recommend")
+            posts.append({
+                "제목": a.get_text(strip=True),
+                "번호": post_no,
+                "날짜": date_text,
+                "조회수": pd.to_numeric(count_td.get_text(strip=True), errors="coerce") if count_td else None,
+                "추천": pd.to_numeric(recommend_td.get_text(strip=True), errors="coerce") if recommend_td else None,
+                "url": f"{DC_GALLERY_VIEW_URL}?id={DC_GALLERY_ID}&no={post_no}",
+            })
+        if len(posts) >= count:
+            break
+    return pd.DataFrame(posts[:count])
+
+
+def _fetch_dc_post_content(post_no: str) -> str:
+    resp = requests.get(DC_GALLERY_VIEW_URL, params={"id": DC_GALLERY_ID, "no": post_no}, headers=DC_HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    content = soup.find("div", class_="write_div")
+    return content.get_text(" ", strip=True) if content else ""
+
+
+def _find_korean_font() -> str | None:
+    for path in KOREAN_FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def extract_korean_word_freq(texts: list[str], min_len: int = 2) -> Counter:
+    combined = re.sub(r"http\S+", " ", " ".join(texts))
+    tokens = re.findall(r"[가-힣]{%d,}" % min_len, combined)
+    return Counter(t for t in tokens if t not in KOREAN_STOPWORDS)
+
+
+def render_wordcloud_image(word_freq: Counter, max_words: int = 80):
+    font_path = _find_korean_font()
+    if font_path is None or not word_freq:
+        return None
+    wc = WordCloud(
+        font_path=font_path, width=900, height=450, background_color="white",
+        max_words=max_words, colormap="tab10",
+    ).generate_from_frequencies(word_freq)
+    return wc.to_image()
+
+
+def curate_good_dc_posts(posts_df: pd.DataFrame, stock_name: str, max_posts: int = 20) -> tuple[str, list[dict]]:
+    """게시글 본문을 가져와 감정적 비방·잡담이 아닌 근거 기반 분석글을 AI가 추려낸다."""
+    client = genai.Client()
+    subset = posts_df.head(max_posts)
+    items = []
+    for _, row in subset.iterrows():
+        try:
+            content = _fetch_dc_post_content(row["번호"])
+        except requests.RequestException:
+            content = ""
+        items.append(f"[글번호 {row['번호']}] 제목: {row['제목']}\n내용: {content[:400] if content else '(내용 없음)'}")
+    prompt = f"""다음은 디시인사이드 주식갤러리(krstock)에서 '{stock_name}' 관련 검색으로 찾은 게시글 목록입니다.
+이 갤러리는 욕설·비방·밈·단순 잡담 비중이 매우 높으니 그런 글은 반드시 제외하고,
+실제 데이터나 근거를 바탕으로 {stock_name}에 대한 분석이나 의견을 제시하는 게시글만 최대 5개 골라줘.
+
+{chr(10).join(f"{chr(10)}{item}" for item in items)}
+
+아래 형식을 정확히 지켜서, 한 줄에 하나씩 답변해줘 (다른 설명 없이):
+글번호|이유
+해당하는 게시글이 하나도 없으면 "없음" 한 단어만 답해줘."""
+    interaction = client.interactions.create(model=GEMINI_MODEL, input=prompt)
+    raw_text = interaction.output_text or ""
+
+    picks = []
+    for line in raw_text.strip().splitlines():
+        m = re.match(r"\s*(\d+)\s*\|\s*(.+)", line)
+        if not m:
+            continue
+        post_no, reason = m.group(1), m.group(2).strip()
+        match_row = subset[subset["번호"] == post_no]
+        if match_row.empty:
+            continue
+        row = match_row.iloc[0]
+        picks.append({"제목": row["제목"], "url": row["url"], "이유": reason})
+    return raw_text, picks
+
+
 def _parse_dram_table(soup: BeautifulSoup, tbody_id: str, item_filter: set[str] | None = None) -> pd.DataFrame:
     tbody = soup.find("tbody", id=tbody_id)
     if tbody is None:
@@ -875,9 +1017,10 @@ def _refresh_all_indicator_caches(progress_bar=None) -> None:
     fetch_dram_module_prices.clear()
     fetch_dram_chip_prices.clear()
     fetch_bigtech_capex.clear()
+    fetch_dc_gallery_posts.clear()
 
     steps = [
-        ("투자자별 순매수 이력", lambda: fetch_investor_netbuy(TICKER, lookback_days)),
+        ("투자자별 순매수 이력", lambda: fetch_investor_netbuy(TICKER, DEFAULT_LOOKBACK_DAYS)),
         ("종목 시세·수급 이력", lambda: fetch_backtest_history(TICKER, target_days=700)),
         ("최근 시세(오늘자)", lambda: fetch_latest_bars(TICKER)),
         ("코스피200 선물 외국인 이력", lambda: fetch_futures_foreign_history(target_days=700)),
@@ -887,6 +1030,7 @@ def _refresh_all_indicator_caches(progress_bar=None) -> None:
         ("DRAM 모듈 시세", lambda: fetch_dram_module_prices()),
         ("DRAM 칩 시세", lambda: fetch_dram_chip_prices()),
         ("빅테크 Capex", lambda: fetch_bigtech_capex()),
+        ("디시인사이드 주식갤러리", lambda: fetch_dc_gallery_posts(STOCK_NAME, DEFAULT_COMMUNITY_POST_COUNT)),
     ]
     for i, (label, fetch_fn) in enumerate(steps):
         if progress_bar is not None:
@@ -998,6 +1142,8 @@ tabs = st.tabs(tab_labels)
 with tabs[0]:
 
     investor_df = pd.DataFrame()
+
+    lookback_days = st.slider("수급 분석 기간(일)", min_value=10, max_value=180, value=DEFAULT_LOOKBACK_DAYS, step=10)
 
     st.subheader(f"최근 {lookback_days}일 투자자별 순매수 거래량")
     st.caption("개인 순매수는 기관·외국인 합산의 잔차로 추정한 값입니다 (기타법인 등 소액 오차 포함 가능).")
@@ -1682,77 +1828,97 @@ with tabs[7]:
         "백테스트나 예측 신호가 아니라 분기별 데이터 흐름을 보여드리는 것이 목적입니다. 분기 실적 발표 주기상 최대 며칠~몇 주 지연될 수 있습니다."
     )
     try:
-        capex_df = fetch_bigtech_capex()
-        if capex_df.empty:
+        capex_df_all = fetch_bigtech_capex()
+        if capex_df_all.empty:
             st.warning("Capex 데이터를 가져오지 못했습니다.")
         else:
-            capex_df = capex_df.copy()
-            capex_df["capex_B"] = capex_df["capex_USD"] / 1e9
+            capex_df_all = capex_df_all.copy()
+            capex_df_all["capex_B"] = capex_df_all["capex_USD"] / 1e9
 
-            fig_capex = px.bar(
-                capex_df, x="분기말", y="capex_B", color="기업", barmode="stack",
-                labels={"capex_B": "Capex (10억달러)", "분기말": "분기"},
-            )
-            totals = capex_df.groupby("분기말")["capex_B"].sum().reset_index().sort_values("분기말")
-            totals["qoq_pct"] = totals["capex_B"].pct_change() * 100
-            fig_capex.add_trace(
-                go.Scatter(x=totals["분기말"], y=totals["capex_B"], name="4개사 합계", mode="lines+markers", line=dict(color="black", dash="dot")),
-            )
-            fig_capex.add_trace(
-                go.Scatter(
-                    x=totals["분기말"], y=totals["qoq_pct"], name="4개사 합계 전분기 대비 증감률(%)",
-                    mode="lines+markers", line=dict(color="#d62728"), yaxis="y2",
-                ),
-            )
-            fig_capex.update_layout(
-                title="빅테크 4개사 분기별 Capex (누적 막대 + 합계 추세 + 전분기 대비 증감률)",
-                yaxis=dict(title="Capex (10억달러)"),
-                yaxis2=dict(title="전분기 대비 증감률(%)", overlaying="y", side="right", showgrid=False),
-            )
-            st.plotly_chart(fig_capex, use_container_width=True, key="chart_bigtech_capex")
+            company_list = list(BIGTECH_CIKS.keys())
+            selected_companies = [c for c in company_list if st.session_state.get(f"capex_company_{c}", True)]
 
-            company_count = capex_df.groupby("분기말")["기업"].nunique()
-            n_companies = capex_df["기업"].nunique()
-            complete_qs = sorted(company_count[company_count == n_companies].index)
-            incomplete_latest = capex_df["분기말"].max() not in complete_qs
-            if incomplete_latest:
-                missing = set(capex_df["기업"].unique()) - set(
-                    capex_df[capex_df["분기말"] == capex_df["분기말"].max()]["기업"]
+            if not selected_companies:
+                st.info("표시할 기업을 하나 이상 선택해주세요.")
+            else:
+                capex_df = capex_df_all[capex_df_all["기업"].isin(selected_companies)]
+
+                fig_capex = px.bar(
+                    capex_df, x="분기말", y="capex_B", color="기업", barmode="stack",
+                    labels={"capex_B": "Capex (10억달러)", "분기말": "분기"},
                 )
-                st.caption(f"⚠️ 최근 분기는 {', '.join(missing)}의 실적 발표 전이라 그래프의 마지막 막대는 아직 미완성입니다.")
+                totals = capex_df.groupby("분기말")["capex_B"].sum().reset_index().sort_values("분기말")
+                totals["qoq_pct"] = totals["capex_B"].pct_change() * 100
+                fig_capex.add_trace(
+                    go.Scatter(x=totals["분기말"], y=totals["capex_B"], name="합계", mode="lines+markers", line=dict(color="black", dash="dot")),
+                )
+                fig_capex.add_trace(
+                    go.Scatter(
+                        x=totals["분기말"], y=totals["qoq_pct"], name="증감률",
+                        mode="lines+markers", line=dict(color="#d62728"), yaxis="y2",
+                    ),
+                )
+                fig_capex.update_layout(
+                    title=dict(text="빅테크 분기별 Capex (누적 막대 + 합계 추세 + 증감률)", y=0.98, yanchor="top"),
+                    yaxis=dict(title="Capex (10억달러)"),
+                    yaxis2=dict(title="증감률(%)", overlaying="y", side="right", showgrid=False),
+                    legend=dict(title=dict(text=""), orientation="h", yanchor="bottom", y=1.1, xanchor="left", x=0),
+                    margin=dict(t=110),
+                )
+                st.plotly_chart(fig_capex, use_container_width=True, key="chart_bigtech_capex")
 
-            if complete_qs:
-                latest_q = complete_qs[-1]
-                latest_total = totals[totals["분기말"] == latest_q]["capex_B"].iloc[0]
-                if len(complete_qs) >= 5:
-                    yoy_q = complete_qs[-5]
-                    yoy_total = totals[totals["분기말"] == yoy_q]["capex_B"].iloc[0]
-                    yoy_change = (latest_total / yoy_total - 1) * 100
-                    st.info(
-                        f"가장 최근 4개사 실적이 모두 발표된 분기({latest_q.strftime('%Y-%m')}) 합계 capex: **${latest_total:,.0f}B** "
-                        f"(전년 동기 대비 {yoy_change:+.0f}%). 참고용 데이터이며 매매 신호가 아닙니다."
+                st.caption("표시 기업")
+                company_cols = st.columns(len(company_list))
+                for col, company in zip(company_cols, company_list):
+                    with col:
+                        st.checkbox(company, value=True, key=f"capex_company_{company}")
+
+                company_count = capex_df.groupby("분기말")["기업"].nunique()
+                n_companies = len(selected_companies)
+                complete_qs = sorted(company_count[company_count == n_companies].index)
+                incomplete_latest = capex_df["분기말"].max() not in complete_qs
+                if incomplete_latest:
+                    missing = set(selected_companies) - set(
+                        capex_df[capex_df["분기말"] == capex_df["분기말"].max()]["기업"]
                     )
-                else:
-                    st.info(f"가장 최근 4개사 실적이 모두 발표된 분기({latest_q.strftime('%Y-%m')}) 합계 capex: **${latest_total:,.0f}B** (참고용, 매매 신호 아님)")
+                    st.caption(f"⚠️ 최근 분기는 {', '.join(missing)}의 실적 발표 전이라 그래프의 마지막 막대는 아직 미완성입니다.")
 
-            with st.expander("분기별 상세 수치 보기"):
-                pivot = capex_df.pivot(index="분기말", columns="기업", values="capex_B").sort_index(ascending=False)
-                pivot["합계"] = pivot.sum(axis=1)
-                qoq_pivot = pivot.pct_change(periods=-1) * 100
-                pivot.index = pivot.index.strftime("%Y-%m")
-                qoq_pivot.index = qoq_pivot.index.strftime("%Y-%m")
+                if complete_qs:
+                    latest_q = complete_qs[-1]
+                    latest_total = totals[totals["분기말"] == latest_q]["capex_B"].iloc[0]
+                    if len(complete_qs) >= 5:
+                        yoy_q = complete_qs[-5]
+                        yoy_total = totals[totals["분기말"] == yoy_q]["capex_B"].iloc[0]
+                        yoy_change = (latest_total / yoy_total - 1) * 100
+                        st.info(
+                            f"가장 최근 선택 기업({n_companies}개사) 실적이 모두 발표된 분기({latest_q.strftime('%Y-%m')}) 합계 capex: **${latest_total:,.0f}B** "
+                            f"(전년 동기 대비 {yoy_change:+.0f}%). 참고용 데이터이며 매매 신호가 아닙니다."
+                        )
+                    else:
+                        st.info(f"가장 최근 선택 기업({n_companies}개사) 실적이 모두 발표된 분기({latest_q.strftime('%Y-%m')}) 합계 capex: **${latest_total:,.0f}B** (참고용, 매매 신호 아님)")
 
-                st.markdown("**Capex (10억달러)**")
-                st.dataframe(pivot.round(1), use_container_width=True)
+                with st.expander("분기별 상세 수치 보기"):
+                    pivot = capex_df.pivot(index="분기말", columns="기업", values="capex_B").sort_index(ascending=False)
+                    pivot["합계"] = pivot.sum(axis=1)
+                    qoq_pivot = pivot.pct_change(periods=-1) * 100
+                    pivot.index = pivot.index.strftime("%Y-%m")
+                    qoq_pivot.index = qoq_pivot.index.strftime("%Y-%m")
 
-                st.markdown("**전분기 대비 증감률(%)**")
-                st.dataframe(qoq_pivot.round(1), use_container_width=True)
+                    st.markdown("**Capex (10억달러)**")
+                    st.dataframe(pivot.round(1), use_container_width=True)
+
+                    st.markdown("**전분기 대비 증감률(%)**")
+                    st.dataframe(qoq_pivot.round(1), use_container_width=True)
     except Exception as e:
         st.error(f"빅테크 Capex 조회에 실패했습니다: {e}")
 
 with tabs[8]:
 
     community_summary = "커뮤니티 심리 데이터를 가져오지 못함"
+
+    community_post_count = st.slider(
+        "게시글 조회 개수 (네이버·디시인사이드 공통)", min_value=20, max_value=300, value=DEFAULT_COMMUNITY_POST_COUNT, step=20,
+    )
 
     st.subheader("커뮤니티 심리 (네이버 종목토론방)")
     st.caption(
@@ -1801,6 +1967,63 @@ with tabs[8]:
             )
     except Exception as e:
         st.error(f"커뮤니티 심리 분석에 실패했습니다: {e}")
+
+    st.divider()
+
+    st.subheader("디시인사이드 주식갤러리 (krstock)")
+    st.caption(
+        "특정 종목 전용 갤러리가 아니라 국내 주식 전반을 다루는 갤러리라, 거래량·관심도가 낮은 종목은 "
+        "검색 결과가 적거나 없을 수 있습니다. 제목·본문에 종목명이 포함된 게시글만 모았습니다. "
+        "여론일 뿐 사실이 아니며, 매매 신호로 쓰지 마세요."
+    )
+    try:
+        dc_posts_df = fetch_dc_gallery_posts(STOCK_NAME, community_post_count)
+        if dc_posts_df.empty:
+            st.warning(f"'{STOCK_NAME}' 관련 게시글을 찾지 못했습니다.")
+        else:
+            st.metric("검색된 게시글", f"{len(dc_posts_df)}건")
+
+            word_freq = extract_korean_word_freq(dc_posts_df["제목"].tolist())
+            wc_image = render_wordcloud_image(word_freq)
+            if wc_image is not None:
+                st.markdown("**워드클라우드 (게시글 제목 기반)**")
+                st.image(wc_image, use_container_width=True)
+            else:
+                st.caption("한글 폰트를 찾지 못해 워드클라우드를 표시할 수 없습니다 (서버에 한글 폰트 설치가 필요합니다).")
+
+            with st.expander(f"게시글 {len(dc_posts_df)}건 목록 보기"):
+                st.dataframe(
+                    dc_posts_df[["날짜", "제목", "조회수", "추천", "url"]].sort_values("날짜", ascending=False),
+                    use_container_width=True, hide_index=True,
+                    column_config={"url": st.column_config.LinkColumn("링크")},
+                )
+
+            st.markdown("**AI로 우수 분석글 찾기**")
+            st.caption(
+                "최근 게시글 중 최대 20개의 본문을 가져와 AI가 잡담·비방을 걸러내고 근거 있는 분석글만 추려줍니다. "
+                "시간이 다소 걸릴 수 있습니다."
+            )
+            if not os.environ.get("GEMINI_API_KEY"):
+                st.info("이 기능을 사용하려면 GEMINI_API_KEY 환경변수를 설정해주세요.")
+            else:
+                if st.button("우수 분석글 추리기", key="dc_curate_button"):
+                    with st.spinner("게시글 본문을 확인하고 분석글을 추리는 중..."):
+                        try:
+                            raw_text, picks = curate_good_dc_posts(dc_posts_df, STOCK_NAME)
+                            st.session_state["dc_curation_raw"] = raw_text
+                            st.session_state["dc_curation_picks"] = picks
+                        except Exception as e:
+                            st.error(f"AI 분석글 추리기에 실패했습니다: {e}")
+
+                if "dc_curation_picks" in st.session_state:
+                    picks = st.session_state["dc_curation_picks"]
+                    if picks:
+                        for i, pick in enumerate(picks, 1):
+                            st.markdown(f"{i}. [{pick['제목']}]({pick['url']}) — {pick['이유']}")
+                    else:
+                        st.info(st.session_state.get("dc_curation_raw", "").strip() or "조건에 맞는 분석글을 찾지 못했습니다.")
+    except Exception as e:
+        st.error(f"디시인사이드 주식갤러리 조회에 실패했습니다: {e}")
 
 with tabs[9]:
 
