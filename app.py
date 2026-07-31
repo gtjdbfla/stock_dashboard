@@ -65,7 +65,7 @@ DRAM_HISTORY_FILE = os.environ.get("DRAM_HISTORY_FILE", "data/dram_spot_history.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def fetch_stock_search(query: str) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(NAVER_SEARCH_URL, params={"q": query, "target": "stock"}, headers=headers, timeout=10)
@@ -113,7 +113,7 @@ STOCK_NAME = st.session_state.stock_name
 st.title(f"{STOCK_NAME}({TICKER}) 대시보드")
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=5, show_spinner="불러오는 중...")
 def fetch_current_price(ticker: str) -> dict:
     url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{ticker}"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
@@ -140,7 +140,7 @@ def _fetch_frgn_page(ticker: str, page: int) -> pd.DataFrame:
     return df[["날짜", "종가", "거래량", "기관", "외국인_순매매량"]].rename(columns={"외국인_순매매량": "외국인"})
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
     frames = []
@@ -177,7 +177,7 @@ def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
     return cum.rolling(window).apply(lambda w: calc_slope(pd.Series(w)), raw=False)
 
 
-@st.cache_data(ttl=24 * 3600)
+@st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_backtest_history(ticker: str, target_days: int = 500) -> pd.DataFrame:
     frames = []
     max_pages = 60
@@ -197,7 +197,7 @@ def fetch_backtest_history(ticker: str, target_days: int = 500) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner="불러오는 중...")
 def fetch_latest_bars(ticker: str) -> pd.DataFrame:
     """장중 계속 바뀌는 최근 1페이지(며칠치)만 짧은 캐시로 빠르게 가져온다."""
     page_df = _fetch_frgn_page(ticker, 1)
@@ -353,7 +353,7 @@ def run_overheat_threshold_strategy(
 FUTURES_DEAL_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
 
 
-@st.cache_data(ttl=24 * 3600)
+@st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_futures_foreign_history(target_days: int = 700) -> pd.DataFrame:
     """코스피200 선물 외국인 순매수(계약수) 일별 이력. 특정 종목이 아닌 시장 전체 지표라 티커와 무관하게 캐시된다."""
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
@@ -389,7 +389,7 @@ def fetch_futures_foreign_history(target_days: int = 700) -> pd.DataFrame:
     return out.reset_index(drop=True).rename(columns={"외국인": "선물외국인"})
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner="불러오는 중...")
 def fetch_latest_futures_bars() -> pd.DataFrame:
     """장중 계속 바뀌는 코스피200 선물 최근 며칠치만 짧은 캐시로 빠르게 가져온다."""
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
@@ -468,7 +468,7 @@ def run_futures_decline_backtest(
     return result
 
 
-@st.cache_data(ttl=24 * 3600)
+@st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_yahoo_history(label: str) -> pd.DataFrame:
     symbol = YAHOO_SYMBOLS[label]
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -556,7 +556,7 @@ def compute_composite(df: pd.DataFrame, signal_cols: list[str], results: dict[st
     return composite, weights
 
 
-@st.cache_data(ttl=6 * 3600)
+@st.cache_data(ttl=6 * 3600, show_spinner="불러오는 중...")
 def fetch_news_headlines(query: str, count: int = 6) -> list[str]:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(
@@ -568,7 +568,7 @@ def fetch_news_headlines(query: str, count: int = 6) -> list[str]:
     return headlines[:count]
 
 
-@st.cache_data(ttl=6 * 3600)
+@st.cache_data(ttl=6 * 3600, show_spinner="불러오는 중...")
 def fetch_analyst_reports(ticker: str, count: int = 5) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(
@@ -581,7 +581,7 @@ def fetch_analyst_reports(ticker: str, count: int = 5) -> pd.DataFrame:
     return df[["제목", "증권사", "작성일"]].head(count)
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner="불러오는 중...")
 def _fetch_board_page(ticker: str, page: int) -> list[dict]:
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
     resp = requests.get(
@@ -609,7 +609,7 @@ def _fetch_board_page(ticker: str, page: int) -> list[dict]:
     return posts
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner="불러오는 중...")
 def fetch_community_posts(ticker: str, count: int = 60) -> pd.DataFrame:
     all_posts: list[dict] = []
     max_pages = min(30, count // 20 + 2)
@@ -639,7 +639,7 @@ def classify_sentiment(posts_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner="불러오는 중...")
 def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
     """디시인사이드 주식갤러리(krstock)에서 keyword가 제목/본문에 포함된 게시글을 검색한다.
     krstock은 특정 종목 전용 갤러리가 아니라 국내 주식 전반을 다루는 갤러리라,
@@ -792,7 +792,7 @@ def _parse_dram_table(soup: BeautifulSoup, tbody_id: str, item_filter: set[str] 
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def fetch_dram_module_prices() -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(DRAMEXCHANGE_URL, headers=headers, timeout=15)
@@ -801,7 +801,7 @@ def fetch_dram_module_prices() -> pd.DataFrame:
     return _parse_dram_table(soup, "tb_ModuleSpotPrice")
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def fetch_dram_chip_prices() -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(DRAMEXCHANGE_URL, headers=headers, timeout=15)
@@ -900,7 +900,7 @@ def _fetch_company_standalone_capex_quarters(cik: str) -> list[dict]:
     return sorted(quarters, key=lambda q: q["end"])
 
 
-@st.cache_data(ttl=24 * 3600)
+@st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_bigtech_capex() -> pd.DataFrame:
     """빅테크(마이크로소프트/구글/아마존/메타)의 분기별 설비투자(capex) 실적을 SEC 공시(XBRL)에서 가져온다."""
     rows = []
@@ -919,7 +919,7 @@ def fetch_bigtech_capex() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def generate_ai_analysis(
     stock_label: str,
     time_label: str,
@@ -1058,7 +1058,7 @@ def _floor_to_hour(t: dt.datetime) -> dt.datetime:
     return t.replace(minute=0, second=0, microsecond=0)
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="불러오는 중...")
 def _get_global_refresh_state() -> dict:
     """세션마다 따로 있는 st.session_state와 달리, 서버 전체에서 공유되는 새로고침 상태.
     브라우저를 새로고침하거나 새 세션이 열려도 '진짜 마지막 데이터 갱신 시각'을 그대로 유지한다."""
