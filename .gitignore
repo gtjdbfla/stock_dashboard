@@ -5,3 +5,4 @@ data/
 .env
 _st_err*.log
 _st_out*.log
+.claude/

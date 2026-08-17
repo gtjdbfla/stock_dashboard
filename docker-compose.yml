@@ -2,6 +2,7 @@ services:
   hynix-dashboard:
     build: .
     container_name: hynix-dashboard
+    # 대시보드 자체는 집 안(LAN)에서만 열어둔다. 외부 공개는 caddy(비밀번호) + Tailscale Funnel이 담당한다.
     ports:
       - "8501:8501"
     restart: unless-stopped
@@ -9,3 +10,47 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+    # Streamlit이 살아 있는지 docker ps에서 바로 보이게 한다.
+    # 컨테이너가 Up인데 앱만 죽어 있으면 caddy가 502를 내는데, 그 원인을 찾느라 헤맨 적이 있다.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5).status==200 else 1)\""]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # 프리장/애프터장 시세 수집기.
+  # Streamlit은 브라우저가 접속해야만 스크립트를 실행해서, 대시보드 안에 넣으면
+  # 아무도 화면을 안 보는 아침 프리장(08:00~09:00)이 통째로 비어버린다.
+  # 별도 프로세스로 띄워 접속과 무관하게 상시 기록한다.
+  hynix-collector:
+    build: .
+    container_name: hynix-collector
+    command: ["python", "collector.py"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: hynix-caddy
+    restart: unless-stopped
+    # Tailscale Funnel이 이 포트(호스트 localhost:8080)로 넘겨준다.
+    # 127.0.0.1 에 묶어 LAN/인터넷에 직접 노출되지 않게 한다.
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./logs/caddy:/var/log/caddy
+    depends_on:
+      - hynix-dashboard
+
+volumes:
+  caddy_data:
+  caddy_config:
