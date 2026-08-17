@@ -1139,10 +1139,15 @@ def fetch_adr_quote() -> dict | None:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_adr_intraday() -> pd.DataFrame:
-    """SKHY의 하루치 1분봉을 프리장–애프터장 전 구간(04:00–20:00 ET) 가져온다.
+    """SKHY의 가장 최근 하루치 1분봉을 프리장–애프터장 전 구간(04:00–20:00 ET) 가져온다.
 
     미국 거래시간을 한국시간으로 바꾸면 17:00 – 익일 09:00(서머타임 기준)이라 자정을 넘는다.
     그래도 '하루 흐름'으로 이어 보는 게 목적이므로 그대로 시계열로 둔다.
+
+    range=1d로 받으면 안 되는 이유: 미국 애프터장이 끝나는 20:00 ET(한국 09:00)부터
+    다음 프리장이 열리는 04:00 ET(한국 17:00)까지 야후가 '오늘'을 아직 시작 안 한 날로 잡아
+    빈 응답을 준다. 그러면 한국 낮 시간 내내 ADR 그래프가 통째로 사라진다.
+    2일치를 받아서 데이터가 있는 마지막 미국 거래일만 잘라 쓴다.
     """
     empty = pd.DataFrame({"시각": pd.Series(dtype="datetime64[ns]"),
                           "가격": pd.Series(dtype="float64"),
@@ -1150,7 +1155,7 @@ def fetch_adr_intraday() -> pd.DataFrame:
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ADR_SYMBOL}",
                          headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-                         params={"range": "1d", "interval": "1m", "includePrePost": "true"})
+                         params={"range": "2d", "interval": "1m", "includePrePost": "true"})
         r.raise_for_status()
         res = r.json()["chart"]["result"][0]
         stamps = res.get("timestamp") or []
@@ -1160,7 +1165,8 @@ def fetch_adr_intraday() -> pd.DataFrame:
         for t, c in zip(stamps, closes):
             if c is None:
                 continue
-            et = dt.datetime.fromtimestamp(t, et_tz).time()
+            et_dt = dt.datetime.fromtimestamp(t, et_tz)
+            et = et_dt.time()
             # 본주 그래프와 같은 규칙으로 칠하기 위해 세션을 나눠둔다
             if et < dt.time(9, 30):
                 session = "프리장"
@@ -1171,10 +1177,14 @@ def fetch_adr_intraday() -> pd.DataFrame:
             rows.append({
                 "시각": dt.datetime.fromtimestamp(t, om.KST).replace(tzinfo=None),
                 "가격": float(c), "세션": session,
+                # 프리장 04:00 ~ 애프터장 20:00은 모두 같은 미국 날짜라 이 값으로 하루가 갈린다
+                "_거래일": et_dt.date(),
             })
         if not rows:
             return empty
-        return pd.DataFrame(rows).sort_values("시각").reset_index(drop=True)
+        df = pd.DataFrame(rows).sort_values("시각")
+        df = df[df["_거래일"] == df["_거래일"].max()]
+        return df.drop(columns="_거래일").reset_index(drop=True)
     except Exception:
         return empty
 
@@ -2103,37 +2113,51 @@ def render_current_price():
 
         try:
             intraday_df = fetch_intraday_price(TICKER)
+            today_kst = dt.datetime.now(om.KST).date()
+
+            # 본주 파트와 ADR 파트를 한 그림에 쌓고, 마지막에 버튼으로 묶는다.
+            # 예전에는 분봉이 있을 때만 ADR을 붙여서, 분봉이 아직 없는 아침(프리장)에는
+            # ADR 그래프가 통째로 사라졌다. 이제 어느 한쪽만 있어도 그 쪽을 보여준다.
+            fig_intraday = go.Figure()
+            host_traces = 0
+            host_shapes: list[dict] = []
+            host_title = None
+            x_start = x_end = None
+            has_over = False
+            help_lines: list[str] = []
+
             # 프리장(08:00–09:00)에는 당일 분봉이 아직 없어 intraday_df가 비어 있다.
             # 이때는 정규장 선 없이 시간외 기록만으로 그린다.
-            today_kst = dt.datetime.now(om.KST).date()
             if intraday_df.empty:
                 over_only = load_over_market_ticks(TICKER, today_kst - dt.timedelta(days=1))
                 over_only = over_only[over_only["시각"].dt.date == today_kst]
                 if not over_only.empty:
-                    fig_pre = go.Figure()
-                    fig_pre.add_trace(go.Scatter(
+                    fig_intraday.add_trace(go.Scatter(
                         x=over_only["시각"], y=over_only["가격"],
                         # 개장 직후엔 점이 1–2개뿐이라 선만으로는 아무것도 안 보인다.
                         # 이 화면(프리장 단독)에서만 마커를 같이 찍어 초반에도 보이게 한다.
                         mode="lines+markers", line=dict(color="#7f7f7f"),
                         marker=dict(size=4), name="프리장",
+                        hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>프리장</extra>",
                     ))
-                    # 정규장이 아직 안 열렸으므로 기준선은 '직전 정규장 종가'
-                    fig_pre.add_hline(y=close_price, line_dash="dash", line_color="gray", opacity=0.6)
-                    _style_chart_mobile(fig_pre, title=f"프리장 주가 추이 ({today_kst})", show_legend=False)
-                    fig_pre.update_xaxes(
-                        range=[dt.datetime.combine(today_kst, dt.time(8, 0)),
-                               dt.datetime.combine(today_kst, dt.time(9, 0))],
-                        tickformat="%H:%M",
-                    )
-                    fig_pre.update_yaxes(title_text="현재가(원)")
-                    st.plotly_chart(fig_pre, width="stretch", key="chart_intraday_price",
-                                    config={"displayModeBar": False})
-                    st.caption(
+                    host_traces = 1
+                    x_start = dt.datetime.combine(today_kst, dt.time(8, 0))
+                    x_end = dt.datetime.combine(today_kst, dt.time(9, 0))
+                    # 정규장이 아직 안 열렸으므로 기준선은 '직전 정규장 종가'.
+                    # add_hline(도형)이 아니라 트레이스로 그려야 ADR로 전환할 때 같이 숨는다.
+                    fig_intraday.add_trace(go.Scatter(
+                        x=[x_start, x_end], y=[close_price, close_price], mode="lines",
+                        line=dict(color="gray", dash="dash", width=1), opacity=0.6,
+                        name="직전 종가", hoverinfo="skip", showlegend=False,
+                    ))
+                    host_traces += 1
+                    host_title = f"프리장 ({today_kst})"
+                    has_over = True
+                    help_lines.append(
                         f"점선은 직전 정규장 종가({close_price:,}원) 기준선입니다. "
                         "09:00에 정규장이 열리면 본장 그래프에 이어붙습니다."
                     )
-            elif not intraday_df.empty:
+            else:
                 trade_date = intraday_df["시각"].iloc[-1].date()
                 x_start = dt.datetime.combine(trade_date, dt.time(9, 0))
                 x_end = dt.datetime.combine(trade_date, dt.time(15, 30))
@@ -2162,7 +2186,6 @@ def render_current_price():
                     # 전 거래일 정규장 + 어젯밤 애프터장 + 오늘 아침 프리장을 한 흐름으로 보여준다
                     x_end = max(x_end, pre_ticks["시각"].max().to_pydatetime())
 
-                fig_intraday = go.Figure()
                 # --- 본주 트레이스 (기본 표시) ---
                 fig_intraday.add_trace(go.Scatter(
                     x=intraday_df["시각"], y=intraday_df["현재가"],
@@ -2189,11 +2212,40 @@ def render_current_price():
                 ))
                 host_traces += 1
 
-                # --- ADR(SKHY) 트레이스: 미국 프리장–애프터장 전 구간 ---
-                adr_df = fetch_adr_intraday() if TICKER == ADR_HOST_TICKER else pd.DataFrame()
-                adr_quote = fetch_adr_quote() if not adr_df.empty else None
-                adr_shapes = []
-                if not adr_df.empty:
+                title_date = f"{trade_date}" if chart_date == trade_date else f"{trade_date} – {chart_date}"
+                # 큰 제목은 그래프 위 Streamlit 헤더가 맡고, 그래프 안 제목은 '지금 무엇을 보는지'만 표시한다
+                host_title = f"본주 ({title_date})"
+
+                # 정규장 시작·종료 세로선. 본주 볼 때만 필요하므로 버튼에서 같이 켜고 끈다.
+                if has_over:
+                    for boundary in (dt.datetime.combine(trade_date, dt.time(9, 0)),
+                                     dt.datetime.combine(trade_date, dt.time(15, 30))):
+                        host_shapes.append(dict(
+                            type="line", x0=boundary, x1=boundary, yref="paper", y0=0, y1=1,
+                            line=dict(color="gray", dash="dot", width=1), opacity=0.35,
+                        ))
+                    help_lines.append(
+                        "회색 선이 프리장(08:00부터)·애프터장(20:00까지) 구간이고, "
+                        "세로 점선은 정규장 시작·종료 시각입니다.\n\n"
+                        "네이버가 시간외 분봉을 제공하지 않아, 서버가 20초마다 직접 기록한 값입니다. "
+                        "서버가 꺼져 있던 시간대는 비어 있습니다."
+                    )
+                else:
+                    help_lines.append(
+                        "점선은 전일 종가 기준선입니다. "
+                        "장 마감 후에는 마지막 거래일의 09:00–15:30 데이터가 표시됩니다."
+                    )
+
+            # --- ADR(SKHY) 트레이스: 미국 프리장–애프터장 전 구간 ---
+            # 본주 파트가 비어 있어도 붙인다. 한국 분봉이 없는 아침에도 ADR은 볼 수 있어야 한다.
+            host_available = host_traces > 0
+            adr_df = fetch_adr_intraday() if TICKER == ADR_HOST_TICKER else pd.DataFrame()
+            adr_quote = fetch_adr_quote() if not adr_df.empty else None
+            adr_shapes: list[dict] = []
+            adr_start = adr_end = adr_day = None
+            if not adr_df.empty:
+                    # 본주가 아직 없으면 ADR을 기본 화면으로 띄운다
+                    adr_visible = not host_available
                     # 본주 그래프와 같은 색 규칙: 정규장 빨강, 프리장·애프터장 회색.
                     # 구간이 끊겨 보이지 않게, 이어지는 지점 한 점씩 겹쳐서 선을 붙인다.
                     for label, color in (("프리장", "#7f7f7f"), ("정규장", "#d62728"), ("애프터장", "#7f7f7f")):
@@ -2206,7 +2258,7 @@ def render_current_price():
                         seg = adr_df.iloc[lo:hi] if label != "프리장" else adr_df.iloc[idx.min():hi]
                         fig_intraday.add_trace(go.Scatter(
                             x=seg["시각"], y=seg["가격"], mode="lines",
-                            line=dict(color=color), name=f"{label}(ADR)", visible=False,
+                            line=dict(color=color), name=f"{label}(ADR)", visible=adr_visible,
                             hovertemplate="%{x|%H:%M}  $%{y:,.2f}<extra>" + label + "</extra>",
                         ))
                     adr_prev = (adr_quote or {}).get("prev_close")
@@ -2214,7 +2266,7 @@ def render_current_price():
                         fig_intraday.add_trace(go.Scatter(
                             x=[adr_df["시각"].min(), adr_df["시각"].max()], y=[adr_prev, adr_prev],
                             mode="lines", line=dict(color="gray", dash="dash", width=1), opacity=0.6,
-                            name="전일 종가(ADR)", hoverinfo="skip", showlegend=False, visible=False,
+                            name="전일 종가(ADR)", hoverinfo="skip", showlegend=False, visible=adr_visible,
                         ))
                     # 미국 정규장 시작·종료(한국시간)에도 본주와 똑같이 세로 점선을 넣는다
                     reg = adr_df[adr_df["세션"] == "정규장"]
@@ -2224,34 +2276,35 @@ def render_current_price():
                                 type="line", x0=boundary, x1=boundary, yref="paper", y0=0, y1=1,
                                 line=dict(color="gray", dash="dot", width=1), opacity=0.35,
                             ))
-
-                title_date = f"{trade_date}" if chart_date == trade_date else f"{trade_date} – {chart_date}"
-                # 큰 제목은 그래프 위 Streamlit 헤더가 맡고, 그래프 안 제목은 '지금 무엇을 보는지'만 표시한다
-                host_title = f"본주 ({title_date})"
-                # ADR 화면은 정규장(빨강)/시간외(회색)를 색으로 구분하므로 범례가 있어야 읽힌다
-                _style_chart_mobile(fig_intraday, title=host_title,
-                                    show_legend=has_over or not adr_df.empty)
-                fig_intraday.update_xaxes(range=[x_start, x_end], tickformat="%H:%M")
-                fig_intraday.update_yaxes(title_text="현재가(원)")
-
-                # 정규장 시작·종료 세로선. 본주 볼 때만 필요하므로 버튼에서 같이 켜고 끈다.
-                host_shapes = []
-                if has_over:
-                    for boundary in (dt.datetime.combine(trade_date, dt.time(9, 0)),
-                                     dt.datetime.combine(trade_date, dt.time(15, 30))):
-                        host_shapes.append(dict(
-                            type="line", x0=boundary, x1=boundary, yref="paper", y0=0, y1=1,
-                            line=dict(color="gray", dash="dot", width=1), opacity=0.35,
-                        ))
-                fig_intraday.update_layout(shapes=host_shapes)
-
-                if not adr_df.empty:
-                    total = len(fig_intraday.data)
-                    host_vis = [i < host_traces for i in range(total)]
-                    adr_vis = [i >= host_traces for i in range(total)]
                     adr_start = adr_df["시각"].min().to_pydatetime()
                     adr_end = adr_df["시각"].max().to_pydatetime()
                     adr_day = adr_df["시각"].max().date()
+
+            if not host_available and adr_df.empty:
+                # 한국 분봉도 시간외 기록도 ADR도 없는 시간대(휴장일 새벽 등).
+                # 예전에는 아무것도 그리지 않고 조용히 넘어가서, 그래프가 사라진 건지
+                # 원래 데이터가 없는 건지 구분이 안 됐다.
+                st.caption(":gray[장중 주가 추이: 아직 오늘 체결 기록이 없습니다.]")
+            else:
+                # 처음 보여줄 쪽. 본주가 있으면 본주, 없으면(아침 프리장 등) ADR.
+                if host_available:
+                    view_title, view_range = host_title, [x_start, x_end]
+                    view_ytitle, view_shapes = "현재가(원)", host_shapes
+                else:
+                    view_title, view_range = f"SKHY ({adr_day})", [adr_start, adr_end]
+                    view_ytitle, view_shapes = "SKHY($)", adr_shapes
+                # ADR 화면은 정규장(빨강)/시간외(회색)를 색으로 구분하므로 범례가 있어야 읽힌다
+                _style_chart_mobile(fig_intraday, title=view_title,
+                                    show_legend=has_over or not adr_df.empty)
+                fig_intraday.update_xaxes(range=view_range, tickformat="%H:%M")
+                fig_intraday.update_yaxes(title_text=view_ytitle)
+                fig_intraday.update_layout(shapes=view_shapes)
+
+                # 전환 버튼은 양쪽 다 있을 때만 의미가 있다
+                if host_available and not adr_df.empty:
+                    total = len(fig_intraday.data)
+                    host_vis = [i < host_traces for i in range(total)]
+                    adr_vis = [i >= host_traces for i in range(total)]
                     # updatemenus는 브라우저에서 바로 처리돼 Streamlit 재실행이 없다.
                     # 그래서 전환이 끊기지 않고 부드럽게 이어진다.
                     # 버튼은 제목과 같은 줄의 오른쪽 끝에 둔다.
@@ -2293,25 +2346,20 @@ def render_current_price():
                     )
 
                 # 긴 설명은 화면을 어지럽히므로 제목 옆 ? 버튼 안으로 넣는다
-                help_lines = []
-                if has_over:
-                    help_lines.append(
-                        "회색 선이 프리장(08:00부터)·애프터장(20:00까지) 구간이고, "
-                        "세로 점선은 정규장 시작·종료 시각입니다.\n\n"
-                        "네이버가 시간외 분봉을 제공하지 않아, 서버가 20초마다 직접 기록한 값입니다. "
-                        "서버가 꺼져 있던 시간대는 비어 있습니다."
-                    )
-                else:
-                    help_lines.append(
-                        "점선은 전일 종가 기준선입니다. "
-                        "장 마감 후에는 마지막 거래일의 09:00–15:30 데이터가 표시됩니다."
-                    )
+                # (본주 쪽 설명은 위에서 이미 help_lines에 담아뒀다)
                 if not adr_df.empty:
-                    help_lines.append(
-                        f"**ADR(SKHY) 버튼**을 누르면 나스닥 상장분의 하루치가 같은 자리에 나옵니다 "
-                        f"(프리장 04:00 – 애프터장 20:00 ET, 한국시간 {adr_start:%H:%M}–{adr_end:%H:%M}).\n\n"
-                        "ADR 화면도 본주와 같은 색 규칙입니다. 정규장은 빨간색, 프리장·애프터장은 회색."
-                    )
+                    if host_available:
+                        help_lines.append(
+                            f"**ADR(SKHY) 버튼**을 누르면 나스닥 상장분의 하루치가 같은 자리에 나옵니다 "
+                            f"(프리장 04:00 – 애프터장 20:00 ET, 한국시간 {adr_start:%H:%M}–{adr_end:%H:%M}).\n\n"
+                            "ADR 화면도 본주와 같은 색 규칙입니다. 정규장은 빨간색, 프리장·애프터장은 회색."
+                        )
+                    else:
+                        help_lines.append(
+                            f"한국 분봉이 아직 없어 나스닥 상장분(SKHY) {adr_day} 하루치를 먼저 보여줍니다 "
+                            f"(한국시간 {adr_start:%H:%M}–{adr_end:%H:%M}). 정규장은 빨간색, 프리장·애프터장은 회색입니다.\n\n"
+                            "오늘 국내 체결이 쌓이면 **본주 / ADR 전환 버튼**이 생깁니다."
+                        )
                 _bold_label_with_help("장중 주가 추이", "\n\n".join(help_lines), key="intraday")
                 st.plotly_chart(fig_intraday, width="stretch", key="chart_intraday_price", config={"displayModeBar": False})
         except Exception as exc:
