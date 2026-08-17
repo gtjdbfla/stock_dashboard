@@ -1,0 +1,7 @@
+# 배포는 리눅스 서버로 scp한 뒤 md5로 대조해서 확인한다.
+# 윈도우 작업트리에서 CRLF로 바뀌면 내용이 같은데도 md5가 달라져서, 배포가 잘못된 것처럼 보인다.
+# 어느 쪽에서 체크아웃하든 LF로 통일한다.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
