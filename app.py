@@ -849,6 +849,53 @@ def fetch_yahoo_history(label: str) -> pd.DataFrame:
     return df.dropna().reset_index(drop=True)
 
 
+# AI 분석에 넘길 거시경제 지표. YAHOO_SYMBOLS와 따로 두는 이유는, 그쪽에 넣으면
+# build_composite_dataset이 통합 신호용 데이터셋에 열을 같이 병합해버리기 때문이다.
+# (label, 야후 심볼, 변동을 %로 볼지 %p로 볼지)
+MACRO_SYMBOLS = [
+    ("필라델피아 반도체지수(SOX)", "%5ESOX", "pct"),
+    ("나스닥", "%5EIXIC", "pct"),
+    ("달러인덱스(DXY)", "DX-Y.NYB", "pct"),
+    ("원/달러 환율", "KRW=X", "pct"),
+    # 금리는 그 자체가 %라, 변동을 %가 아니라 %p로 봐야 말이 된다
+    ("미국 10년물 금리", "%5ETNX", "pp"),
+]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_macro_summary() -> str:
+    """반도체 업황을 좌우하는 거시 지표의 최근 움직임을 한 덩어리 텍스트로 만든다.
+
+    이 종목은 수출·달러·미국 반도체 수요에 크게 붙어 있는데, 지금까지 AI 분석에는
+    이런 매크로 정보가 아예 안 들어가서 '뉴스 요약'에 가까운 답이 나왔다.
+    1일/5일/20일 변화를 같이 주면 '오늘만의 일'과 '추세'를 구분해서 쓸 수 있다.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    lines = []
+    for label, symbol, kind in MACRO_SYMBOLS:
+        try:
+            r = requests.get(YAHOO_CHART_URL.format(symbol=symbol), headers=headers, timeout=15,
+                             params={"range": "3mo", "interval": "1d"})
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            closes = pd.Series(res["indicators"]["quote"][0]["close"]).dropna().reset_index(drop=True)
+            if len(closes) < 21:
+                continue
+            last = float(closes.iloc[-1])
+            parts = []
+            for days, name in ((1, "1일"), (5, "5일"), (20, "20일")):
+                past = float(closes.iloc[-1 - days])
+                if kind == "pp":
+                    parts.append(f"{name} {last - past:+.2f}%p")
+                else:
+                    parts.append(f"{name} {(last / past - 1) * 100:+.2f}%")
+            fmt = f"{last:,.2f}%" if kind == "pp" else f"{last:,.2f}"
+            lines.append(f"- {label}: {fmt} ({', '.join(parts)})")
+        except Exception:
+            lines.append(f"- {label}: (수집 실패)")
+    return "\n".join(lines) if lines else "(수집 실패)"
+
+
 def build_composite_dataset(ticker: str) -> pd.DataFrame:
     """무거운 하위 fetch들(기관/외국인 이력, SOX/DXY)은 각자 24시간 캐시되고 최근 며칠치만 1분 캐시로
     실시간 반영되므로, 이 함수 자체는 캐시하지 않고 매번 가볍게 재조립한다."""
@@ -1262,6 +1309,44 @@ def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
                 break
         items.append({"제목": title, "요약": summary})
     return items
+
+
+# 종목명만으로 뉴스를 뽑으면 '주가가 올랐다/내렸다'류 시황 기사만 모여서, AI가 원인을 짚지 못한다.
+# 업황·전방수요·매크로 쪽 질의를 같이 던져서 '왜'에 해당하는 재료를 확보한다.
+SECTOR_NEWS_QUERIES = [
+    "{name} HBM",
+    "메모리 반도체 업황",
+    "D램 가격",
+    "엔비디아 실적 AI 반도체",
+    "반도체 수출 실적",
+]
+
+
+@st.cache_data(ttl=1800, show_spinner="업종·매크로 뉴스 수집 중...")
+def fetch_sector_news(stock_name: str, per_query: int = 3) -> str:
+    """업종·전방수요·매크로 관련 뉴스를 질의별로 모아 하나의 마크다운으로 만든다.
+
+    구글 검색 grounding이 무료 요금제에서 막혀 있어(429), '검색으로 보강'은 실제로는
+    한 번도 동작한 적이 없다. 대신 네이버 뉴스에 질의를 여러 개 던져서 같은 목적
+    - 대시보드에 없는 바깥 소식을 채우는 것 - 을 실제로 달성한다.
+    """
+    blocks = []
+    seen_titles: set[str] = set()
+    for template in SECTOR_NEWS_QUERIES:
+        query = template.format(name=stock_name)
+        try:
+            items = fetch_news_with_summary(query, count=per_query)
+        except Exception:
+            continue
+        rows = []
+        for it in items:
+            if it["제목"] in seen_titles:      # 질의끼리 겹치는 기사는 한 번만
+                continue
+            seen_titles.add(it["제목"])
+            rows.append(f"- {it['제목']}" + (f"\n  요약: {it['요약']}" if it["요약"] else ""))
+        if rows:
+            blocks.append(f"[검색어: {query}]\n" + "\n".join(rows))
+    return "\n\n".join(blocks)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="불러오는 중...")
@@ -1831,6 +1916,9 @@ def generate_ai_analysis(
     snapshot_md: str = "",
     news_md: str = "",
     use_search: bool = False,
+    macro_md: str = "",
+    sector_news_md: str = "",
+    adr_md: str = "",
 ) -> tuple[str, str | None]:
     prompt = f"""오늘은 {time_label}입니다. 다음은 이 시점 기준 {stock_label} 관련 데이터입니다.
 
@@ -1864,8 +1952,17 @@ def generate_ai_analysis(
 [최근 애널리스트 리포트]
 {reports_md if reports_md else "(수집된 리포트 없음)"}
 
+[업종 · 전방수요 · 매크로 관련 뉴스]
+{sector_news_md if sector_news_md else "(수집 안 함)"}
+
 [해외 반도체 산업 리서치 뉴스 — TrendForce]
 {trendforce_md if trendforce_md else "(수집된 자료 없음)"}
+
+[거시경제 지표]
+{macro_md if macro_md else "(수집 실패)"}
+
+[해외 상장분(ADR) 괴리율]
+{adr_md if adr_md else "(해당 없음)"}
 
 [투자자 커뮤니티 심리 — 참고용, 사실 아님]
 {community_summary}
@@ -1880,10 +1977,28 @@ def generate_ai_analysis(
 이 종목만 튀었으면 개별 이슈다. 반드시 다른 종목 등락률 숫자를 인용해서 근거를 대줘.
 
 ## 강세 근거
-데이터에서 실제로 확인되는 것만. 각 항목에 근거가 된 숫자를 괄호로 붙여줘.
-
 ## 약세 근거 / 리스크
-같은 방식으로. 강세만 나열하지 말고 반대편도 반드시 찾아줘.
+
+이 두 항목이 이 분석의 핵심이다. 다음 규칙을 지켜라.
+
+1) 아래 다섯 갈래를 **모두** 훑어보고, 각 갈래에서 나온 근거를 빠짐없이 배치해라.
+   `[뉴스]`   종목 뉴스 + 업종·전방수요·매크로 뉴스
+   `[리포트]` 애널리스트 리포트
+   `[산업]`   TrendForce 산업 리서치 + DRAM 현물가
+   `[거시]`   거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 금리) + ADR 괴리율
+   `[대시보드]` 수급, 통합 신호, 가격 과열도, 선물 경보, 밸류에이션·컨센서스, 동일업종 등락률
+2) 각 항목은 **`[갈래] 내용 (근거 숫자·출처)`** 형식으로 써라.
+   말머리는 위 다섯 개(`[뉴스]` `[리포트]` `[산업]` `[거시]` `[대시보드]`)만 쓰고, 다른 이름을 지어내지 마라.
+   예: `[거시] SOX 20일 +6.37%로 반도체 업종 전반이 강세 (SOX 12,417.05)`
+3) 어느 갈래에서 쓸 만한 근거가 안 나오면 그 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음`이라고 한 줄로 적어라.
+   억지로 만들어내지 마라.
+4) 매크로 지표는 숫자만 옮기지 말고 **이 종목까지 어떻게 연결되는지** 한 마디로 붙여라
+   (예: 원화 약세면 수출 채산성에 유리, 금리 급등이면 성장주 밸류에이션에 부담).
+5) 강세만 길게 쓰고 약세를 형식적으로 채우지 마라. 양쪽을 같은 밀도로 써라.
+
+## 근거의 무게
+위 강세·약세 중 지금 더 무거운 쪽은 어디이고 왜인지 2–3문장.
+'확인된 실적·가격 데이터'가 '기대·심리'보다 무겁다는 기준으로 판단해라.
 
 ## 지금 위치
 현재가가 컨센서스 목표주가, 52주 고저, PER 대비 어디에 있는지 숫자로 정리해줘.
@@ -1897,19 +2012,24 @@ def generate_ai_analysis(
 - 위 데이터에 없는 사실은 지어내지 마. 모르면 "데이터에 없음"이라고 써.
 - 숫자를 인용할 때는 위 데이터의 값을 그대로 써.
 - "긍정적 흐름이 예상된다" 같은 하나 마나 한 문장은 쓰지 마.
-- 통합 신호·가격 과열도·선물 경보·커뮤니티 심리는 참고로만 가볍게. 핵심 근거로 삼지 마.
+- 통합 신호·가격 과열도·선물 경보는 과거 통계를 돌린 참고 지표다. 근거로 써도 되지만,
+  쓸 때는 "백테스트 기반 참고치" 같은 단서를 반드시 함께 붙여라. 단독 근거로 결론을 내지 마.
+- 커뮤니티 심리는 사실이 아니라 여론이다. 사실 근거와 같은 급으로 취급하지 마.
 - 매수/매도 추천이나 목표가 제시는 하지 마. 사실과 해석만.
-- 날짜를 쓸 때는 위 데이터에 있는 날짜만 써. 기억에 의존한 날짜는 쓰지 마."""
+- 날짜를 쓸 때는 위 데이터에 있는 날짜만 써. 기억에 의존한 날짜는 쓰지 마.
+- 같은 내용을 여러 갈래에 중복해서 적지 마. 한 근거는 가장 잘 맞는 갈래 한 곳에만."""
 
     note = None
-    if use_search:
-        # 구글 검색 grounding은 무료 요금제에서 막혀 있다(쿼터가 남은 모델에서도 즉시 429).
-        # 실패하면 조용히 검색 없이 다시 부르고 그 사실만 알린다.
+    # 구글 검색 grounding은 무료 요금제에서 막혀 있다(쿼터가 남은 모델로 시험해도 즉시 429).
+    # 그래서 '검색으로 보강'은 실제로 한 번도 동작한 적이 없고, 매번 실패 후 되돌아오느라
+    # 호출만 한 번 더 쓰고 있었다. 유료 키로 바꿀 때만 켜지도록 환경변수 뒤로 옮긴다.
+    # 바깥 소식은 fetch_sector_news()가 네이버 뉴스 다중 질의로 실제로 채워온다.
+    if use_search and os.environ.get("GEMINI_ENABLE_GROUNDING") == "1":
         try:
             text, used = _call_gemini(prompt, tools=[{"type": "google_search"}])
             return (text or "AI가 응답을 생성하지 못했습니다.", "search_ok")
         except Exception:
-            note = "구글 검색 보강은 무료 요금제에서 막혀 있어, 검색 없이 대시보드 데이터만으로 분석했습니다."
+            note = "구글 검색 grounding에 실패해, 수집된 뉴스만으로 분석했습니다."
 
     text, used = _call_gemini(prompt)
     if used != GEMINI_MODEL:
@@ -4090,9 +4210,12 @@ def _render_tab_community():
 def _render_tab_ai():
     _subheader_with_help(
         "AI 분석: 오늘의 주가 변동 요인",
-        "뉴스(제목+본문 요약)·애널리스트 리포트·TrendForce 산업 뉴스에 더해, 증권사 컨센서스 목표주가·투자의견, "
-        "PER·EPS·52주 고저, **동일업종 종목들의 오늘 등락률**, 최근 5일 투자자별 순매수와 외국인 보유율까지 "
-        "함께 넘겨서 분석하게 합니다.\n\n"
+        "강세 근거와 약세 근거를 다섯 갈래로 나눠서, 각 갈래를 빠짐없이 훑도록 시킵니다.\n\n"
+        "① 뉴스(종목 + 업종·전방수요·매크로) ② 애널리스트 리포트 "
+        "③ TrendForce 산업 리서치 + DRAM 현물가 ④ 거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 10년물 금리) "
+        "와 ADR 괴리율 ⑤ 대시보드 지표(수급·통합 신호·가격 과열도·선물 경보·컨센서스·동일업종 등락률)\n\n"
+        "각 근거에는 `[갈래] 내용 (근거 숫자)` 형태로 출처를 달게 하고, 매크로 숫자는 이 종목까지 "
+        "어떻게 연결되는지 설명하게 합니다. 마지막에 어느 쪽 근거가 더 무거운지도 짚습니다.\n\n"
         "동일업종 비교가 들어가면서 '오늘 움직임이 이 종목만의 이슈인지, 업종 전체가 같이 움직인 것인지'를 "
         "구분할 수 있게 됐습니다. 위쪽 지표는 AI를 돌리지 않아도 바로 보입니다.\n\n"
         "버튼을 누를 때만 실행됩니다(자동 갱신 없음). AI가 잘못 짚거나 지어낼 수 있으니, "
@@ -4133,10 +4256,11 @@ def _render_tab_ai():
         st.info("AI 분석을 사용하려면 GEMINI_API_KEY 환경변수를 설정해주세요.")
     else:
         use_search = st.toggle(
-            "구글 검색으로 최신 정보 보강",
-            key="ai_use_search",
-            help="AI가 직접 웹을 검색해 대시보드에 없는 최신 소식까지 반영합니다. "
-                 "Gemini 유료 요금제에서만 동작하며, 무료 키에서는 자동으로 검색 없이 분석합니다.",
+            "업종·매크로 뉴스까지 넓게 수집",
+            key="ai_use_search", value=True,
+            help="종목명으로만 뉴스를 모으면 '올랐다/내렸다'는 시황 기사만 쌓여서 원인을 못 짚습니다.\n\n"
+                 "이 옵션을 켜면 HBM·메모리 업황·D램 가격·엔비디아·반도체 수출로도 각각 검색해서, "
+                 "주가가 왜 움직였는지에 해당하는 재료를 같이 넘깁니다. 수집에 몇 초 더 걸립니다.",
         )
         if st.button("지금 바로 분석하기"):
             try:
@@ -4187,12 +4311,42 @@ def _render_tab_ai():
                     f"- {row['제목']} ({row['날짜']})" for _, row in trendforce_df.iterrows()
                 )
 
+                # 매크로와 업종 뉴스는 '왜 움직였나'를 짚는 데 필요한 재료라, 실패해도 분석은 계속한다
+                try:
+                    macro_md = fetch_macro_summary()
+                except Exception:
+                    macro_md = ""
+                sector_news_md = fetch_sector_news(STOCK_NAME) if use_search else ""
+
+                adr_md = ""
+                if TICKER == ADR_HOST_TICKER:
+                    try:
+                        adr_q, adr_base = fetch_adr_quote(), fetch_adr_baseline()
+                        cur_price = _to_number(st.session_state.get("current_price_value"))
+                        if adr_q and cur_price:
+                            per_share = adr_q["price"] * adr_q["fx"] / ADR_SHARE_RATIO
+                            gap = (per_share / cur_price - 1) * 100
+                            adr_md = (
+                                f"- 나스닥 SKHY ${adr_q['price']:,.2f} ({adr_q['session']}), "
+                                f"본주 환산 {per_share:,.0f}원 → 괴리율 {gap:+.1f}%"
+                            )
+                            if adr_base:
+                                base_gap = (adr_base / ADR_SHARE_RATIO - 1) * 100
+                                adr_md += (
+                                    f"\n- 최근 20일 평균 괴리율 {base_gap:+.1f}% 대비 {gap - base_gap:+.1f}%p."
+                                    " 이 종목은 평소에도 30–40% 프리미엄이 붙으므로 절대값이 아니라"
+                                    " 평균 대비 벌어진 정도로 읽어야 한다."
+                                )
+                    except Exception:
+                        adr_md = ""
+
                 time_label = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
                 analysis, search_note = generate_ai_analysis(
                     f"{STOCK_NAME}({TICKER})",
                     time_label, price_summary, supply_summary, headlines, reports_md,
                     dram_summary, community_summary, composite_summary, overheat_summary, futures_summary,
                     trendforce_md, snapshot_md, news_md, use_search,
+                    macro_md, sector_news_md, adr_md,
                 )
 
                 st.session_state["ai_search_note"] = search_note
@@ -4201,6 +4355,9 @@ def _render_tab_ai():
                 st.session_state["ai_analysis_headlines"] = headlines
                 st.session_state["ai_analysis_reports"] = reports_df
                 st.session_state["ai_analysis_trendforce"] = trendforce_df
+                st.session_state["ai_analysis_macro"] = macro_md
+                st.session_state["ai_analysis_sector_news"] = sector_news_md
+                st.session_state["ai_analysis_adr"] = adr_md
             except Exception as e:
                 st.error(f"AI 분석 생성에 실패했습니다: {e}")
 
@@ -4216,6 +4373,16 @@ def _render_tab_ai():
             with st.expander("분석에 사용된 원본 데이터 보기"):
                 st.write("**뉴스 헤드라인**")
                 st.write(st.session_state["ai_analysis_headlines"])
+                sector_news = st.session_state.get("ai_analysis_sector_news")
+                if sector_news:
+                    st.write("**업종 · 전방수요 · 매크로 뉴스**")
+                    st.text(sector_news)
+                st.write("**거시경제 지표**")
+                st.text(st.session_state.get("ai_analysis_macro") or "수집 실패")
+                adr_used = st.session_state.get("ai_analysis_adr")
+                if adr_used:
+                    st.write("**해외 상장분(ADR) 괴리율**")
+                    st.text(adr_used)
                 st.write("**애널리스트 리포트**")
                 st.table(st.session_state["ai_analysis_reports"], width="stretch", hide_index=True)
                 st.write("**해외 반도체 산업 리서치 뉴스 (TrendForce)**")
