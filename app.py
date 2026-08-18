@@ -1,7 +1,9 @@
 import datetime as dt
 import os
 import re
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from zoneinfo import ZoneInfo
 
@@ -15,7 +17,23 @@ import over_market as om
 from bs4 import BeautifulSoup
 from google import genai
 from plotly.subplots import make_subplots
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from wordcloud import WordCloud
+
+
+def _streamlit_pool(max_workers: int) -> ThreadPoolExecutor:
+    """워커 스레드에도 Streamlit 실행 컨텍스트를 붙인 스레드풀.
+
+    워커 안에서 @st.cache_data 함수를 부를 때 컨텍스트가 없으면 호출마다
+    'missing ScriptRunContext' 경고가 쏟아지고 캐시 동작도 보장되지 않는다.
+    순수 requests/pandas 작업만 던질 때는 굳이 필요 없다.
+    """
+    ctx = get_script_run_ctx()
+
+    def _attach() -> None:
+        add_script_run_ctx(threading.current_thread(), ctx)
+
+    return ThreadPoolExecutor(max_workers=max_workers, initializer=_attach)
 
 DEFAULT_TICKER = "000660"
 REFRESH_SEC = 5
@@ -447,22 +465,41 @@ def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
 
 @st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_backtest_history(ticker: str, target_days: int = 500) -> pd.DataFrame:
-    frames = []
+    # 페이지끼리 의존이 없으므로(page=N은 그냥 N번째 묶음) 한 장씩 순서대로 기다릴 이유가 없다.
+    # 700일치면 35페이지쯤인데, 순차로 받으면 왕복 지연만 5초가 넘는다.
+    # 1페이지로 '한 장에 몇 줄인지'만 확인한 뒤 나머지를 한꺼번에 받는다.
+    first = _fetch_frgn_page(ticker, 1)
+    if first.empty:
+        return pd.DataFrame(columns=["날짜", "종가", "기관", "외국인", "개인"])
+
+    frames = [first]
+    per_page = max(len(first), 1)
     max_pages = 60
-    for page in range(1, max_pages + 1):
-        page_df = _fetch_frgn_page(ticker, page)
-        if page_df.empty:
-            break
-        frames.append(page_df)
-        if sum(len(f) for f in frames) >= target_days:
-            break
+    # 휴장일·중복으로 한두 장 모자랄 수 있어 여유분을 둔다
+    need_pages = min(max_pages, -(-target_days // per_page) + 1)
+    if need_pages > 1:
+        def _safe_page(p: int) -> pd.DataFrame:
+            # 상장 기간이 짧은 종목은 요청한 페이지가 아예 없을 수 있다. 순차 루프일 때는
+            # 빈 페이지에서 멈추면 그만이었지만, 한꺼번에 받는 지금은 한 장이 실패해도
+            # 나머지는 살려야 한다.
+            try:
+                return _fetch_frgn_page(ticker, p)
+            except Exception:
+                return pd.DataFrame()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for page_df in pool.map(_safe_page, range(2, need_pages + 1)):
+                if not page_df.empty:
+                    frames.append(page_df)
 
     if not frames:
         return pd.DataFrame(columns=["날짜", "종가", "기관", "외국인", "개인"])
 
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜").sort_values("날짜")
     df["개인"] = -(df["기관"] + df["외국인"])
-    return df.reset_index(drop=True)
+    # 여유분으로 한 장 더 받으므로 순차 시절보다 며칠 더 딸려온다. 백테스트 구간이 조회
+    # 시점에 따라 들쭉날쭉해지지 않게 최근 target_days개로 잘라 맞춘다.
+    return df.tail(target_days).reset_index(drop=True)
 
 
 @st.cache_data(ttl=60, show_spinner="불러오는 중...")
@@ -871,8 +908,9 @@ def fetch_macro_summary() -> str:
     1일/5일/20일 변화를 같이 주면 '오늘만의 일'과 '추세'를 구분해서 쓸 수 있다.
     """
     headers = {"User-Agent": "Mozilla/5.0"}
-    lines = []
-    for label, symbol, kind in MACRO_SYMBOLS:
+
+    def one(item) -> str:
+        label, symbol, kind = item
         try:
             r = requests.get(YAHOO_CHART_URL.format(symbol=symbol), headers=headers, timeout=15,
                              params={"range": "3mo", "interval": "1d"})
@@ -880,7 +918,7 @@ def fetch_macro_summary() -> str:
             res = r.json()["chart"]["result"][0]
             closes = pd.Series(res["indicators"]["quote"][0]["close"]).dropna().reset_index(drop=True)
             if len(closes) < 21:
-                continue
+                return ""
             last = float(closes.iloc[-1])
             parts = []
             for days, name in ((1, "1일"), (5, "5일"), (20, "20일")):
@@ -890,9 +928,13 @@ def fetch_macro_summary() -> str:
                 else:
                     parts.append(f"{name} {(last / past - 1) * 100:+.2f}%")
             fmt = f"{last:,.2f}%" if kind == "pp" else f"{last:,.2f}"
-            lines.append(f"- {label}: {fmt} ({', '.join(parts)})")
+            return f"- {label}: {fmt} ({', '.join(parts)})"
         except Exception:
-            lines.append(f"- {label}: (수집 실패)")
+            return f"- {label}: (수집 실패)"
+
+    # 지표끼리 서로 무관해서 순서대로 기다릴 이유가 없다 (5종 순차 2초 -> 병렬 0.5초 수준)
+    with ThreadPoolExecutor(max_workers=len(MACRO_SYMBOLS)) as pool:
+        lines = [ln for ln in pool.map(one, MACRO_SYMBOLS) if ln]
     return "\n".join(lines) if lines else "(수집 실패)"
 
 
@@ -1126,8 +1168,16 @@ def fetch_adr_quote() -> dict | None:
     base = "https://query1.finance.yahoo.com/v8/finance/chart/{s}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(base.format(s=ADR_SYMBOL), headers=headers, timeout=10,
-                         params={"range": "1d", "interval": "1m", "includePrePost": "true"})
+        # 시세와 환율은 서로 기다릴 이유가 없다. 이 함수는 5초짜리 화면 조각 안에서 불리므로
+        # 왕복 한 번을 줄이는 것도 체감에 바로 들어온다.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            quote_f = pool.submit(
+                requests.get, base.format(s=ADR_SYMBOL), headers=headers, timeout=10,
+                params={"range": "1d", "interval": "1m", "includePrePost": "true"})
+            fx_f = pool.submit(
+                requests.get, base.format(s="KRW=X"), headers=headers, timeout=10,
+                params={"range": "1d", "interval": "1d"})
+        r = quote_f.result()
         r.raise_for_status()
         res = r.json()["chart"]["result"][0]
         meta = res["meta"]
@@ -1166,8 +1216,7 @@ def fetch_adr_quote() -> dict | None:
                 nxt += dt.timedelta(days=1)
             next_open = nxt.astimezone(om.KST).strftime("%m-%d %H:%M")
 
-        fx = requests.get(base.format(s="KRW=X"), headers=headers, timeout=10,
-                          params={"range": "1d", "interval": "1d"}).json()
+        fx = fx_f.result().json()
         fx_rate = fx["chart"]["result"][0]["meta"].get("regularMarketPrice")
         if not (last_price and fx_rate):
             return None
@@ -1258,7 +1307,10 @@ def fetch_adr_baseline(days: int = ADR_BASELINE_DAYS) -> float | None:
         }).dropna()
 
     try:
-        m = daily(ADR_SYMBOL).merge(daily("000660.KS"), on="날짜").merge(daily("KRW=X"), on="날짜")
+        # 세 종목의 일봉은 서로 무관하다. 순서대로 받으면 왕복 지연이 3번 쌓인다.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            adr_d, host_d, fx_d = pool.map(daily, (ADR_SYMBOL, "000660.KS", "KRW=X"))
+        m = adr_d.merge(host_d, on="날짜").merge(fx_d, on="날짜")
         if m.empty:
             return None
         ratio = (m[ADR_SYMBOL] * m["KRW=X"]) / m["000660.KS"]
@@ -1330,14 +1382,22 @@ def fetch_sector_news(stock_name: str, per_query: int = 3) -> str:
     한 번도 동작한 적이 없다. 대신 네이버 뉴스에 질의를 여러 개 던져서 같은 목적
     - 대시보드에 없는 바깥 소식을 채우는 것 - 을 실제로 달성한다.
     """
+    queries = [t.format(name=stock_name) for t in SECTOR_NEWS_QUERIES]
+
+    def one(query: str):
+        try:
+            return query, fetch_news_with_summary(query, count=per_query)
+        except Exception:
+            return query, []
+
+    # 질의 5개를 순서대로 던지면 왕복 지연이 그대로 쌓인다. 한꺼번에 보내고 결과만 순서대로 정리한다.
+    # 워커가 캐시된 fetch_news_with_summary를 부르므로 컨텍스트를 붙인 풀을 쓴다.
+    with _streamlit_pool(len(queries)) as pool:
+        fetched = list(pool.map(one, queries))
+
     blocks = []
     seen_titles: set[str] = set()
-    for template in SECTOR_NEWS_QUERIES:
-        query = template.format(name=stock_name)
-        try:
-            items = fetch_news_with_summary(query, count=per_query)
-        except Exception:
-            continue
+    for query, items in fetched:
         rows = []
         for it in items:
             if it["제목"] in seen_titles:      # 질의끼리 겹치는 기사는 한 번만
@@ -1499,24 +1559,21 @@ def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
     """디시인사이드 주식갤러리(krstock)에서 keyword가 제목/본문에 포함된 게시글을 검색한다.
     krstock은 특정 종목 전용 갤러리가 아니라 국내 주식 전반을 다루는 갤러리라,
     거래량·관심도가 낮은 종목은 검색 결과가 적거나 없을 수 있다."""
-    posts: list[dict] = []
-    seen_no: set[str] = set()
     max_pages = min(30, count // 20 + 2)
-    for page in range(1, max_pages + 1):
+
+    def one_page(page: int) -> list[dict]:
         params = {"id": DC_GALLERY_ID, "s_type": "search_subject_memo", "s_keyword": keyword, "page": str(page)}
         try:
             resp = requests.get(DC_GALLERY_LIST_URL, params=params, headers=DC_HEADERS, timeout=10)
             resp.raise_for_status()
         except requests.RequestException:
-            break
+            return []
         soup = BeautifulSoup(resp.text, "html.parser")
         table = soup.find("table", class_="gall_list")
         if table is None:
-            break
-        rows = table.find("tbody").find_all("tr", class_="us-post")
-        if not rows:
-            break
-        for tr in rows:
+            return []
+        found = []
+        for tr in table.find("tbody").find_all("tr", class_="us-post"):
             title_td = tr.find("td", class_="gall_tit")
             a = title_td.find("a") if title_td else None
             if a is None:
@@ -1525,14 +1582,11 @@ def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
             if not m:
                 continue
             post_no = m.group(1)
-            if post_no in seen_no:
-                continue
-            seen_no.add(post_no)
             date_td = tr.find("td", class_="gall_date")
             date_text = (date_td.get("title") if date_td else None) or (date_td.get_text(strip=True) if date_td else "")
             count_td = tr.find("td", class_="gall_count")
             recommend_td = tr.find("td", class_="gall_recommend")
-            posts.append({
+            found.append({
                 "제목": a.get_text(strip=True),
                 "번호": post_no,
                 "날짜": date_text,
@@ -1540,8 +1594,21 @@ def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
                 "추천": pd.to_numeric(recommend_td.get_text(strip=True), errors="coerce") if recommend_td else None,
                 "url": f"{DC_GALLERY_VIEW_URL}?id={DC_GALLERY_ID}&no={post_no}",
             })
-        if len(posts) >= count:
-            break
+        return found
+
+    # 검색 결과 페이지는 서로 독립이라 한꺼번에 받는다. 순차로 돌면 페이지 수만큼 왕복이 쌓인다.
+    # 결과는 페이지 순서대로 이어붙여서 기존과 같은 정렬(최신순)을 유지한다.
+    with ThreadPoolExecutor(max_workers=min(max_pages, 8)) as pool:
+        pages = list(pool.map(one_page, range(1, max_pages + 1)))
+
+    posts: list[dict] = []
+    seen_no: set[str] = set()
+    for page_posts in pages:
+        for post in page_posts:
+            if post["번호"] in seen_no:
+                continue
+            seen_no.add(post["번호"])
+            posts.append(post)
     return pd.DataFrame(posts[:count])
 
 
@@ -1883,12 +1950,19 @@ def _fetch_company_standalone_capex_quarters(cik: str) -> list[dict]:
 @st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_bigtech_capex() -> pd.DataFrame:
     """빅테크(마이크로소프트/구글/아마존/메타)의 분기별 설비투자(capex) 실적을 SEC 공시(XBRL)에서 가져온다."""
-    rows = []
-    for name, cik in BIGTECH_CIKS.items():
+    def one(item):
+        name, cik = item
         try:
-            quarters = _fetch_company_standalone_capex_quarters(cik)
+            return name, _fetch_company_standalone_capex_quarters(cik)
         except Exception:
-            continue
+            return name, []
+
+    # 회사 4곳의 SEC 공시는 서로 무관하다. 한 곳이 느려도 나머지를 붙잡아두지 않게 동시에 받는다.
+    with ThreadPoolExecutor(max_workers=len(BIGTECH_CIKS)) as pool:
+        fetched = list(pool.map(one, BIGTECH_CIKS.items()))
+
+    rows = []
+    for name, quarters in fetched:
         for q in quarters:
             rows.append({"기업": name, "분기말": q["end"], "capex_USD": q["val"]})
     if not rows:
@@ -2501,21 +2575,33 @@ DRAM_REFRESH_HOURS = [13, 16, 20]
 BIGTECH_CAPEX_REFRESH_HOURS = [16]
 
 
+# 선물·통합 신호 계열 탭이 쓰는 데이터. 코스피200 선물 이력은 페이지마다 다음 조회 날짜가
+# 앞 응답에서 나와서 병렬로 못 받고, 700일을 채우는 데 8초 넘게 걸린다.
+# 이 탭들은 기본으로 꺼져 있으므로, 켜져 있을 때만 미리 데워둔다.
+_FUTURES_TAB_LABELS = {"선물 경보", "통합 신호", "하락 조기신호", "상승 조기신호", "매매 신호"}
+
+
 def _refresh_market_data_caches() -> None:
     """수급현황·가격과열도·선물경보·통합신호·하락·상승 조기신호 탭이 공유하는 종가/수급 기반 캐시."""
     fetch_investor_netbuy.clear()
     fetch_backtest_history.clear()
     fetch_latest_bars.clear()
-    fetch_futures_foreign_history.clear()
-    fetch_latest_futures_bars.clear()
     fetch_yahoo_history.clear()
     fetch_investor_netbuy(TICKER, DEFAULT_LOOKBACK_DAYS)
     fetch_backtest_history(TICKER, target_days=700)
     fetch_latest_bars(TICKER)
-    fetch_futures_foreign_history(target_days=700)
-    fetch_latest_futures_bars()
     fetch_yahoo_history("SOX")
     fetch_yahoo_history("DXY")
+
+    # 선물 이력은 화면에 쓰는 탭이 켜져 있을 때만. 꺼져 있는데 데워두면 아무도 안 보는
+    # 데이터를 받느라 예약 새로고침이 8초 넘게 멈춘다.
+    # (사이드바에서 만들어지는 visible_tab_labels를 쓴다. _visible_tab_labels는 탭을
+    #  실제로 그리는 시점에야 생기는데, 이 함수는 그보다 먼저 불릴 수 있다.)
+    if _FUTURES_TAB_LABELS & set(globals().get("visible_tab_labels") or ALL_TAB_LABELS):
+        fetch_futures_foreign_history.clear()
+        fetch_latest_futures_bars.clear()
+        fetch_futures_foreign_history(target_days=700)
+        fetch_latest_futures_bars()
 
 
 def _refresh_dram_caches() -> None:
