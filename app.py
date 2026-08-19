@@ -1158,100 +1158,28 @@ ADR_BASELINE_DAYS = 20
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_adr_quote() -> dict | None:
-    """SKHY 최신 체결가를 프리장/애프터장까지 포함해서 가져온다.
+def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
+    """SKHY 1분봉을 여러 거래일치 받아 세션·거래일까지 붙여서 돌려준다.
 
-    includePrePost=true 로 1분봉을 받으면 미국 정규장 밖(프리장 04:00 ET – 애프터 20:00 ET)
-    체결도 들어온다. 한국 장이 열리기 전 미국 시간외 움직임을 보는 게 이 지표의 핵심이라
-    마지막 유효 체결가를 그대로 쓴다.
-    """
-    base = "https://query1.finance.yahoo.com/v8/finance/chart/{s}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        # 시세와 환율은 서로 기다릴 이유가 없다. 이 함수는 5초짜리 화면 조각 안에서 불리므로
-        # 왕복 한 번을 줄이는 것도 체감에 바로 들어온다.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            quote_f = pool.submit(
-                requests.get, base.format(s=ADR_SYMBOL), headers=headers, timeout=10,
-                params={"range": "1d", "interval": "1m", "includePrePost": "true"})
-            fx_f = pool.submit(
-                requests.get, base.format(s="KRW=X"), headers=headers, timeout=10,
-                params={"range": "1d", "interval": "1d"})
-        r = quote_f.result()
-        r.raise_for_status()
-        res = r.json()["chart"]["result"][0]
-        meta = res["meta"]
-        stamps = res.get("timestamp") or []
-        closes = (res["indicators"]["quote"][0].get("close") or [])
-        last_price, last_ts = None, None
-        for ts, c in zip(stamps, closes):
-            if c is not None:
-                last_price, last_ts = float(c), ts
-        if last_price is None:
-            last_price = meta.get("regularMarketPrice")
-            last_ts = meta.get("regularMarketTime")
+    시세(fetch_adr_quote)와 그래프(fetch_adr_intraday)가 같은 응답을 쓰도록 한 곳에 모았다.
+    예전에는 같은 URL을 각자 한 번씩 불러서 왕복이 두 번 났다.
 
-        # 세션 판정은 '체결 시각'을 미국 동부시간으로 바꿔서 한다.
-        # meta의 currentTradingPeriod는 '지금' 기준이라, 주말이나 장 마감 후에 조회하면
-        # 다음 프리장을 가리켜서 애프터장 체결을 프리장으로 잘못 표시한다.
-        session = "정규장"
-        if last_ts:
-            et = dt.datetime.fromtimestamp(last_ts, ZoneInfo("America/New_York")).time()
-            if et < dt.time(9, 30):
-                session = "프리장"
-            elif et >= dt.time(16, 0):
-                session = "애프터장"
-
-        # 지금 미국이 거래 중인지(프리장 04:00 – 애프터 20:00 ET, 평일)를 따로 본다.
-        # 이걸 구분하지 않으면 장이 닫힌 새벽에도 '애프터장 $166.60'이 떠서
-        # 실시간 시세가 멈춘 것처럼 보인다.
-        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
-        is_open = now_et.weekday() < 5 and dt.time(4, 0) <= now_et.time() < dt.time(20, 0)
-        next_open = None
-        if not is_open:
-            nxt = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
-            if now_et.time() >= dt.time(4, 0):
-                nxt += dt.timedelta(days=1)
-            while nxt.weekday() >= 5:
-                nxt += dt.timedelta(days=1)
-            next_open = nxt.astimezone(om.KST).strftime("%m-%d %H:%M")
-
-        fx = fx_f.result().json()
-        fx_rate = fx["chart"]["result"][0]["meta"].get("regularMarketPrice")
-        if not (last_price and fx_rate):
-            return None
-        return {
-            "price": float(last_price),
-            "prev_close": meta.get("chartPreviousClose") or meta.get("previousClose"),
-            "session": session,
-            "is_open": is_open,
-            "next_open": next_open,
-            "fx": float(fx_rate),
-            "time": dt.datetime.fromtimestamp(last_ts, om.KST).strftime("%m-%d %H:%M") if last_ts else None,
-        }
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_adr_intraday() -> pd.DataFrame:
-    """SKHY의 가장 최근 하루치 1분봉을 프리장–애프터장 전 구간(04:00–20:00 ET) 가져온다.
-
-    미국 거래시간을 한국시간으로 바꾸면 17:00 – 익일 09:00(서머타임 기준)이라 자정을 넘는다.
-    그래도 '하루 흐름'으로 이어 보는 게 목적이므로 그대로 시계열로 둔다.
-
-    range=1d로 받으면 안 되는 이유: 미국 애프터장이 끝나는 20:00 ET(한국 09:00)부터
-    다음 프리장이 열리는 04:00 ET(한국 17:00)까지 야후가 '오늘'을 아직 시작 안 한 날로 잡아
-    빈 응답을 준다. 그러면 한국 낮 시간 내내 ADR 그래프가 통째로 사라진다.
-    2일치를 받아서 데이터가 있는 마지막 미국 거래일만 잘라 쓴다.
+    하루치(range=1d)로는 부족한 이유가 두 가지다.
+      1) 애프터장이 끝나는 20:00 ET부터 다음 프리장 04:00 ET까지 야후가 빈 응답을 준다.
+      2) 프리장 동안 meta.chartPreviousClose가 한 세션 뒤처진다. 창이 아직 전 거래일에
+         걸려 있어서, 오늘 프리장 체결을 '이틀 전 종가'와 비교하게 된다.
+         (실측: 8/19 프리장 $162.02를 8/17 종가 $171.38과 비교해 -5.46%로 표시. 실제는
+          8/18 종가 $155.62 대비 +4.11%로, 부호까지 뒤집혔다.)
+    그래서 여러 날을 받아 기준값을 데이터에서 직접 고른다.
     """
     empty = pd.DataFrame({"시각": pd.Series(dtype="datetime64[ns]"),
                           "가격": pd.Series(dtype="float64"),
-                          "세션": pd.Series(dtype="object")})
+                          "세션": pd.Series(dtype="object"),
+                          "거래일": pd.Series(dtype="object")})
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ADR_SYMBOL}",
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-                         params={"range": "2d", "interval": "1m", "includePrePost": "true"})
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+                         params={"range": f"{days}d", "interval": "1m", "includePrePost": "true"})
         r.raise_for_status()
         res = r.json()["chart"]["result"][0]
         stamps = res.get("timestamp") or []
@@ -1274,15 +1202,112 @@ def fetch_adr_intraday() -> pd.DataFrame:
                 "시각": dt.datetime.fromtimestamp(t, om.KST).replace(tzinfo=None),
                 "가격": float(c), "세션": session,
                 # 프리장 04:00 ~ 애프터장 20:00은 모두 같은 미국 날짜라 이 값으로 하루가 갈린다
-                "_거래일": et_dt.date(),
+                "거래일": et_dt.date(),
             })
-        if not rows:
-            return empty
-        df = pd.DataFrame(rows).sort_values("시각")
-        df = df[df["_거래일"] == df["_거래일"].max()]
-        return df.drop(columns="_거래일").reset_index(drop=True)
+        return pd.DataFrame(rows).sort_values("시각").reset_index(drop=True) if rows else empty
     except Exception:
         return empty
+
+
+def _adr_baselines(bars: pd.DataFrame, last_day, last_session) -> tuple[float | None, float | None]:
+    """(등락률 기준값, 전 거래일 종가)를 봉 데이터에서 직접 고른다.
+
+    등락률 기준은 세션마다 다르다. 프리장·정규장은 '직전 거래일 정규장 종가'와 비교하고,
+    애프터장은 '당일 정규장 종가'와 비교하는 게 통상 표기다. 본주(NXT) 쪽도 같은 규칙이다.
+    전 거래일 종가는 하루치 그래프의 기준선용이라 세션과 무관하게 늘 직전 거래일 값이다.
+    """
+    reg = bars[bars["세션"] == "정규장"]
+    if reg.empty:
+        return None, None
+    closes = reg.groupby("거래일")["가격"].last()          # 거래일별 정규장 종가
+    earlier = [d for d in closes.index if d < last_day]
+    prev_day_close = float(closes[max(earlier)]) if earlier else None
+    if last_session == "애프터장" and last_day in closes.index:
+        return float(closes[last_day]), prev_day_close
+    return prev_day_close, prev_day_close
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_adr_quote() -> dict | None:
+    """SKHY 최신 체결가를 프리장/애프터장까지 포함해서 가져온다.
+
+    includePrePost=true 로 1분봉을 받으면 미국 정규장 밖(프리장 04:00 ET – 애프터 20:00 ET)
+    체결도 들어온다. 한국 장이 열리기 전 미국 시간외 움직임을 보는 게 이 지표의 핵심이라
+    마지막 유효 체결가를 그대로 쓴다.
+    """
+    try:
+        # 봉과 환율은 서로 기다릴 이유가 없다. 이 함수는 5초짜리 화면 조각 안에서 불리므로
+        # 왕복 한 번을 줄이는 것도 체감에 바로 들어온다.
+        with _streamlit_pool(2) as pool:
+            bars_f = pool.submit(_fetch_adr_bars)
+            fx_f = pool.submit(
+                requests.get, "https://query1.finance.yahoo.com/v8/finance/chart/KRW=X",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+                params={"range": "1d", "interval": "1d"})
+        bars = bars_f.result()
+        if bars.empty:
+            return None
+        last = bars.iloc[-1]
+        last_price = float(last["가격"])
+        # 세션은 '체결 시각' 기준으로 이미 갈라져 있다. meta의 currentTradingPeriod는 '지금'
+        # 기준이라, 장 마감 후에 조회하면 애프터장 체결을 프리장으로 잘못 표시한다.
+        session = str(last["세션"])
+        prev_close, prev_day_close = _adr_baselines(bars, last["거래일"], session)
+        last_ts = last["시각"].to_pydatetime()
+
+        # 지금 미국이 거래 중인지(프리장 04:00 – 애프터 20:00 ET, 평일)를 따로 본다.
+        # 이걸 구분하지 않으면 장이 닫힌 새벽에도 '애프터장 $166.60'이 떠서
+        # 실시간 시세가 멈춘 것처럼 보인다.
+        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+        is_open = now_et.weekday() < 5 and dt.time(4, 0) <= now_et.time() < dt.time(20, 0)
+        next_open = None
+        if not is_open:
+            nxt = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+            if now_et.time() >= dt.time(4, 0):
+                nxt += dt.timedelta(days=1)
+            while nxt.weekday() >= 5:
+                nxt += dt.timedelta(days=1)
+            next_open = nxt.astimezone(om.KST).strftime("%m-%d %H:%M")
+
+        fx = fx_f.result().json()
+        fx_rate = fx["chart"]["result"][0]["meta"].get("regularMarketPrice")
+        if not (last_price and fx_rate):
+            return None
+        return {
+            "price": last_price,
+            # 세션에 맞는 등락률 기준 (프리장·정규장=직전 거래일 종가 / 애프터장=당일 종가)
+            "prev_close": prev_close,
+            # 하루치 그래프의 점선 기준선용. 세션과 무관하게 늘 직전 거래일 종가다.
+            "prev_day_close": prev_day_close,
+            "session": session,
+            "is_open": is_open,
+            "next_open": next_open,
+            "fx": float(fx_rate),
+            "time": last_ts.strftime("%m-%d %H:%M"),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_adr_intraday() -> pd.DataFrame:
+    """SKHY의 가장 최근 하루치 1분봉을 프리장–애프터장 전 구간(04:00–20:00 ET) 가져온다.
+
+    미국 거래시간을 한국시간으로 바꾸면 17:00 – 익일 09:00(서머타임 기준)이라 자정을 넘는다.
+    그래도 '하루 흐름'으로 이어 보는 게 목적이므로 그대로 시계열로 둔다.
+
+    range=1d로 받으면 안 되는 이유: 미국 애프터장이 끝나는 20:00 ET(한국 09:00)부터
+    다음 프리장이 열리는 04:00 ET(한국 17:00)까지 야후가 '오늘'을 아직 시작 안 한 날로 잡아
+    빈 응답을 준다. 그러면 한국 낮 시간 내내 ADR 그래프가 통째로 사라진다.
+    2일치를 받아서 데이터가 있는 마지막 미국 거래일만 잘라 쓴다.
+    """
+    bars = _fetch_adr_bars()
+    if bars.empty:
+        return pd.DataFrame({"시각": pd.Series(dtype="datetime64[ns]"),
+                             "가격": pd.Series(dtype="float64"),
+                             "세션": pd.Series(dtype="object")})
+    latest = bars[bars["거래일"] == bars["거래일"].max()]
+    return latest.drop(columns="거래일").reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2247,13 +2272,22 @@ def render_current_price():
                             adr_delta = (
                                 f"{(adr['price'] / prev - 1) * 100:+.2f}%" if prev else None
                             )
+                            # 등락률이 무엇 대비인지 헷갈리지 않게 기준값을 그대로 적어준다
+                            basis = (
+                                "당일 정규장 종가" if adr["session"] == "애프터장" else "직전 거래일 종가"
+                            )
+                            basis_help = (
+                                f"등락률은 {basis} ${prev:,.2f} 대비입니다."
+                                if prev else "등락률 기준값을 구하지 못했습니다."
+                            )
                             with adr_col.container(key="metric_small_adr"):
                                 # 장이 닫혀 있으면 값이 안 움직이는 게 정상이라는 걸 라벨에서 바로 알 수 있게 한다
                                 if adr.get("is_open"):
                                     adr_label = f"SKHY ({adr['session']})"
                                     adr_help = (
                                         f"나스닥 상장 SK하이닉스. 마지막 체결 {adr['time'] or '-'} KST "
-                                        f"(환율 {adr['fx']:,.1f}원). 미국 프리장·애프터장 체결도 반영합니다."
+                                        f"(환율 {adr['fx']:,.1f}원). 미국 프리장·애프터장 체결도 반영합니다.\n\n"
+                                        f"{basis_help}"
                                     )
                                 else:
                                     adr_label = "SKHY (미국장 마감)"
@@ -2262,7 +2296,8 @@ def render_current_price():
                                         f"마지막 체결: {adr['time'] or '-'} KST ({adr['session']})\n\n"
                                         f"다음 프리장 개장: {adr['next_open'] or '-'} KST\n\n"
                                         f"미국 거래시간(KST): 프리장 17:00–22:30, 정규장 22:30–익일 05:00, "
-                                        f"애프터장 –익일 09:00 (서머타임 기준)"
+                                        f"애프터장 –익일 09:00 (서머타임 기준)\n\n"
+                                        f"{basis_help}"
                                     )
                                 st.metric(
                                     adr_label, f"${adr['price']:,.2f}",
@@ -2455,7 +2490,8 @@ def render_current_price():
                             line=dict(color=color), name=f"{label}(ADR)", visible=adr_visible,
                             hovertemplate="%{x|%H:%M}  $%{y:,.2f}<extra>" + label + "</extra>",
                         ))
-                    adr_prev = (adr_quote or {}).get("prev_close")
+                    # 하루 전체를 그리는 그래프라 기준선은 세션과 무관하게 '직전 거래일 종가'다
+                    adr_prev = (adr_quote or {}).get("prev_day_close")
                     if adr_prev:
                         fig_intraday.add_trace(go.Scatter(
                             x=[adr_df["시각"].min(), adr_df["시각"].max()], y=[adr_prev, adr_prev],
