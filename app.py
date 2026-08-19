@@ -1388,6 +1388,118 @@ def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
     return items
 
 
+NAVER_DISCLOSURE_URL = "https://m.stock.naver.com/api/stock/{code}/disclosure"
+
+
+@st.cache_data(ttl=1800, show_spinner="공시 수집 중...")
+def fetch_disclosures(ticker: str, count: int = 20, body_days: int = 3) -> str:
+    """전자공시(KOSCOM/DART) 목록과, 최근 것들의 본문 요지를 마크다운으로 만든다.
+
+    뉴스는 공시를 몇 시간~하루 늦게 따라간다. 정작 주가를 움직인 원인이 공시 한 줄인 경우가
+    많은데(자기주식 취득·소각, 신규시설투자, 조회공시 답변 등) 지금까지 AI는 이걸 아예 못 봤다.
+    제목만으로는 규모를 알 수 없어서, 최근 body_days일 안의 공시는 본문까지 받아 숫자를 넘긴다.
+    """
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"}
+    try:
+        r = requests.get(NAVER_DISCLOSURE_URL.format(code=ticker), headers=headers,
+                         params={"pageSize": count}, timeout=10)
+        r.raise_for_status()
+        items = r.json() or []
+    except Exception:
+        return ""
+    if not isinstance(items, list) or not items:
+        return ""
+
+    cutoff = (dt.datetime.now(om.KST).date() - dt.timedelta(days=body_days)).isoformat()
+    recent = [d for d in items if str(d.get("datetime", ""))[:10] >= cutoff]
+
+    def body(item) -> tuple[int, str]:
+        did = item.get("disclosureId")
+        try:
+            rr = requests.get(f"{NAVER_DISCLOSURE_URL.format(code=ticker)}/{did}",
+                              headers=headers, timeout=10)
+            rr.raise_for_status()
+            html = ((rr.json() or {}).get("disclosure") or {}).get("contents") or ""
+        except Exception:
+            return did, ""
+        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+        return did, re.sub(r"\s+", " ", text)[:700]
+
+    bodies: dict[int, str] = {}
+    if recent:
+        with _streamlit_pool(min(len(recent), 6)) as pool:
+            bodies = dict(pool.map(body, recent))
+
+    lines = []
+    for d in items:
+        when = str(d.get("datetime", "")).replace("T", " ")[:16]
+        lines.append(f"- {when}  {d.get('title')}")
+        text = bodies.get(d.get("disclosureId"))
+        if text:
+            lines.append(f"    본문: {text}")
+    return "\n".join(lines)
+
+
+def build_over_market_summary(ticker: str, close_price: int | None) -> str:
+    """프리장·애프터장(NXT)에서 오늘 실제로 무슨 일이 있었는지 정리한다.
+
+    정규장이 끝난 뒤 공시 한 줄에 시간외에서 크게 되돌리는 날이 있는데(예: 마감 직후
+    자사주 취득·소각 공시), 종가만 보면 그 사실이 통째로 빠진다. 화면에는 이미 그리고 있지만
+    AI에는 안 넘어가고 있었다.
+    """
+    today = dt.datetime.now(om.KST).date()
+    try:
+        ticks = load_over_market_ticks(ticker, today)
+        ticks = ticks[ticks["시각"].dt.date == today]
+    except Exception:
+        ticks = pd.DataFrame()
+    if ticks.empty:
+        return ""
+
+    lines = []
+    for label in ("프리장", "애프터장"):
+        seg = ticks[ticks["세션"] == label]
+        if seg.empty:
+            continue
+        first, last = float(seg["가격"].iloc[0]), float(seg["가격"].iloc[-1])
+        line = (f"- {label} {seg['시각'].min():%H:%M}~{seg['시각'].max():%H:%M}: "
+                f"{first:,.0f} → {last:,.0f}원 "
+                f"(고가 {seg['가격'].max():,.0f} / 저가 {seg['가격'].min():,.0f})")
+        # 애프터장은 '정규장 종가 대비'가 핵심이다. 마감 후 재료가 반영된 폭이 그대로 보인다.
+        if label == "애프터장" and close_price:
+            line += f", 정규장 종가({close_price:,}원) 대비 {(last / close_price - 1) * 100:+.2f}%"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_intraday_summary(ticker: str, close_price: int | None) -> str:
+    """오늘 장중에 어떻게 움직였는지(언제 밀렸는지/되돌렸는지)를 분봉에서 뽑는다.
+    '종가 -9.75%'만 넘기면 하루 종일 흘러내린 건지 특정 시각에 급락한 건지 구분할 수 없다."""
+    try:
+        bars = fetch_intraday_price(ticker)
+    except Exception:
+        return ""
+    if bars.empty or len(bars) < 10:
+        return ""
+    px = bars["현재가"].astype(float)
+    open_p, high_p, low_p, last_p = float(px.iloc[0]), float(px.max()), float(px.min()), float(px.iloc[-1])
+    lines = [
+        f"- 장중 {bars['시각'].min():%H:%M}~{bars['시각'].max():%H:%M}: "
+        f"시가 {open_p:,.0f} / 고가 {high_p:,.0f} / 저가 {low_p:,.0f} / 마지막 {last_p:,.0f}원",
+        f"- 고점 대비 낙폭 {(low_p / high_p - 1) * 100:+.2f}%, 저점 대비 회복 {(last_p / low_p - 1) * 100:+.2f}%",
+    ]
+    # 30분 단위로 가장 크게 움직인 구간을 짚어준다
+    step = max(len(px) // 13, 1)
+    moves = []
+    for i in range(0, len(px) - step, step):
+        chg = px.iloc[i + step] / px.iloc[i] - 1
+        moves.append((abs(chg), chg, bars["시각"].iloc[i], bars["시각"].iloc[i + step]))
+    if moves:
+        _, chg, t0, t1 = max(moves)
+        lines.append(f"- 가장 급했던 구간: {t0:%H:%M}~{t1:%H:%M} {chg * 100:+.2f}%")
+    return "\n".join(lines)
+
+
 # 종목명만으로 뉴스를 뽑으면 '주가가 올랐다/내렸다'류 시황 기사만 모여서, AI가 원인을 짚지 못한다.
 # 업황·전방수요·매크로 쪽 질의를 같이 던져서 '왜'에 해당하는 재료를 확보한다.
 SECTOR_NEWS_QUERIES = [
@@ -2018,6 +2130,9 @@ def generate_ai_analysis(
     macro_md: str = "",
     sector_news_md: str = "",
     adr_md: str = "",
+    disclosure_md: str = "",
+    over_market_md: str = "",
+    intraday_md: str = "",
 ) -> tuple[str, str | None]:
     prompt = f"""오늘은 {time_label}입니다. 다음은 이 시점 기준 {stock_label} 관련 데이터입니다.
 
@@ -2026,6 +2141,15 @@ def generate_ai_analysis(
 
 [오늘 주가]
 {price_summary}
+
+[오늘 장중 흐름]
+{intraday_md if intraday_md else "(수집 실패)"}
+
+[정규장 밖 움직임 — 프리장 · 애프터장(NXT)]
+{over_market_md if over_market_md else "(오늘 시간외 기록 없음)"}
+
+[전자공시 — 최근순, 최근 것은 본문 요지 포함]
+{disclosure_md if disclosure_md else "(수집 실패)"}
 
 [밸류에이션 · 컨센서스 · 동일업종 · 수급추이]
 {snapshot_md if snapshot_md else "(수집 실패)"}
@@ -2071,6 +2195,13 @@ def generate_ai_analysis(
 ## 한 줄 요약
 오늘 이 종목에서 가장 중요한 사실 한 문장.
 
+## 오늘 이렇게 움직인 이유
+정규장 등락을 '언제 무엇 때문에'로 설명해라. 장중 흐름에서 급했던 구간을 짚고,
+그 시각 전후의 공시·뉴스와 연결해라. 연결할 근거가 없으면 "직접 연결되는 재료는 데이터에 없음"이라고 써라.
+**정규장이 끝난 뒤 시간외에서 방향이 바뀌었다면 반드시 별도 문단으로 짚어라.**
+종가만 보면 놓치는 부분이고, 공시가 마감 직후에 나오는 경우가 잦다.
+시간외 등락률은 정규장 종가 대비 값을 쓰고, 전일 종가 대비와 헷갈리지 마라.
+
 ## 종목 이슈인가, 업종 전체인가
 '동일업종' 등락률과 비교해서 판단해줘. 동종 종목들이 비슷하게 움직였으면 업종/매크로 요인이고,
 이 종목만 튀었으면 개별 이슈다. 반드시 다른 종목 등락률 숫자를 인용해서 근거를 대줘.
@@ -2080,14 +2211,16 @@ def generate_ai_analysis(
 
 이 두 항목이 이 분석의 핵심이다. 다음 규칙을 지켜라.
 
-1) 아래 다섯 갈래를 **모두** 훑어보고, 각 갈래에서 나온 근거를 빠짐없이 배치해라.
+1) 아래 여섯 갈래를 **모두** 훑어보고, 각 갈래에서 나온 근거를 빠짐없이 배치해라.
+   `[공시]`   전자공시 (규모·기간 같은 숫자를 본문에서 인용해라)
    `[뉴스]`   종목 뉴스 + 업종·전방수요·매크로 뉴스
    `[리포트]` 애널리스트 리포트
    `[산업]`   TrendForce 산업 리서치 + DRAM 현물가
    `[거시]`   거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 금리) + ADR 괴리율
    `[대시보드]` 수급, 통합 신호, 가격 과열도, 선물 경보, 밸류에이션·컨센서스, 동일업종 등락률
 2) 각 항목은 **`[갈래] 내용 (근거 숫자·출처)`** 형식으로 써라.
-   말머리는 위 다섯 개(`[뉴스]` `[리포트]` `[산업]` `[거시]` `[대시보드]`)만 쓰고, 다른 이름을 지어내지 마라.
+   말머리는 위 여섯 개(`[공시]` `[뉴스]` `[리포트]` `[산업]` `[거시]` `[대시보드]`)만 쓰고,
+   다른 이름을 지어내지 마라.
    예: `[거시] SOX 20일 +6.37%로 반도체 업종 전반이 강세 (SOX 12,417.05)`
 3) 어느 갈래에서 쓸 만한 근거가 안 나오면 그 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음`이라고 한 줄로 적어라.
    억지로 만들어내지 마라.
@@ -4332,10 +4465,14 @@ def _render_tab_community():
 def _render_tab_ai():
     _subheader_with_help(
         "AI 분석: 오늘의 주가 변동 요인",
-        "강세 근거와 약세 근거를 다섯 갈래로 나눠서, 각 갈래를 빠짐없이 훑도록 시킵니다.\n\n"
-        "① 뉴스(종목 + 업종·전방수요·매크로) ② 애널리스트 리포트 "
-        "③ TrendForce 산업 리서치 + DRAM 현물가 ④ 거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 10년물 금리) "
-        "와 ADR 괴리율 ⑤ 대시보드 지표(수급·통합 신호·가격 과열도·선물 경보·컨센서스·동일업종 등락률)\n\n"
+        "강세 근거와 약세 근거를 여섯 갈래로 나눠서, 각 갈래를 빠짐없이 훑도록 시킵니다.\n\n"
+        "① **전자공시**(제목만이 아니라 본문 요지까지) ② 뉴스(종목 + 업종·전방수요·매크로) "
+        "③ 애널리스트 리포트 ④ TrendForce 산업 리서치 + DRAM 현물가 "
+        "⑤ 거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 10년물 금리)와 ADR 괴리율 "
+        "⑥ 대시보드 지표(수급·통합 신호·가격 과열도·선물 경보·컨센서스·동일업종 등락률)\n\n"
+        "여기에 **오늘 장중 흐름**(언제 급했는지)과 **정규장 밖 움직임**(프리장·애프터장)을 같이 넘겨서, "
+        "'오늘 이렇게 움직인 이유'를 시각 단위로 설명하게 합니다. 마감 직후 공시가 떠서 시간외에서 "
+        "방향이 바뀌는 날은 종가만 봐서는 알 수 없기 때문입니다.\n\n"
         "각 근거에는 `[갈래] 내용 (근거 숫자)` 형태로 출처를 달게 하고, 매크로 숫자는 이 종목까지 "
         "어떻게 연결되는지 설명하게 합니다. 마지막에 어느 쪽 근거가 더 무거운지도 짚습니다.\n\n"
         "동일업종 비교가 들어가면서 '오늘 움직임이 이 종목만의 이슈인지, 업종 전체가 같이 움직인 것인지'를 "
@@ -4440,6 +4577,22 @@ def _render_tab_ai():
                     macro_md = ""
                 sector_news_md = fetch_sector_news(STOCK_NAME) if use_search else ""
 
+                # 공시 · 장중 흐름 · 시간외. 종가 한 줄로는 안 보이는 것들이라 개별로 실패를 감싼다.
+                try:
+                    disclosure_md = fetch_disclosures(TICKER)
+                except Exception:
+                    disclosure_md = ""
+                cur_close = _to_number(st.session_state.get("current_price_value"))
+                cur_close = int(cur_close) if cur_close else None
+                try:
+                    intraday_md = build_intraday_summary(TICKER, cur_close)
+                except Exception:
+                    intraday_md = ""
+                try:
+                    over_market_md = build_over_market_summary(TICKER, cur_close)
+                except Exception:
+                    over_market_md = ""
+
                 adr_md = ""
                 if TICKER == ADR_HOST_TICKER:
                     try:
@@ -4469,6 +4622,7 @@ def _render_tab_ai():
                     dram_summary, community_summary, composite_summary, overheat_summary, futures_summary,
                     trendforce_md, snapshot_md, news_md, use_search,
                     macro_md, sector_news_md, adr_md,
+                    disclosure_md, over_market_md, intraday_md,
                 )
 
                 st.session_state["ai_search_note"] = search_note
@@ -4480,6 +4634,9 @@ def _render_tab_ai():
                 st.session_state["ai_analysis_macro"] = macro_md
                 st.session_state["ai_analysis_sector_news"] = sector_news_md
                 st.session_state["ai_analysis_adr"] = adr_md
+                st.session_state["ai_analysis_disclosure"] = disclosure_md
+                st.session_state["ai_analysis_over_market"] = over_market_md
+                st.session_state["ai_analysis_intraday"] = intraday_md
             except Exception as e:
                 st.error(f"AI 분석 생성에 실패했습니다: {e}")
 
@@ -4493,6 +4650,13 @@ def _render_tab_ai():
             st.markdown(st.session_state["ai_analysis"])
 
             with st.expander("분석에 사용된 원본 데이터 보기"):
+                for label, key in (("오늘 장중 흐름", "ai_analysis_intraday"),
+                                   ("정규장 밖 움직임 (프리장·애프터장)", "ai_analysis_over_market"),
+                                   ("전자공시", "ai_analysis_disclosure")):
+                    value = st.session_state.get(key)
+                    if value:
+                        st.write(f"**{label}**")
+                        st.text(value)
                 st.write("**뉴스 헤드라인**")
                 st.write(st.session_state["ai_analysis_headlines"])
                 sector_news = st.session_state.get("ai_analysis_sector_news")
