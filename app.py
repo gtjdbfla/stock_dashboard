@@ -2294,6 +2294,27 @@ def _live_deviation(live_price: float, ma_window: int) -> tuple[float | None, fl
     return current, percentile
 
 
+def _korea_session_now(now_kst: dt.datetime | None = None) -> str | None:
+    """지금 한국 시장이 거래 중인 구간이면 그 이름을, 아니면 None.
+
+    NXT 프리장 08:00–09:00 / KRX 정규장 09:00–15:30 / NXT 애프터장 15:40–20:00.
+    15:30–15:40 공백은 따로 가르지 않는다. 10분 때문에 화면 기본값이 ADR로 튀었다가
+    돌아오면 오히려 더 어수선하다.
+    공휴일은 이 함수로 알 수 없으므로, 호출부에서 '오늘 실제 체결이 있었는지'와 같이 본다.
+    """
+    now = now_kst or dt.datetime.now(om.KST)
+    if now.weekday() >= 5:
+        return None
+    t = now.time()
+    if dt.time(8, 0) <= t < dt.time(9, 0):
+        return "프리장"
+    if dt.time(9, 0) <= t < dt.time(15, 40):
+        return "정규장"
+    if dt.time(15, 40) <= t <= dt.time(20, 0):
+        return "애프터장"
+    return None
+
+
 def _note_optional_failure(what: str, exc: Exception) -> None:
     """현재가 화면의 '있으면 좋은' 부품이 실패했을 때 쓰는 처리.
 
@@ -2486,6 +2507,9 @@ def render_current_price():
             host_title = None
             x_start = x_end = None
             has_over = False
+            # 화면에 그린 본주 데이터가 '오늘 것'인지. 휴장일에는 직전 거래일 분봉이 실려서
+            # 시간만 보면 장중인 줄 알게 되므로, 기본 화면을 고를 때 같이 본다.
+            host_is_today = False
             help_lines: list[str] = []
 
             # 프리장(08:00–09:00)에는 당일 분봉이 아직 없어 intraday_df가 비어 있다.
@@ -2515,6 +2539,7 @@ def render_current_price():
                     host_traces += 1
                     host_title = f"프리장 ({today_kst})"
                     has_over = True
+                    host_is_today = True      # 오늘 프리장 기록만으로 그린 화면
                     help_lines.append(
                         f"점선은 직전 정규장 종가({close_price:,}원) 기준선입니다. "
                         "09:00에 정규장이 열리면 본장 그래프에 이어붙습니다."
@@ -2574,6 +2599,7 @@ def render_current_price():
                 ))
                 host_traces += 1
 
+                host_is_today = chart_date == today_kst
                 title_date = f"{trade_date}" if chart_date == trade_date else f"{trade_date} – {chart_date}"
                 # 큰 제목은 그래프 위 Streamlit 헤더가 맡고, 그래프 안 제목은 '지금 무엇을 보는지'만 표시한다
                 host_title = f"본주 ({title_date})"
@@ -2605,9 +2631,16 @@ def render_current_price():
             adr_quote = fetch_adr_quote() if not adr_df.empty else None
             adr_shapes: list[dict] = []
             adr_start = adr_end = adr_day = None
+
+            # 어느 쪽을 먼저 보여줄지: 한국장이 실제로 돌아가는 시간이면 본주, 아니면 ADR.
+            # 한국이 닫혀 있는 동안 움직이는 건 미국 쪽이라, 멈춘 본주 그래프를 띄워두는 것보다
+            # 지금 값이 변하는 화면을 먼저 보여주는 게 맞다. 버튼으로 언제든 되돌릴 수 있다.
+            korea_session = _korea_session_now()
+            korea_live = korea_session is not None and host_is_today
+            show_host_first = host_available and (korea_live or adr_df.empty)
+
             if not adr_df.empty:
-                    # 본주가 아직 없으면 ADR을 기본 화면으로 띄운다
-                    adr_visible = not host_available
+                    adr_visible = not show_host_first
                     # 본주 그래프와 같은 색 규칙: 정규장 빨강, 프리장·애프터장 회색.
                     # 구간이 끊겨 보이지 않게, 이어지는 지점 한 점씩 겹쳐서 선을 붙인다.
                     for label, color in (("프리장", "#7f7f7f"), ("정규장", "#d62728"), ("애프터장", "#7f7f7f")):
@@ -2643,14 +2676,21 @@ def render_current_price():
                     adr_end = adr_df["시각"].max().to_pydatetime()
                     adr_day = adr_df["시각"].max().date()
 
+            # 어느 쪽을 먼저 보여주든, 반대쪽은 반드시 숨겨야 한다.
+            # ADR 트레이스에만 visible을 주고 본주는 기본값(보임)으로 두면, 본주가 안 숨어서
+            # 원(150만)과 달러(160) 두 선이 한 y축에 같이 그려진다.
+            if host_available and not adr_df.empty:
+                for i, trace in enumerate(fig_intraday.data):
+                    trace.visible = (i < host_traces) == show_host_first
+
             if not host_available and adr_df.empty:
                 # 한국 분봉도 시간외 기록도 ADR도 없는 시간대(휴장일 새벽 등).
                 # 예전에는 아무것도 그리지 않고 조용히 넘어가서, 그래프가 사라진 건지
                 # 원래 데이터가 없는 건지 구분이 안 됐다.
                 st.caption(":gray[장중 주가 추이: 아직 오늘 체결 기록이 없습니다.]")
             else:
-                # 처음 보여줄 쪽. 본주가 있으면 본주, 없으면(아침 프리장 등) ADR.
-                if host_available:
+                # 처음 보여줄 쪽 (show_host_first에서 이미 정해졌다)
+                if show_host_first:
                     view_title, view_range = host_title, [x_start, x_end]
                     view_ytitle, view_shapes = "현재가(원)", host_shapes
                 else:
@@ -2710,17 +2750,30 @@ def render_current_price():
 
                 # 긴 설명은 화면을 어지럽히므로 제목 옆 ? 버튼 안으로 넣는다
                 # (본주 쪽 설명은 위에서 이미 help_lines에 담아뒀다)
+                adr_range_txt = (
+                    f"(프리장 04:00 – 애프터장 20:00 ET, 한국시간 {adr_start:%H:%M}–{adr_end:%H:%M})"
+                    if adr_start else ""
+                )
                 if not adr_df.empty:
-                    if host_available:
+                    if show_host_first:
                         help_lines.append(
                             f"**ADR(SKHY) 버튼**을 누르면 나스닥 상장분의 하루치가 같은 자리에 나옵니다 "
-                            f"(프리장 04:00 – 애프터장 20:00 ET, 한국시간 {adr_start:%H:%M}–{adr_end:%H:%M}).\n\n"
+                            f"{adr_range_txt}.\n\n"
                             "ADR 화면도 본주와 같은 색 규칙입니다. 정규장은 빨간색, 프리장·애프터장은 회색."
+                        )
+                    elif host_available:
+                        # 한국장이 닫혀 있어 ADR을 먼저 띄운 경우
+                        help_lines.append(
+                            f"지금은 한국 시장(프리장 08:00–09:00 · 정규장 09:00–15:30 · 애프터장 15:40–20:00)이 "
+                            f"열려 있지 않아, 값이 계속 움직이는 나스닥 상장분(SKHY) {adr_day} 하루치를 "
+                            f"먼저 보여줍니다 {adr_range_txt}.\n\n"
+                            "**본주 버튼**을 누르면 국내 그래프로 돌아갑니다. "
+                            "한국장이 열리면 자동으로 본주가 기본 화면이 됩니다."
                         )
                     else:
                         help_lines.append(
                             f"한국 분봉이 아직 없어 나스닥 상장분(SKHY) {adr_day} 하루치를 먼저 보여줍니다 "
-                            f"(한국시간 {adr_start:%H:%M}–{adr_end:%H:%M}). 정규장은 빨간색, 프리장·애프터장은 회색입니다.\n\n"
+                            f"{adr_range_txt}. 정규장은 빨간색, 프리장·애프터장은 회색입니다.\n\n"
                             "오늘 국내 체결이 쌓이면 **본주 / ADR 전환 버튼**이 생깁니다."
                         )
                 _bold_label_with_help("장중 주가 추이", "\n\n".join(help_lines), key="intraday")
