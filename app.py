@@ -2515,35 +2515,78 @@ def render_current_price():
             # 프리장(08:00–09:00)에는 당일 분봉이 아직 없어 intraday_df가 비어 있다.
             # 이때는 정규장 선 없이 시간외 기록만으로 그린다.
             if intraday_df.empty:
-                over_only = load_over_market_ticks(TICKER, today_kst - dt.timedelta(days=1))
-                over_only = over_only[over_only["시각"].dt.date == today_kst]
+                # 네이버 분봉은 자정을 넘기면 빈 배열이 된다. 그래서 밤에는 오늘 기록도,
+                # 어제 분봉도 없어서 본주 쪽이 통째로 사라지고 전환 버튼까지 없어졌다.
+                # 다행히 수집기가 08:00–20:00을 20초 간격으로 찍어두므로, 오늘 기록이 없으면
+                # 틱 파일에 남아 있는 가장 최근 거래일로 본주 화면을 그려준다.
+                over_all = load_over_market_ticks(TICKER, today_kst - dt.timedelta(days=7))
+                over_only = over_all[over_all["시각"].dt.date == today_kst]
+                fallback_day = None
+                if over_only.empty and not over_all.empty:
+                    fallback_day = over_all["시각"].max().date()
+                    over_only = over_all[over_all["시각"].dt.date == fallback_day]
+
                 if not over_only.empty:
-                    fig_intraday.add_trace(go.Scatter(
-                        x=over_only["시각"], y=over_only["가격"],
-                        # 개장 직후엔 점이 1–2개뿐이라 선만으로는 아무것도 안 보인다.
-                        # 이 화면(프리장 단독)에서만 마커를 같이 찍어 초반에도 보이게 한다.
-                        mode="lines+markers", line=dict(color="#7f7f7f"),
-                        marker=dict(size=4), name="프리장",
-                        hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>프리장</extra>",
-                    ))
-                    host_traces = 1
-                    x_start = dt.datetime.combine(today_kst, dt.time(8, 0))
-                    x_end = dt.datetime.combine(today_kst, dt.time(9, 0))
-                    # 정규장이 아직 안 열렸으므로 기준선은 '직전 정규장 종가'.
+                    day = fallback_day or today_kst
+                    open_t = dt.datetime.combine(day, dt.time(9, 0))
+                    close_t = dt.datetime.combine(day, dt.time(15, 30))
+                    # 네이버는 정규장 시간대의 NXT 체결도 'OVER_MARKET'으로 준다. 라벨을 그대로
+                    # 믿으면 한낮 체결이 회색으로 칠해지므로, 색은 라벨이 아니라 시각으로 나눈다.
+                    segments = [
+                        ("프리장", over_only[over_only["시각"] < open_t], "#7f7f7f"),
+                        ("정규장", over_only[(over_only["시각"] >= open_t)
+                                           & (over_only["시각"] <= close_t)], "#d62728"),
+                        ("애프터장", over_only[over_only["시각"] > close_t], "#7f7f7f"),
+                    ]
+                    for label, seg, color in segments:
+                        if seg.empty:
+                            continue
+                        fig_intraday.add_trace(go.Scatter(
+                            x=seg["시각"], y=seg["가격"],
+                            # 개장 직후엔 점이 1–2개뿐이라 선만으로는 아무것도 안 보인다.
+                            # 마커를 같이 찍어 초반에도 보이게 한다.
+                            mode="lines+markers" if len(seg) < 10 else "lines",
+                            line=dict(color=color), marker=dict(size=4), name=label,
+                            hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>" + label + "</extra>",
+                        ))
+                        host_traces += 1
+                    has_over = True
+                    host_is_today = fallback_day is None
+
+                    x_start = min(over_only["시각"].min().to_pydatetime(),
+                                  dt.datetime.combine(day, dt.time(8, 0)))
+                    x_end = max(over_only["시각"].max().to_pydatetime(),
+                                dt.datetime.combine(day, dt.time(9, 0)))
+                    # 오늘 프리장만 그릴 때는 아직 정규장 전이라 기준선이 '직전 종가'(=close_price).
+                    # 지난 거래일을 되살려 그릴 때는 그 날의 종가가 close_price이므로 전일 종가로.
+                    base_price = close_price if host_is_today else close_price - change
                     # add_hline(도형)이 아니라 트레이스로 그려야 ADR로 전환할 때 같이 숨는다.
                     fig_intraday.add_trace(go.Scatter(
-                        x=[x_start, x_end], y=[close_price, close_price], mode="lines",
+                        x=[x_start, x_end], y=[base_price, base_price], mode="lines",
                         line=dict(color="gray", dash="dash", width=1), opacity=0.6,
-                        name="직전 종가", hoverinfo="skip", showlegend=False,
+                        name="기준 종가", hoverinfo="skip", showlegend=False,
                     ))
                     host_traces += 1
-                    host_title = f"프리장 ({today_kst})"
-                    has_over = True
-                    host_is_today = True      # 오늘 프리장 기록만으로 그린 화면
-                    help_lines.append(
-                        f"점선은 직전 정규장 종가({close_price:,}원) 기준선입니다. "
-                        "09:00에 정규장이 열리면 본장 그래프에 이어붙습니다."
-                    )
+
+                    if host_is_today:
+                        host_title = f"프리장 ({day})"
+                        help_lines.append(
+                            f"점선은 직전 정규장 종가({base_price:,}원) 기준선입니다. "
+                            "09:00에 정규장이 열리면 본장 그래프에 이어붙습니다."
+                        )
+                    else:
+                        host_title = f"본주 ({day})"
+                        # 정규장 시작·종료 세로선은 아래 공통 코드가 host_shapes로 그린다
+                        for boundary in (open_t, close_t):
+                            host_shapes.append(dict(
+                                type="line", x0=boundary, x1=boundary, yref="paper", y0=0, y1=1,
+                                line=dict(color="gray", dash="dot", width=1), opacity=0.35,
+                            ))
+                        help_lines.append(
+                            f"네이버 분봉이 자정에 초기화돼서, 서버가 20초마다 직접 기록한 값으로 "
+                            f"{day} 하루치를 그렸습니다(08:00–20:00). 점선은 전 거래일 종가"
+                            f"({base_price:,}원) 기준선이고, 세로 점선은 정규장 시작·종료 시각입니다."
+                        )
             else:
                 trade_date = intraday_df["시각"].iloc[-1].date()
                 x_start = dt.datetime.combine(trade_date, dt.time(9, 0))
