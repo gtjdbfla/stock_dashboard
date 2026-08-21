@@ -1168,6 +1168,17 @@ ADR_SYMBOL = os.environ.get("ADR_SYMBOL", "SKHY")      # 나스닥 상장 SK하�
 ADR_HOST_TICKER = "000660"                              # ADR 비교 대상 본주
 # 공식 비율: 1 ADR = 본주 0.1주 (ADR : 본주 = 1 : 10)
 ADR_SHARE_RATIO = float(os.environ.get("ADR_SHARE_RATIO", "0.1"))
+# 국내 증권사가 파는 '미국주식 주간거래(데이장)'는 Blue Ocean ATS의 오버나이트 세션
+# (미국 동부 20:00–04:00 = 한국 09:00–17:00)이다. 브로커 앱에서는 이 시간에 SKHY 값이
+# 움직이는데 대시보드는 '마감'으로 뜨니, 왜 다른지 화면에서 바로 알 수 있게 적어둔다.
+# 2026-08-21 한국 10:24(세션 진행 중)에 확인: 야후 1분봉은 이 구간 봉이 0개이고,
+# 네이버 해외주식도 marketStatus=CLOSE / overMarketPriceInfo=null 이었다.
+ADR_DAY_SESSION_NOTE = (
+    "**국내 증권사 '주간거래(데이장)'와 다를 수 있습니다.** 주간거래는 한국 09:00–17:00에 "
+    "돌아가는 미국 오버나이트 세션(Blue Ocean ATS)인데, 그 체결가는 증권사 유료 시세라 "
+    "무료 공개 경로(야후·네이버)에 나오지 않습니다. 이 화면은 미국 프리장–정규장–애프터장만 "
+    "반영하므로, 한국 낮 시간에는 값이 멈춰 있는 게 맞습니다."
+)
 ADR_BASELINE_DAYS = 20
 
 
@@ -2547,6 +2558,7 @@ def render_current_price():
                                         f"다음 프리장 개장: {adr['next_open'] or '-'} KST\n\n"
                                         f"미국 거래시간(KST): 프리장 17:00–22:30, 정규장 22:30–익일 05:00, "
                                         f"애프터장 –익일 09:00 (서머타임 기준)\n\n"
+                                        f"{ADR_DAY_SESSION_NOTE}\n\n"
                                         f"{basis_help}"
                                     )
                                 st.metric(
@@ -2898,7 +2910,8 @@ def render_current_price():
                         help_lines.append(
                             f"**ADR(SKHY) 버튼**을 누르면 나스닥 상장분의 하루치가 같은 자리에 나옵니다 "
                             f"{adr_range_txt}.\n\n"
-                            "ADR 화면도 본주와 같은 색 규칙입니다. 정규장은 빨간색, 프리장·애프터장은 회색."
+                            "ADR 화면도 본주와 같은 색 규칙입니다. 정규장은 빨간색, 프리장·애프터장은 회색.\n\n"
+                            f"{ADR_DAY_SESSION_NOTE}"
                         )
                     elif host_available:
                         # 한국장이 닫혀 있어 ADR을 먼저 띄운 경우
