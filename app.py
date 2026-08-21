@@ -232,6 +232,20 @@ st.markdown(
     div[data-testid="stTable"] {
         overflow-x: auto !important;
     }
+    /* 코스피 전체 수급: 순매수는 초록, 순매도는 빨강. 화면의 다른 상승/하락 색과 같은 톤이다.
+       st.metric은 delta에만 색을 주므로, 숫자(값)까지 칠하려면 이렇게 직접 지정해야 한다. */
+    div[class*="st-key-metric_small_flow_buy_"] [data-testid="stMetricValue"],
+    div[class*="st-key-metric_small_flow_buy_"] [data-testid="stMetricDelta"],
+    div[class*="st-key-metric_small_flow_buy_"] [data-testid="stMetricDelta"] svg {
+        color: #1a9e5f !important;
+        fill: #1a9e5f !important;
+    }
+    div[class*="st-key-metric_small_flow_sell_"] [data-testid="stMetricValue"],
+    div[class*="st-key-metric_small_flow_sell_"] [data-testid="stMetricDelta"],
+    div[class*="st-key-metric_small_flow_sell_"] [data-testid="stMetricDelta"] svg {
+        color: #e04b4b !important;
+        fill: #e04b4b !important;
+    }
     /* 제목 + 물음표 버튼은 모바일에서도 한 줄에 붙어 있어야 한다 (기본은 세로로 쌓임).
        제목 칸을 글자 너비에 맞게 줄여서 물음표가 제목 바로 옆에 오도록 한다. */
     div[class*="st-key-help_row_"] div[data-testid="stHorizontalBlock"] {
@@ -2577,41 +2591,6 @@ def render_current_price():
         st.session_state["current_price_value"] = close_price
 
         try:
-            flow = fetch_market_flow()
-            if flow:
-                live = flow["is_today"]
-                flow_help = (
-                    "**이 종목이 아니라 코스피 시장 전체 수급입니다.**\n\n"
-                    "종목별 장중 수급은 한국거래소가 장 마감 후에만 공개해서 무료로는 구할 수 없습니다. "
-                    "증권사 HTS가 장중에 보여주는 종목별 수급은 거래소 유료 실시간 피드입니다.\n\n"
-                    "시장 전체 잠정치는 장중 1~2분마다 갱신됩니다. 이 종목의 수급으로 읽지 말고, "
-                    "'오늘 시장에서 외국인이 사는 날인가 파는 날인가' 정도의 배경으로만 보세요.\n\n"
-                    "종목별 일별 확정 수급은 **수급 현황** 탭에 있습니다."
-                )
-                _bold_label_with_help(
-                    f"코스피 전체 수급 ({'장중 잠정' if live else flow['날짜'] + ' 확정'}, 억원)",
-                    flow_help, key="market_flow",
-                )
-                with st.container(key="price_row_market_flow"):
-                    cols = st.columns(4)
-                    items = [
-                        ("개인", flow["개인"], "normal"),
-                        ("외국인", flow["외국인"], "normal"),
-                        ("기관계", flow["기관계"], "normal"),
-                        ("프로그램 비차익", flow["비차익"], "normal"),
-                    ]
-                    for col, (label, value, color) in zip(cols, items):
-                        with col.container(key=f"metric_small_flow_{label}"):
-                            st.metric(
-                                label,
-                                f"{value:+,.0f}" if value is not None else "N/A",
-                                delta="순매수" if (value or 0) > 0 else ("순매도" if value else None),
-                                delta_color=color,
-                            )
-        except Exception as exc:
-            _note_optional_failure("코스피 전체 수급", exc)
-
-        try:
             intraday_df = fetch_intraday_price(TICKER)
             today_kst = dt.datetime.now(om.KST).date()
 
@@ -2940,6 +2919,41 @@ def render_current_price():
                 st.plotly_chart(fig_intraday, width="stretch", key="chart_intraday_price", config={"displayModeBar": False})
         except Exception as exc:
             _note_optional_failure("장중 주가 추이", exc)
+
+        # 장중 그래프 아래. 종목 그래프를 먼저 보고, 그 다음에 시장 전체 배경을 보는 순서다.
+        try:
+            flow = fetch_market_flow()
+            if flow:
+                live = flow["is_today"]
+                flow_help = (
+                    "**이 종목이 아니라 코스피 시장 전체 수급입니다.**\n\n"
+                    "종목별 장중 수급은 한국거래소가 장 마감 후에만 공개해서 무료로는 구할 수 없습니다. "
+                    "증권사 HTS가 장중에 보여주는 종목별 수급은 거래소 유료 실시간 피드입니다.\n\n"
+                    "시장 전체 잠정치는 장중 1~2분마다 갱신됩니다. 이 종목의 수급으로 읽지 말고, "
+                    "'오늘 시장에서 외국인이 사는 날인가 파는 날인가' 정도의 배경으로만 보세요.\n\n"
+                    "종목별 일별 확정 수급은 **수급 현황** 탭에 있습니다."
+                )
+                _bold_label_with_help(
+                    f"코스피 전체 수급 ({'장중 잠정' if live else flow['날짜'] + ' 확정'}, 억원)",
+                    flow_help, key="market_flow",
+                )
+                with st.container(key="price_row_market_flow"):
+                    cols = st.columns(4)
+                    items = [("개인", flow["개인"]), ("외국인", flow["외국인"]),
+                             ("기관계", flow["기관계"]), ("프로그램 비차익", flow["비차익"])]
+                    for col, (label, value) in zip(cols, items):
+                        # 순매수=초록 / 순매도=빨강. st.metric은 delta만 색을 입히고 값에는
+                        # 못 입혀서, 컨테이너 key에 buy/sell을 넣고 CSS로 숫자를 칠한다.
+                        side = "none" if not value else ("buy" if value > 0 else "sell")
+                        with col.container(key=f"metric_small_flow_{side}_{label}"):
+                            st.metric(
+                                label,
+                                f"{value:+,.0f}" if value is not None else "N/A",
+                                delta={"buy": "순매수", "sell": "순매도"}.get(side),
+                                delta_color="off",   # 색은 아래 CSS가 값·델타 양쪽에 같이 준다
+                            )
+        except Exception as exc:
+            _note_optional_failure("코스피 전체 수급", exc)
     except Exception as e:
         st.error(f"현재가 조회에 실패했습니다: {e}")
         st.session_state["current_price_summary"] = "현재가 데이터를 가져오지 못함"
