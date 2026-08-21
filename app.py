@@ -303,33 +303,27 @@ st.markdown(
         word-wrap: break-word !important;
     }
     @media (max-width: 640px) {
-        div[class*="st-key-price_row_columns"] div[data-testid="stHorizontalBlock"] {
-            flex-direction: row !important;
-            flex-wrap: wrap !important;
-        }
-        div[class*="st-key-price_row_columns"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
-            flex: 1 1 45% !important;
-            width: 45% !important;
-            min-width: 45% !important;
-        }
-        div[class*="st-key-price_row_columns"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
-            flex: 1 1 100% !important;
-            width: 100% !important;
-            min-width: 100% !important;
-        }
-        /* 괴리율 + ADR 3종(4칸)과 시간외 시세(2칸)도 좁은 화면에서 2열로 접는다.
-           안 접으면 한 줄에 4개가 밀려들어가 숫자가 잘린다. */
-        div[class*="st-key-price_row_deviation"] div[data-testid="stHorizontalBlock"],
-        div[class*="st-key-price_row_over"] div[data-testid="stHorizontalBlock"] {
+        /* 현재가 주변의 지표 줄들은 좁은 화면에서 2열로 접는다.
+           안 접으면 Streamlit 기본값대로 한 칸씩 전체 폭을 먹고 세로로 쌓여서,
+           숫자 네 개에 화면 한 판을 다 쓰게 된다.
+           컨테이너 이름을 하나씩 적는 대신 st-key-price_row_ 접두어로 한 번에 잡는다.
+           예전에 개별 나열식이라, 새로 추가한 줄(코스피 전체 수급)이 목록에서 빠져
+           혼자만 세로로 늘어지는 일이 있었다. */
+        div[class*="st-key-price_row_"] div[data-testid="stHorizontalBlock"] {
             flex-direction: row !important;
             flex-wrap: wrap !important;
             gap: 0.25rem !important;
         }
-        div[class*="st-key-price_row_deviation"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
-        div[class*="st-key-price_row_over"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        div[class*="st-key-price_row_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
             flex: 1 1 47% !important;
             width: 47% !important;
             min-width: 47% !important;
+        }
+        /* 현재가 줄만 예외: 첫 칸(현재가 본체)은 한 줄을 다 쓴다. */
+        div[class*="st-key-price_row_columns"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
+            flex: 1 1 100% !important;
+            width: 100% !important;
+            min-width: 100% !important;
         }
         /* 라벨이 길어(예: "80일선 괴리율 (현재가 기준)") 두 줄로 넘어가도 값이 밀리지 않게 */
         div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"] {
