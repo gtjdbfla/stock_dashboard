@@ -94,6 +94,9 @@ NEGATIVE_KEYWORDS = [
     "악재", "약세", "하한가", "신저가", "붕괴", "패닉", "팔아", "매도", "손실", "탈출",
     "폭락", "마이너스", "마이나스", "개미눈물",
 ]
+# fetch_investor_netbuy가 돌려주는 순매수 열. 거래량·종가가 같은 표에 붙어 있어서,
+# '투자자별'만 훑어야 하는 곳(그래프·누적추세·AI 요약)이 열 목록을 여기서 가져다 쓴다.
+INVESTOR_COLUMNS = ("개인", "외국인", "기관")
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_COMMUNITY_POST_COUNT = 60
 # 가격 과열도 기본 파라미터. 이동평균 7종 x 예측기간 5종 x 임계폭 5종(168개 유효 조합)을 SK하이닉스
@@ -463,7 +466,10 @@ def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜")
     df = df[df["날짜"] >= cutoff].sort_values("날짜")
     df["개인"] = -(df["기관"] + df["외국인"])
-    df = df.set_index("날짜")[["개인", "외국인", "기관"]]
+    # 순매수 세 열 뒤에 거래량·종가를 덧붙인다. 순매수는 '누가 샀나'만 알려줄 뿐,
+    # 그 날 거래가 얼마나 활발했는지는 알 수 없어서 절대 거래량을 같이 본다.
+    # 순매수 열만 골라 쓰는 곳이 있으므로 순서를 지켜 INVESTOR_COLUMNS를 앞에 둔다.
+    df = df.set_index("날짜")[list(INVESTOR_COLUMNS) + ["거래량", "종가"]]
     return df
 
 
@@ -3291,7 +3297,10 @@ def _render_tab_supply():
         "개인·기관·외국인이 이 종목을 하루에 얼마나 순매수(매수-매도)했는지와, 그 누적 추세를 봅니다. "
         "아래 표의 기울기는 누적 순매수 추세선의 하루 평균 기울기로, 양수면 매수 우위입니다.\n\n"
         "개인 순매수는 네이버가 따로 제공하지 않아 기관·외국인 합산의 잔차로 추정한 값이라 "
-        "기타법인 등의 소액 오차가 섞일 수 있습니다.",
+        "기타법인 등의 소액 오차가 섞일 수 있습니다.\n\n"
+        "**절대 거래량**도 같이 그립니다. 순매수는 '누가 샀나'만 알려줄 뿐이라, 같은 순매수라도 "
+        "거래량이 평소의 3배인 날과 절반인 날은 의미가 다릅니다. 막대 색은 그 날 종가가 "
+        "전일 대비 올랐으면 초록, 내렸으면 빨강입니다.",
         key="supply",
     )
     lookback_days = st.slider(
@@ -3305,12 +3314,60 @@ def _render_tab_supply():
         if df.empty:
             st.warning("투자자 수급 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
         else:
-            df_long = df.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="순매수")
+            flows = df[list(INVESTOR_COLUMNS)]
+            df_long = flows.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="순매수")
             fig_bar = px.bar(df_long, x="날짜", y="순매수", color="투자자", barmode="group")
             _style_chart_mobile(fig_bar, title="일별 순매수 거래량(주)")
             st.plotly_chart(fig_bar, width="stretch", key="chart_investor_bar", config={"displayModeBar": False})
 
-            df_cum = df.cumsum()
+            # 절대 거래량. 순매수는 '누가 샀나'만 말해줄 뿐 그 날 얼마나 활발했는지는 안 보인다.
+            # 같은 순매수라도 거래량이 평소의 3배인 날과 절반인 날은 의미가 다르다.
+            if "거래량" in df.columns and df["거래량"].notna().any():
+                vol = df["거래량"].astype(float)
+                # 상승 마감이면 초록, 하락이면 빨강 (화면의 다른 색 규칙과 동일)
+                direction = df["종가"].astype(float).diff()
+                colors = [_DOWN_COLOR if d < 0 else _UP_COLOR for d in direction.fillna(0)]
+                avg_window = min(20, max(len(vol) // 3, 2))
+                vol_avg = vol.rolling(avg_window, min_periods=1).mean()
+
+                fig_vol = go.Figure()
+                fig_vol.add_trace(go.Bar(
+                    x=df.index, y=vol, marker_color=colors, name="거래량",
+                    hovertemplate="%{x|%m-%d}  %{y:,.0f}주<extra>거래량</extra>",
+                ))
+                fig_vol.add_trace(go.Scatter(
+                    x=df.index, y=vol_avg, mode="lines", name=f"{avg_window}일 평균",
+                    line=dict(color="#7f7f7f", width=1.5),
+                    hovertemplate="%{x|%m-%d}  %{y:,.0f}주<extra>" + f"{avg_window}일 평균</extra>",
+                ))
+                _style_chart_mobile(fig_vol, title="일별 거래량(주) — 상승 마감 초록 / 하락 마감 빨강")
+                fig_vol.update_yaxes(title_text="거래량(주)")
+                st.plotly_chart(fig_vol, width="stretch", key="chart_volume",
+                                config={"displayModeBar": False})
+
+                latest_vol = float(vol.iloc[-1])
+                base_vol = float(vol_avg.iloc[-1])
+                vcol1, vcol2, vcol3 = st.columns(3)
+                with vcol1.container(key="metric_small_vol_last"):
+                    # 이 표는 장 마감 후 확정되는 값이라 오늘치가 아니다. 화면 위쪽 현재가의
+                    # 실시간 거래량과 다른 날짜라서, 날짜를 라벨에 박아 헷갈리지 않게 한다.
+                    st.metric(f"{vol.index[-1]:%m-%d} 거래량", f"{latest_vol:,.0f}주",
+                              delta=f"{avg_window}일 평균 대비 {latest_vol / base_vol - 1:+.0%}"
+                              if base_vol else None, delta_color="off")
+                with vcol2.container(key="metric_small_vol_avg"):
+                    st.metric(f"{avg_window}일 평균 거래량", f"{base_vol:,.0f}주")
+                with vcol3.container(key="metric_small_vol_max"):
+                    peak_day = vol.idxmax()
+                    st.metric("기간 내 최대", f"{vol.max():,.0f}주",
+                              delta=f"{peak_day:%m-%d}", delta_color="off")
+                st.caption(
+                    "이 표는 장 마감 후 확정되는 값이라 오늘치는 다음 날 들어옵니다 "
+                    "(오늘 실시간 거래량은 화면 맨 위 현재가 옆에 있습니다).\n\n"
+                    "거래량이 평소보다 크게 늘어난 날은 위 순매수 그래프에서 누가 움직였는지 같이 보세요. "
+                    "다만 거래량 자체는 이 종목 과거 데이터에서 방향 예측력이 없었습니다 — 크기의 참고치로만 쓰세요."
+                )
+
+            df_cum = flows.cumsum()
             df_cum_long = df_cum.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="누적 순매수")
             fig_line = px.line(df_cum_long, x="날짜", y="누적 순매수", color="투자자")
             _style_chart_mobile(fig_line, title="누적 순매수 추세")
@@ -4828,10 +4885,20 @@ def _render_tab_ai():
 
                 if not investor_df.empty:
                     recent = investor_df.tail(5)
-                    supply_summary = "\n".join(
+                    # 순매수 열만 돈다. 같은 표에 거래량·종가가 붙어 있어서 전체 열을 돌면
+                    # '거래량 순매수 합계' 같은 말이 안 되는 줄이 생긴다.
+                    lines = [
                         f"- 최근 {len(recent)}거래일 {col} 순매수 합계: {recent[col].sum():+,.0f}주"
-                        for col in recent.columns
-                    )
+                        for col in INVESTOR_COLUMNS if col in recent.columns
+                    ]
+                    if "거래량" in investor_df.columns and investor_df["거래량"].notna().any():
+                        vols = investor_df["거래량"].astype(float)
+                        lines.append(
+                            f"- 절대 거래량: 최근 {vols.iloc[-1]:,.0f}주, "
+                            f"기간 평균 {vols.mean():,.0f}주 대비 {vols.iloc[-1] / vols.mean() - 1:+.0%} "
+                            f"(기간 최대 {vols.max():,.0f}주)"
+                        )
+                    supply_summary = "\n".join(lines)
                 else:
                     supply_summary = "수급 데이터를 가져오지 못함"
 
