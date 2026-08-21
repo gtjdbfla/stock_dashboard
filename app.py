@@ -380,7 +380,11 @@ with st.sidebar:
     st.header("설정")
     # 매매 신호: 하이닉스 10년 백테스트는 강했지만 다른 20종목에서 재현되지 않아(예측력 평균 –0)
     # 기본으로 숨긴다. 참고 지표로 보고 싶을 때만 켜서 쓴다.
-    DEFAULT_HIDDEN_TAB_LABELS = {"매매 신호", "선물 경보", "통합 신호", "하락 조기신호", "상승 조기신호"}
+    # 커뮤니티 탭은 잘 안 보게 돼서 기본으로 숨긴다. 매 렌더마다 네이버 종목토론방(0.7초)과
+    # 디시 갤러리(0.9초)를 훑어서 콜드 로딩의 4분의 1쯤을 차지했다.
+    # 여론 자체는 AI 분석에 build_community_summary()로 계속 들어간다.
+    DEFAULT_HIDDEN_TAB_LABELS = {"매매 신호", "선물 경보", "통합 신호",
+                                 "하락 조기신호", "상승 조기신호", "커뮤니티"}
     with st.expander("표시할 탭 선택"):
         visible_tab_labels = [
             label for label in ALL_TAB_LABELS
@@ -1543,6 +1547,46 @@ def fetch_disclosures(ticker: str, count: int = 20, body_days: int = 3) -> str:
     return "\n".join(lines)
 
 
+def build_community_summary(ticker: str, stock_name: str, titles_per_source: int = 35) -> str:
+    """AI 분석에 넘길 커뮤니티 여론. 비율만이 아니라 '제목 원문'까지 같이 넘긴다.
+
+    커뮤니티 탭은 기본으로 꺼져 있어서 탭 렌더링에 기대면 안 된다. 그래서 여기서 직접 모은다.
+    비율(긍정 40% 부정 35%)만 주면 AI가 '의견이 갈린다'는 하나 마나 한 말밖에 못 한다.
+    실제 제목을 읽혀야 무엇이 대세인지, 무엇을 걱정하는지 짚어낼 수 있다.
+    분류는 키워드 방식을 쓴다. AI 분류는 호출을 하나 더 먹는데, 어차피 분석 모델이
+    제목 원문을 직접 읽으므로 여기서 굳이 정확도를 살 이유가 없다.
+    """
+    blocks = []
+    try:
+        posts = fetch_community_posts(ticker, DEFAULT_COMMUNITY_POST_COUNT)
+    except Exception:
+        posts = pd.DataFrame()
+    if not posts.empty:
+        labeled = classify_sentiment(posts)
+        counts = labeled["심리"].value_counts()
+        total = len(labeled)
+        pos, neg, neu = (int(counts.get(k, 0)) for k in ("긍정", "부정", "중립"))
+        days = labeled["날짜"].nunique()
+        blocks.append(
+            f"[네이버 종목토론방] 최근 {total}건({days}일치) — "
+            f"긍정 {pos}건({pos / total:.0%}) / 부정 {neg}건({neg / total:.0%}) / 중립 {neu}건({neu / total:.0%})"
+            " (키워드 기반 대략치)\n"
+            + "\n".join(f"  - [{r['심리']}] {r['날짜']} {r['제목']}"
+                        for _, r in labeled.head(titles_per_source).iterrows())
+        )
+    try:
+        dc = fetch_dc_gallery_posts(stock_name, DEFAULT_COMMUNITY_POST_COUNT)
+    except Exception:
+        dc = pd.DataFrame()
+    if not dc.empty:
+        blocks.append(
+            f"[디시인사이드 주식갤러리] {len(dc)}건 (종목 전용 갤러리가 아니라 검색 결과)\n"
+            + "\n".join(f"  - {r['날짜']} {r['제목']} (조회 {r['조회수']}, 추천 {r['추천']})"
+                        for _, r in dc.head(titles_per_source).iterrows())
+        )
+    return "\n\n".join(blocks)
+
+
 def build_over_market_summary(ticker: str, close_price: int | None) -> str:
     """프리장·애프터장(NXT)에서 오늘 실제로 무슨 일이 있었는지 정리한다.
 
@@ -2294,8 +2338,8 @@ def generate_ai_analysis(
 [해외 상장분(ADR) 괴리율]
 {adr_md if adr_md else "(해당 없음)"}
 
-[투자자 커뮤니티 심리 — 참고용, 사실 아님]
-{community_summary}
+[투자자 커뮤니티 — 게시글 원문. 여론이지 사실이 아님]
+{community_summary if community_summary else "(수집 실패)"}
 
 아래 형식 그대로, 한국어로 작성해줘.
 
@@ -2338,6 +2382,16 @@ def generate_ai_analysis(
 ## 근거의 무게
 위 강세·약세 중 지금 더 무거운 쪽은 어디이고 왜인지 2–3문장.
 '확인된 실적·가격 데이터'가 '기대·심리'보다 무겁다는 기준으로 판단해라.
+
+## 커뮤니티 대세 반응
+게시글 제목을 실제로 읽고, 지금 개인 투자자 사이에서 **우세한 반응이 무엇인지** 2–3문장으로 짚어라.
+- 비율만 옮기지 마라("긍정 40% 부정 35%"는 그 자체로는 아무 말도 아니다).
+  무엇을 기대하고 무엇을 걱정하는지, 반복해서 나오는 화제가 무엇인지를 써라.
+- 근거로 실제 제목을 1–2개 짧게 인용해라.
+- 대세와 다른 소수 의견이 눈에 띄면 한 줄로 덧붙여라.
+- 여론이 위 강세·약세 근거와 어긋나면 그 점을 지적해라 (예: 데이터는 우호적인데 여론은 공포).
+- 반어법·비꼬는 말투가 많은 곳이다. 표면 단어가 아니라 문맥으로 읽어라.
+- 이건 사실이 아니라 여론이다. 여기서 나온 이야기를 사실 근거로 올려 쓰지 마라.
 
 ## 지금 위치
 현재가가 컨센서스 목표주가, 52주 고저, PER 대비 어디에 있는지 숫자로 정리해줘.
@@ -3034,11 +3088,14 @@ REFRESH_GROUPS = [
 
 
 def _refresh_all_indicator_caches(progress_bar=None) -> None:
-    """'지표 새로고침' 버튼용: 예약된 자동 새로고침 대상 전체 + 커뮤니티(디시인사이드)를 한 번에 갱신한다."""
-    fetch_dc_gallery_posts.clear()
-    steps = [(label, fn) for _, label, _, fn in REFRESH_GROUPS] + [
-        ("디시인사이드 주식갤러리", lambda: fetch_dc_gallery_posts(STOCK_NAME, DEFAULT_COMMUNITY_POST_COUNT)),
-    ]
+    """'지표 새로고침' 버튼용: 예약된 자동 새로고침 대상 전체를 한 번에 갱신한다."""
+    steps = [(label, fn) for _, label, _, fn in REFRESH_GROUPS]
+    # 디시 갤러리는 커뮤니티 탭이 켜져 있을 때만. 꺼놓고도 매번 긁으면
+    # 아무도 안 보는 데이터를 받느라 새로고침이 1초 가까이 길어진다.
+    if "커뮤니티" in (globals().get("visible_tab_labels") or ALL_TAB_LABELS):
+        fetch_dc_gallery_posts.clear()
+        steps.append(("디시인사이드 주식갤러리",
+                      lambda: fetch_dc_gallery_posts(STOCK_NAME, DEFAULT_COMMUNITY_POST_COUNT)))
     for i, (label, fetch_fn) in enumerate(steps):
         if progress_bar is not None:
             progress_bar.progress(i / len(steps), text=f"{label} 수집 중... ({i + 1}/{len(steps)})")
@@ -4715,6 +4772,10 @@ def _render_tab_ai():
         "방향이 바뀌는 날은 종가만 봐서는 알 수 없기 때문입니다.\n\n"
         "각 근거에는 `[갈래] 내용 (근거 숫자)` 형태로 출처를 달게 하고, 매크로 숫자는 이 종목까지 "
         "어떻게 연결되는지 설명하게 합니다. 마지막에 어느 쪽 근거가 더 무거운지도 짚습니다.\n\n"
+        "**커뮤니티 대세 반응**도 따로 정리합니다. 비율만 넘기면 '의견이 갈린다'는 뻔한 답이 나와서, "
+        "네이버 종목토론방·디시 갤러리 게시글 **제목 원문**을 그대로 읽혀서 무엇을 기대하고 무엇을 "
+        "걱정하는지 짚게 했습니다. 반어법이 많은 곳이라 문맥으로 읽으라고 지시해뒀고, "
+        "여론이 데이터와 어긋나면 그 점도 지적하게 합니다. 커뮤니티 탭을 꺼놔도 들어갑니다.\n\n"
         "동일업종 비교가 들어가면서 '오늘 움직임이 이 종목만의 이슈인지, 업종 전체가 같이 움직인 것인지'를 "
         "구분할 수 있게 됐습니다. 위쪽 지표는 AI를 돌리지 않아도 바로 보입니다.\n\n"
         "버튼을 누를 때만 실행됩니다(자동 갱신 없음). AI가 잘못 짚거나 지어낼 수 있으니, "
@@ -4836,6 +4897,12 @@ def _render_tab_ai():
                     market_flow_md = build_market_flow_summary()
                 except Exception:
                     market_flow_md = ""
+                # 커뮤니티 탭은 기본으로 꺼져 있어서 탭이 채워주는 전역값에 기댈 수 없다.
+                # 여기서 직접 모아 제목 원문까지 넘긴다.
+                try:
+                    community_md = build_community_summary(TICKER, STOCK_NAME)
+                except Exception:
+                    community_md = ""
 
                 adr_md = ""
                 if TICKER == ADR_HOST_TICKER:
@@ -4863,7 +4930,7 @@ def _render_tab_ai():
                 analysis, search_note = generate_ai_analysis(
                     f"{STOCK_NAME}({TICKER})",
                     time_label, price_summary, supply_summary, headlines, reports_md,
-                    dram_summary, community_summary, composite_summary, overheat_summary, futures_summary,
+                    dram_summary, community_md, composite_summary, overheat_summary, futures_summary,
                     trendforce_md, snapshot_md, news_md, use_search,
                     macro_md, sector_news_md, adr_md,
                     disclosure_md, over_market_md, intraday_md, market_flow_md,
@@ -4882,6 +4949,7 @@ def _render_tab_ai():
                 st.session_state["ai_analysis_over_market"] = over_market_md
                 st.session_state["ai_analysis_intraday"] = intraday_md
                 st.session_state["ai_analysis_market_flow"] = market_flow_md
+                st.session_state["ai_analysis_community"] = community_md
             except Exception as e:
                 st.error(f"AI 분석 생성에 실패했습니다: {e}")
 
@@ -4898,6 +4966,7 @@ def _render_tab_ai():
                 for label, key in (("오늘 장중 흐름", "ai_analysis_intraday"),
                                    ("정규장 밖 움직임 (프리장·애프터장)", "ai_analysis_over_market"),
                                    ("코스피 시장 전체 수급", "ai_analysis_market_flow"),
+                                   ("커뮤니티 게시글", "ai_analysis_community"),
                                    ("전자공시", "ai_analysis_disclosure")):
                     value = st.session_state.get(key)
                     if value:
