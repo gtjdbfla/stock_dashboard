@@ -3146,10 +3146,52 @@ def _get_group_refresh_state(group_key: str, hours: list[int]) -> dict:
     return store[group_key]
 
 
+# 장 마감 후 수급 확정치를 기다리는 구간. 고정 시각표(16·17·18·19시)만 쓰면
+# 네이버가 그 사이에 올릴 때 최대 한 시간을 그냥 기다리게 된다.
+# 이 구간에는 1페이지만 싸게 찔러보고(약 0.15초), 오늘 날짜가 뜨는 즉시 받아온다.
+POST_CLOSE_WATCH_FROM = dt.time(15, 40)
+POST_CLOSE_WATCH_TO = dt.time(20, 0)
+POST_CLOSE_PROBE_SEC = 300
+
+
+def _today_flow_published(ticker: str) -> bool:
+    """오늘자 투자자 수급이 네이버에 올라왔는지 1페이지만 받아 확인한다."""
+    try:
+        page = _fetch_frgn_page(ticker, 1)
+    except Exception:
+        return False
+    if page.empty:
+        return False
+    return page["날짜"].max().date() == dt.datetime.now(om.KST).date()
+
+
+def _post_close_catch_up(now: dt.datetime, store: dict) -> bool:
+    """마감 후 구간에서 오늘치가 올라왔으면 즉시 갱신한다. 하루 한 번만 돈다."""
+    if now.weekday() >= 5 or not (POST_CLOSE_WATCH_FROM <= now.time() <= POST_CLOSE_WATCH_TO):
+        return False
+    today = now.date()
+    done_key = f"post_close_done:{TICKER}"
+    if store.get(done_key) == today:
+        return False
+    # 브라우저 세션마다 이 조각이 돌기 때문에, 탐침 간격은 서버 전체에서 공유되는
+    # 저장소로 묶는다. 창을 여러 개 열어놔도 5분에 한 번만 찔러본다.
+    probe_key = f"post_close_probe:{TICKER}"
+    last_probe = store.get(probe_key)
+    if last_probe and (now - last_probe).total_seconds() < POST_CLOSE_PROBE_SEC:
+        return False
+    store[probe_key] = now
+    if not _today_flow_published(TICKER):
+        return False
+    _refresh_market_data_caches()
+    store[done_key] = today
+    return True
+
+
 @st.fragment(run_every=REFRESH_CHECK_INTERVAL_SEC)
 def _auto_refresh_indicators():
     now = dt.datetime.now()
     any_refreshed = False
+    store = _get_global_refresh_state_store()
     for name, _label, hours, refresh_fn in REFRESH_GROUPS:
         state = _get_group_refresh_state(_group_state_key(name), hours)
         latest_slot = _last_passed_schedule_slot(hours, now)
@@ -3158,6 +3200,16 @@ def _auto_refresh_indicators():
             state["last_slot"] = latest_slot
             state["last_time"] = now
             any_refreshed = True
+
+    # 시각표와 별개로, 마감 후에는 공개되는 즉시 따라잡는다
+    try:
+        if _post_close_catch_up(now, store):
+            state = _get_group_refresh_state(_group_state_key("market_data"), MARKET_DATA_REFRESH_HOURS)
+            state["last_time"] = now
+            any_refreshed = True
+    except Exception:
+        pass  # 탐침 실패가 나머지 새로고침을 막지 않게 한다
+
     if any_refreshed:
         st.rerun(scope="app")
 
@@ -3170,9 +3222,20 @@ _status_parts = []
 for _name, _label, _hours, _ in REFRESH_GROUPS:
     _state = _get_group_refresh_state(_group_state_key(_name), _hours)
     _due_slot = _last_passed_schedule_slot(_hours, _now)
-    if _due_slot > _state["last_slot"] and _now >= _due_slot + dt.timedelta(seconds=REFRESH_CHECK_INTERVAL_SEC * 3):
+    _in_post_close_watch = (
+        _name == "market_data" and _now.weekday() < 5
+        and POST_CLOSE_WATCH_FROM <= _now.time() <= POST_CLOSE_WATCH_TO
+    )
+    if (not _in_post_close_watch and _due_slot > _state["last_slot"]
+            and _now >= _due_slot + dt.timedelta(seconds=REFRESH_CHECK_INTERVAL_SEC * 3)):
         _stalled_groups.append(f"{_label}(**{_due_slot:%H:%M}**)")
-    _status_parts.append(f"{_label} 다음 **{_next_schedule_slot(_hours, _now):%H:%M}**")
+    # 마감 후 감시 구간에는 시각표가 아니라 '올라오는 즉시'가 실제 동작이라 그렇게 적는다
+    if (_name == "market_data" and _now.weekday() < 5
+            and POST_CLOSE_WATCH_FROM <= _now.time() <= POST_CLOSE_WATCH_TO
+            and _get_global_refresh_state_store().get(f"post_close_done:{TICKER}") != _now.date()):
+        _status_parts.append(f"{_label} **공개되는 즉시** (5분마다 확인)")
+    else:
+        _status_parts.append(f"{_label} 다음 **{_next_schedule_slot(_hours, _now):%H:%M}**")
 
 # 색을 직접 지정하지 않고 기본 본문 색을 그대로 쓴다. 밝은 테마에선 검정, 다크 모드에선 흰색으로
 # 자동으로 바뀌어 시가·고가 같은 지표 글자와 같은 톤이 된다.
