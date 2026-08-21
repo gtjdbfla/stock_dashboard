@@ -1388,6 +1388,84 @@ def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
     return items
 
 
+# 코스피 '전체' 투자자별·프로그램 매매. 종목별 장중 수급은 한국거래소가 장 마감 후에만
+# 배포해서 무료로는 구할 수 없다(네이버·다음·KRX 모두 전 거래일까지만 준다. 2026-08-21 확인).
+# 대신 시장 전체 잠정치는 장중 1~2분마다 갱신되므로, 종목별이 아니라는 점을 명시하고 참고로 쓴다.
+NAVER_INVESTOR_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
+NAVER_PROGRAM_TREND_URL = "https://finance.naver.com/sise/programDealTrendDay.naver"
+
+
+def _fetch_market_trend_row(url: str) -> dict | None:
+    """네이버 시장 전체 매매동향 표에서 가장 최근(=맨 윗줄) 행을 뽑는다. 단위는 억원."""
+    resp = requests.get(url, params={"bizdate": dt.datetime.now(om.KST).strftime("%Y%m%d"), "sosok": "01"},
+                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"},
+                        timeout=10)
+    resp.raise_for_status()
+    resp.encoding = "euc-kr"
+    table = pd.read_html(StringIO(resp.text))[0]
+    # 헤더가 2단이라 MultiIndex로 잡힌다. '기관 금융투자'처럼 이어 붙여 단순한 이름으로 바꾼다.
+    table.columns = [c[1] if c[0] == c[1] else f"{c[0]} {c[1]}" for c in table.columns]
+    table = table.dropna(how="all")
+    date_col = table.columns[0]
+    table = table[table[date_col].astype(str).str.match(r"\d{2}\.\d{2}\.\d{2}")]
+    if table.empty:
+        return None
+    row = table.iloc[0]
+    out = {"날짜": str(row[date_col])}
+    for col in table.columns[1:]:
+        out[col] = float(row[col]) if pd.notna(row[col]) else None
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_market_flow() -> dict | None:
+    """코스피 전체 투자자별 순매수 + 프로그램 매매(차익/비차익)를 한 번에.
+
+    반환값의 is_today로 '장중 잠정치'인지 '직전 거래일 확정치'인지 구분한다.
+    """
+    try:
+        with _streamlit_pool(2) as pool:
+            inv_f = pool.submit(_fetch_market_trend_row, NAVER_INVESTOR_TREND_URL)
+            prg_f = pool.submit(_fetch_market_trend_row, NAVER_PROGRAM_TREND_URL)
+        inv, prg = inv_f.result(), prg_f.result()
+    except Exception:
+        return None
+    if not inv:
+        return None
+    today_txt = dt.datetime.now(om.KST).strftime("%y.%m.%d")
+    return {
+        "날짜": inv["날짜"],
+        "is_today": inv["날짜"] == today_txt,
+        "개인": inv.get("개인"),
+        "외국인": inv.get("외국인"),
+        "기관계": inv.get("기관계"),
+        "연기금등": inv.get("기관 연기금등"),
+        "차익": (prg or {}).get("차익거래 순매수"),
+        "비차익": (prg or {}).get("비차익거래 순매수"),
+    }
+
+
+def build_market_flow_summary() -> str:
+    """AI 분석에 넘길 시장 전체 수급 요약."""
+    flow = fetch_market_flow()
+    if not flow:
+        return ""
+    when = "장중 잠정치" if flow["is_today"] else "직전 거래일 확정치"
+    def fmt(v):
+        return f"{v:+,.0f}억원" if v is not None else "N/A"
+    lines = [
+        f"- 코스피 전체 투자자별 순매수 ({flow['날짜']}, {when}): "
+        f"개인 {fmt(flow['개인'])} / 외국인 {fmt(flow['외국인'])} / 기관계 {fmt(flow['기관계'])}"
+        f" (연기금등 {fmt(flow['연기금등'])})",
+    ]
+    if flow["비차익"] is not None:
+        lines.append(f"- 코스피 프로그램 매매: 차익 {fmt(flow['차익'])} / 비차익 {fmt(flow['비차익'])}"
+                     " (비차익은 외국인·기관 바스켓 매매의 대용 지표)")
+    lines.append("- 주의: 이 수치는 코스피 시장 전체이지 이 종목의 수급이 아니다. "
+                 "종목별 장중 수급은 거래소가 마감 후에만 공개하므로, 방향의 참고로만 써라.")
+    return "\n".join(lines)
+
+
 NAVER_DISCLOSURE_URL = "https://m.stock.naver.com/api/stock/{code}/disclosure"
 
 
@@ -2133,6 +2211,7 @@ def generate_ai_analysis(
     disclosure_md: str = "",
     over_market_md: str = "",
     intraday_md: str = "",
+    market_flow_md: str = "",
 ) -> tuple[str, str | None]:
     prompt = f"""오늘은 {time_label}입니다. 다음은 이 시점 기준 {stock_label} 관련 데이터입니다.
 
@@ -2154,8 +2233,11 @@ def generate_ai_analysis(
 [밸류에이션 · 컨센서스 · 동일업종 · 수급추이]
 {snapshot_md if snapshot_md else "(수집 실패)"}
 
-[최근 수급 동향]
+[최근 수급 동향 — 이 종목, 일별 확정치]
 {supply_summary}
+
+[코스피 시장 전체 수급 — 종목별 아님, 장중 잠정치]
+{market_flow_md if market_flow_md else "(수집 실패)"}
 
 [통합 매수/매도 신호 — 실험적 백테스트, 매매 신호 아님]
 {composite_summary}
@@ -2493,6 +2575,41 @@ def render_current_price():
         st.session_state["current_price_summary"] = f"종가 {close_price:,}원, 전일대비 {change:+,}원 ({change_pct:+.2f}%)"
         # AI 분석 탭에서 컨센서스 목표주가 대비 상승여력을 계산할 때 쓴다
         st.session_state["current_price_value"] = close_price
+
+        try:
+            flow = fetch_market_flow()
+            if flow:
+                live = flow["is_today"]
+                flow_help = (
+                    "**이 종목이 아니라 코스피 시장 전체 수급입니다.**\n\n"
+                    "종목별 장중 수급은 한국거래소가 장 마감 후에만 공개해서 무료로는 구할 수 없습니다. "
+                    "증권사 HTS가 장중에 보여주는 종목별 수급은 거래소 유료 실시간 피드입니다.\n\n"
+                    "시장 전체 잠정치는 장중 1~2분마다 갱신됩니다. 이 종목의 수급으로 읽지 말고, "
+                    "'오늘 시장에서 외국인이 사는 날인가 파는 날인가' 정도의 배경으로만 보세요.\n\n"
+                    "종목별 일별 확정 수급은 **수급 현황** 탭에 있습니다."
+                )
+                _bold_label_with_help(
+                    f"코스피 전체 수급 ({'장중 잠정' if live else flow['날짜'] + ' 확정'}, 억원)",
+                    flow_help, key="market_flow",
+                )
+                with st.container(key="price_row_market_flow"):
+                    cols = st.columns(4)
+                    items = [
+                        ("개인", flow["개인"], "normal"),
+                        ("외국인", flow["외국인"], "normal"),
+                        ("기관계", flow["기관계"], "normal"),
+                        ("프로그램 비차익", flow["비차익"], "normal"),
+                    ]
+                    for col, (label, value, color) in zip(cols, items):
+                        with col.container(key=f"metric_small_flow_{label}"):
+                            st.metric(
+                                label,
+                                f"{value:+,.0f}" if value is not None else "N/A",
+                                delta="순매수" if (value or 0) > 0 else ("순매도" if value else None),
+                                delta_color=color,
+                            )
+        except Exception as exc:
+            _note_optional_failure("코스피 전체 수급", exc)
 
         try:
             intraday_df = fetch_intraday_price(TICKER)
@@ -4688,6 +4805,10 @@ def _render_tab_ai():
                     over_market_md = build_over_market_summary(TICKER, cur_close)
                 except Exception:
                     over_market_md = ""
+                try:
+                    market_flow_md = build_market_flow_summary()
+                except Exception:
+                    market_flow_md = ""
 
                 adr_md = ""
                 if TICKER == ADR_HOST_TICKER:
@@ -4718,7 +4839,7 @@ def _render_tab_ai():
                     dram_summary, community_summary, composite_summary, overheat_summary, futures_summary,
                     trendforce_md, snapshot_md, news_md, use_search,
                     macro_md, sector_news_md, adr_md,
-                    disclosure_md, over_market_md, intraday_md,
+                    disclosure_md, over_market_md, intraday_md, market_flow_md,
                 )
 
                 st.session_state["ai_search_note"] = search_note
@@ -4733,6 +4854,7 @@ def _render_tab_ai():
                 st.session_state["ai_analysis_disclosure"] = disclosure_md
                 st.session_state["ai_analysis_over_market"] = over_market_md
                 st.session_state["ai_analysis_intraday"] = intraday_md
+                st.session_state["ai_analysis_market_flow"] = market_flow_md
             except Exception as e:
                 st.error(f"AI 분석 생성에 실패했습니다: {e}")
 
@@ -4748,6 +4870,7 @@ def _render_tab_ai():
             with st.expander("분석에 사용된 원본 데이터 보기"):
                 for label, key in (("오늘 장중 흐름", "ai_analysis_intraday"),
                                    ("정규장 밖 움직임 (프리장·애프터장)", "ai_analysis_over_market"),
+                                   ("코스피 시장 전체 수급", "ai_analysis_market_flow"),
                                    ("전자공시", "ai_analysis_disclosure")):
                     value = st.session_state.get(key)
                     if value:
