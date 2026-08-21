@@ -3299,8 +3299,7 @@ def _render_tab_supply():
         "개인 순매수는 네이버가 따로 제공하지 않아 기관·외국인 합산의 잔차로 추정한 값이라 "
         "기타법인 등의 소액 오차가 섞일 수 있습니다.\n\n"
         "**절대 거래량**도 같이 그립니다. 순매수는 '누가 샀나'만 알려줄 뿐이라, 같은 순매수라도 "
-        "거래량이 평소의 3배인 날과 절반인 날은 의미가 다릅니다. 막대 색은 그 날 종가가 "
-        "전일 대비 올랐으면 초록, 내렸으면 빨강입니다.",
+        "거래량이 평소의 3배인 날과 절반인 날은 의미가 다릅니다 (자세한 설명은 그 그래프 옆 ❓에).",
         key="supply",
     )
     lookback_days = st.slider(
@@ -3340,7 +3339,19 @@ def _render_tab_supply():
                     line=dict(color="#7f7f7f", width=1.5),
                     hovertemplate="%{x|%m-%d}  %{y:,.0f}주<extra>" + f"{avg_window}일 평균</extra>",
                 ))
-                _style_chart_mobile(fig_vol, title="일별 거래량(주) — 상승 마감 초록 / 하락 마감 빨강")
+                # 설명은 제목 옆 ? 안으로. 그래프 아래 캡션으로 길게 깔면 화면이 어수선해진다.
+                _bold_label_with_help(
+                    "일별 거래량(주)",
+                    "막대 색은 그 날 종가가 전일 대비 올랐으면 초록, 내렸으면 빨강입니다. "
+                    f"회색 선은 {avg_window}일 이동평균이고, 조회 기간에 맞춰 자동으로 조정됩니다.\n\n"
+                    "이 표는 장 마감 후 확정되는 값이라 오늘치는 다음 날 들어옵니다 "
+                    "(오늘 실시간 거래량은 화면 맨 위 현재가 옆에 있습니다).\n\n"
+                    "거래량이 평소보다 크게 늘어난 날은 위 순매수 그래프에서 누가 움직였는지 같이 보세요. "
+                    "다만 거래량 자체는 이 종목 과거 데이터에서 방향 예측력이 없었습니다 — "
+                    "크기의 참고치로만 쓰세요.",
+                    key="volume",
+                )
+                _style_chart_mobile(fig_vol)
                 fig_vol.update_yaxes(title_text="거래량(주)")
                 st.plotly_chart(fig_vol, width="stretch", key="chart_volume",
                                 config={"displayModeBar": False})
@@ -3360,12 +3371,6 @@ def _render_tab_supply():
                     peak_day = vol.idxmax()
                     st.metric("기간 내 최대", f"{vol.max():,.0f}주",
                               delta=f"{peak_day:%m-%d}", delta_color="off")
-                st.caption(
-                    "이 표는 장 마감 후 확정되는 값이라 오늘치는 다음 날 들어옵니다 "
-                    "(오늘 실시간 거래량은 화면 맨 위 현재가 옆에 있습니다).\n\n"
-                    "거래량이 평소보다 크게 늘어난 날은 위 순매수 그래프에서 누가 움직였는지 같이 보세요. "
-                    "다만 거래량 자체는 이 종목 과거 데이터에서 방향 예측력이 없었습니다 — 크기의 참고치로만 쓰세요."
-                )
 
             df_cum = flows.cumsum()
             df_cum_long = df_cum.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="누적 순매수")
