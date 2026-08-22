@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY over_market.py .
 COPY collector.py .
+COPY flow_probe.py .
 COPY .streamlit/ .streamlit/
 
 EXPOSE 8501

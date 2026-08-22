@@ -8,6 +8,7 @@ import datetime as dt
 import sys
 import time
 
+import flow_probe
 import over_market as om
 
 # 로그 한 줄 때문에 수집기가 죽는 일이 없게 한다.
@@ -49,6 +50,13 @@ def main() -> None:
             if day is not None:
                 log(f"{day} 집계: {summary()}")
             day, recorded, skipped, failed = now.date(), 0, 0, 0
+
+        # 마감 후 투자자 수급이 어느 경로에 먼저 올라오는지 기록한다.
+        # 수집 시간대(~20:30) 판정보다 앞에 둔다. 탐침 창이 21:00까지라 대기 모드에서도 돌아야 한다.
+        try:
+            flow_probe.tick(now, log=log)
+        except Exception as exc:                # 탐침 때문에 시세 수집이 멈추면 안 된다
+            log(f"수급탐침 오류: {type(exc).__name__}: {exc}")
 
         if not om.in_collect_window(now):
             if last_state != "idle":

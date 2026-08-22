@@ -183,6 +183,20 @@ def _bold_label_with_help(label: str, help_text: str, key: str) -> None:
             st.markdown(help_text)
 
 
+def _metric_with_help(label: str, value, help_text: str, key: str, **metric_kwargs) -> None:
+    """물음표를 눌러야 설명이 열리는 지표.
+
+    st.metric(help=...)의 기본 물음표는 마우스를 올려야만 열린다. 화면 안에 클릭형(팝오버)과
+    hover형이 섞여 있으면 어느 쪽인지 매번 헷갈리고, 모바일에서는 hover 자체가 안 된다.
+    그래서 지표에도 팝오버를 붙이고, 위치는 CSS로 지표 칸 오른쪽 위에 고정한다
+    (라벨 길이가 제각각이라 라벨 바로 옆에 붙이면 줄이 흔들린다).
+    """
+    with st.container(key=f"metric_help_{key}"):
+        st.metric(label, value, **metric_kwargs)
+        with st.popover("", icon=":material/help:"):
+            st.markdown(help_text)
+
+
 def _style_chart_mobile(fig, title: str | None = None, show_legend: bool = True) -> None:
     """모바일 화면에서 확대/축소 등 모드바 아이콘이 제목과 겹치지 않도록 제목을 왼쪽 정렬하고
     상단 여백을 확보하며, 범례를 그래프 위쪽 가로 방향으로 옮긴다. 모든 차트에 공통 적용한다."""
@@ -293,6 +307,55 @@ st.markdown(
     }
     div[class*="st-key-help_row_"] button > div {
         gap: 0 !important;
+    }
+    /* 지표(st.metric)에 붙는 물음표. 라벨 길이가 제각각이라 라벨 옆이 아니라
+       지표 칸 오른쪽 위에 띄워 고정한다. 클릭해야 열리는 팝오버라 hover 툴팁과 동작이 같다. */
+    div[class*="st-key-metric_help_"] {
+        position: relative !important;
+    }
+    /* 팝오버 컨테이너와 버튼은 기본값이 칸 전체 폭이라, 그대로 두면 물음표 버튼이
+       라벨 글자 위를 통째로 덮어 라벨 아무 데나 눌러도 열린다. 아이콘 크기로 좁힌다. */
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] {
+        position: absolute !important;
+        top: 0 !important;
+        right: 0 !important;
+        width: auto !important;
+        min-width: 0 !important;
+        z-index: 1;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] > div,
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button {
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button {
+        background: none !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        min-height: 0 !important;
+        height: auto !important;
+        opacity: 0.45;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button:hover {
+        opacity: 1;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button div[aria-hidden="true"] {
+        display: none !important;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button [data-testid="stIconMaterial"] {
+        font-size: 0.95rem !important;
+        width: 0.95rem !important;
+        height: 0.95rem !important;
+        margin: 0 !important;
+    }
+    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button > div {
+        gap: 0 !important;
+    }
+    /* 물음표가 값 위에 겹치지 않도록 라벨 오른쪽에 자리를 비워둔다 */
+    div[class*="st-key-metric_help_"] [data-testid="stMetricLabel"] {
+        padding-right: 1.2rem !important;
     }
     div[data-baseweb="tooltip"] {
         max-width: min(85vw, 320px) !important;
@@ -465,6 +528,38 @@ def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     # 순매수 열만 골라 쓰는 곳이 있으므로 순서를 지켜 INVESTOR_COLUMNS를 앞에 둔다.
     df = df.set_index("날짜")[list(INVESTOR_COLUMNS) + ["거래량", "종가"]]
     return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_daily_ohlcv(ticker: str, days: int) -> pd.DataFrame:
+    """일별 종가·거래량. 투자자 수급(frgn.naver)과 달리 마감 직후 바로 확정된다.
+
+    같은 네이버인데도 공개 시점이 다르다. 15:51에 재보니 일봉 경로는 이미 당일치가
+    올라와 있는 반면(종가 1,730,000 / 거래량 4,247,406), 수급 페이지는 아직 전 거래일까지였다.
+    거래량 그래프까지 수급과 같은 소스에 묶어두면 볼 수 있는 값을 몇 시간씩 늦게 보게 된다.
+    """
+    end = dt.datetime.now(om.KST)
+    start = end - dt.timedelta(days=days + 10)     # 휴장일을 감안해 여유를 둔다
+    try:
+        r = requests.get(f"https://api.stock.naver.com/chart/domestic/item/{ticker}/day",
+                         params={"startDateTime": start.strftime("%Y%m%d0000"),
+                                 "endDateTime": end.strftime("%Y%m%d2359")},
+                         headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"},
+                         timeout=10)
+        r.raise_for_status()
+        rows = r.json()
+    except Exception:
+        return pd.DataFrame(columns=["거래량", "종가"])
+    if not isinstance(rows, list) or not rows:
+        return pd.DataFrame(columns=["거래량", "종가"])
+    df = pd.DataFrame([{
+        "날짜": pd.to_datetime(str(x.get("localDate")), format="%Y%m%d"),
+        "종가": float(x.get("closePrice") or 0),
+        "거래량": float(x.get("accumulatedTradingVolume") or 0),
+    } for x in rows if x.get("localDate")])
+    cutoff = pd.Timestamp(dt.datetime.now(om.KST).date() - dt.timedelta(days=days))
+    df = df[df["날짜"] >= cutoff].sort_values("날짜")
+    return df.set_index("날짜")[["거래량", "종가"]]
 
 
 def calc_slope(cum_series: pd.Series) -> float:
@@ -2553,12 +2648,13 @@ def render_current_price():
             with st.container(key="price_row_over"):
                 over_col, over_vol_col = st.columns([2, 3])
                 with over_col.container(key="metric_small_over_price"):
-                    st.metric(
-                        label=f"{session_label} (NXT) 실시간",
-                        value=f"{over_price:,.0f}원",
+                    _metric_with_help(
+                        f"{session_label} (NXT) 실시간",
+                        f"{over_price:,.0f}원",
+                        "정규장 종가 대비 변동입니다. 프리장은 전 거래일 종가, 애프터장은 당일 종가가 기준입니다.",
+                        key="over_price",
                         delta=f"{over_diff:+,.0f}원 ({over_pct:+.2f}%)",
                         delta_color="normal",
-                        help="정규장 종가 대비 변동입니다. 프리장은 전 거래일 종가, 애프터장은 당일 종가가 기준입니다.",
                     )
                 with over_vol_col.container(key="metric_small_over_volume"):
                     st.metric(f"{session_label} 거래량", over_volume)
@@ -2615,18 +2711,19 @@ def render_current_price():
                                         f"{ADR_DAY_SESSION_NOTE}\n\n"
                                         f"{basis_help}"
                                     )
-                                st.metric(
-                                    adr_label, f"${adr['price']:,.2f}",
-                                    delta=adr_delta, delta_color="normal", help=adr_help,
+                                _metric_with_help(
+                                    adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                    delta=adr_delta, delta_color="normal",
                                 )
                             # ADR 1주는 본주 0.1주에 해당하므로, 본주 환산가로 되돌려 비교한다
                             adr_per_share = adr_krw / ADR_SHARE_RATIO
                             with adr_krw_col.container(key="metric_small_adr_krw"):
-                                st.metric(
+                                _metric_with_help(
                                     "SKHY 본주환산", f"{adr_per_share:,.0f}원",
-                                    help=f"ADR ${adr['price']:,.2f} × 환율 {adr['fx']:,.1f} = {adr_krw:,.0f}원 "
-                                         f"(ADR 1주). 공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주로 나눠 "
-                                         "본주 1주 기준으로 환산한 금액입니다.",
+                                    f"ADR ${adr['price']:,.2f} × 환율 {adr['fx']:,.1f} = {adr_krw:,.0f}원 "
+                                    f"(ADR 1주). 공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주로 나눠 "
+                                    "본주 1주 기준으로 환산한 금액입니다.",
+                                    key="adr_krw",
                                 )
                             with adr_gap_col.container(key="metric_small_adr_gap"):
                                 gap = (adr_per_share / close_price - 1) * 100
@@ -2634,18 +2731,17 @@ def render_current_price():
                                 if baseline:
                                     base_gap = (baseline / ADR_SHARE_RATIO - 1) * 100
                                     delta = f"{gap - base_gap:+.1f}%p vs 최근평균"
-                                st.metric(
+                                _metric_with_help(
                                     "ADR 괴리율", f"{gap:+.1f}%",
+                                    f"공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주 기준으로, ADR이 본주보다 "
+                                    "얼마나 비싸게 거래되는지입니다.\n\n"
+                                    "이 종목은 평소에도 30–40%대 프리미엄이 붙어 있어서, 절대값보다 "
+                                    "'최근 평균 대비 얼마나 벌어졌나'(아래 숫자)가 더 의미 있습니다.\n\n"
+                                    "한국 종가와 미국 시세는 최대 13시간 차이가 나므로, 이 값에는 "
+                                    "그 사이의 시장 변화가 섞여 있습니다. 차익거래 기회가 아니라 "
+                                    "미국 쪽 평가를 보는 선행 지표로 읽으세요.",
+                                    key="adr_gap",
                                     delta=delta, delta_color="off",
-                                    help=(
-                                        f"공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주 기준으로, ADR이 본주보다 "
-                                        "얼마나 비싸게 거래되는지입니다.\n\n"
-                                        "이 종목은 평소에도 30–40%대 프리미엄이 붙어 있어서, 절대값보다 "
-                                        "'최근 평균 대비 얼마나 벌어졌나'(아래 숫자)가 더 의미 있습니다.\n\n"
-                                        "한국 종가와 미국 시세는 최대 13시간 차이가 나므로, 이 값에는 "
-                                        "그 사이의 시장 변화가 섞여 있습니다. 차익거래 기회가 아니라 "
-                                        "미국 쪽 평가를 보는 선행 지표로 읽으세요."
-                                    ),
                                 )
         except Exception as exc:
             # 괴리율·ADR은 부가 정보라 현재가 표시는 그대로 두되, 사라진 이유는 남긴다.
@@ -3378,21 +3474,31 @@ def _render_tab_supply():
 
             # 절대 거래량. 순매수는 '누가 샀나'만 말해줄 뿐 그 날 얼마나 활발했는지는 안 보인다.
             # 같은 순매수라도 거래량이 평소의 3배인 날과 절반인 날은 의미가 다르다.
-            if "거래량" in df.columns and df["거래량"].notna().any():
-                vol = df["거래량"].astype(float)
+            #
+            # 거래량은 수급표(frgn.naver)가 아니라 일봉 경로에서 따로 받는다. 같은 네이버인데도
+            # 공개 시점이 다르다 - 15:51에 재보니 일봉은 이미 당일치(종가 1,730,000 /
+            # 거래량 4,247,406)가 있는데 수급 페이지는 아직 전 거래일까지였다.
+            # 한 소스에 묶어두면 이미 나와 있는 오늘 거래량을 몇 시간씩 못 보게 된다.
+            try:
+                ohlcv = fetch_daily_ohlcv(TICKER, lookback_days)
+            except Exception:
+                ohlcv = pd.DataFrame()
+            vol_src = ohlcv if not ohlcv.empty else df
+            if "거래량" in vol_src.columns and vol_src["거래량"].notna().any():
+                vol = vol_src["거래량"].astype(float)
                 # 상승 마감이면 초록, 하락이면 빨강 (화면의 다른 색 규칙과 동일)
-                direction = df["종가"].astype(float).diff()
+                direction = vol_src["종가"].astype(float).diff()
                 colors = [_DOWN_COLOR if d < 0 else _UP_COLOR for d in direction.fillna(0)]
                 avg_window = min(20, max(len(vol) // 3, 2))
                 vol_avg = vol.rolling(avg_window, min_periods=1).mean()
 
                 fig_vol = go.Figure()
                 fig_vol.add_trace(go.Bar(
-                    x=df.index, y=vol, marker_color=colors, name="거래량",
+                    x=vol_src.index, y=vol, marker_color=colors, name="거래량",
                     hovertemplate="%{x|%m-%d}  %{y:,.0f}주<extra>거래량</extra>",
                 ))
                 fig_vol.add_trace(go.Scatter(
-                    x=df.index, y=vol_avg, mode="lines", name=f"{avg_window}일 평균",
+                    x=vol_src.index, y=vol_avg, mode="lines", name=f"{avg_window}일 평균",
                     line=dict(color="#7f7f7f", width=1.5),
                     hovertemplate="%{x|%m-%d}  %{y:,.0f}주<extra>" + f"{avg_window}일 평균</extra>",
                 ))
@@ -3401,8 +3507,9 @@ def _render_tab_supply():
                     "일별 거래량(주)",
                     "막대 색은 그 날 종가가 전일 대비 올랐으면 초록, 내렸으면 빨강입니다. "
                     f"회색 선은 {avg_window}일 이동평균이고, 조회 기간에 맞춰 자동으로 조정됩니다.\n\n"
-                    "이 표는 장 마감 후 확정되는 값이라 오늘치는 다음 날 들어옵니다 "
-                    "(오늘 실시간 거래량은 화면 맨 위 현재가 옆에 있습니다).\n\n"
+                    "거래량은 일봉 경로에서 따로 받아서, 마감 직후 오늘치가 바로 들어옵니다. "
+                    "위 순매수 그래프는 투자자 수급이 공개된 뒤에야 오늘치가 채워지므로, "
+                    "마감 직후에는 거래량 쪽이 하루 앞서 있을 수 있습니다.\n\n"
                     "거래량이 평소보다 크게 늘어난 날은 위 순매수 그래프에서 누가 움직였는지 같이 보세요. "
                     "다만 거래량 자체는 이 종목 과거 데이터에서 방향 예측력이 없었습니다 — "
                     "크기의 참고치로만 쓰세요.",
@@ -4084,7 +4191,12 @@ def _render_tab_signal():
 
         col1, col2, col3 = st.columns(3)
         col1.metric("현재 판정", "매수 · 보유" if is_buy else "매도 · 현금")
-        col2.metric("신호값", f"{current:+.2f}", help="0보다 크면 기관 순매수 우위. 0에서 멀수록 강한 신호입니다.")
+        with col2.container(key="metric_small_signal_value"):
+            _metric_with_help(
+                "신호값", f"{current:+.2f}",
+                "0보다 크면 기관 순매수 우위. 0에서 멀수록 강한 신호입니다.",
+                key="signal_value",
+            )
         col3.metric("현재 판정 지속", f"{streak}거래일")
 
         if is_buy:
@@ -4915,14 +5027,23 @@ def _render_tab_ai():
         col1, col2, col3, col4 = st.columns(4)
         with col1.container(key="metric_small_ai_target"):
             upside = f"{(target / cur - 1) * 100:+.0f}% 여력" if (target and cur) else None
-            st.metric("컨센서스 목표주가", f"{target:,.0f}원" if target else "N/A", delta=upside,
-                      delta_color="normal",
-                      help=f"증권사 평균 목표주가 (기준일 {snapshot.get('컨센서스일자') or '-'}). 기대치일 뿐 보장이 아닙니다.")
+            _metric_with_help(
+                "컨센서스 목표주가", f"{target:,.0f}원" if target else "N/A",
+                f"증권사 평균 목표주가 (기준일 {snapshot.get('컨센서스일자') or '-'}). "
+                "기대치일 뿐 보장이 아닙니다.",
+                key="ai_target", delta=upside, delta_color="normal",
+            )
         with col2.container(key="metric_small_ai_recomm"):
-            st.metric("투자의견 평균", snapshot.get("투자의견") or "N/A",
-                      help="5점 만점에 가까울수록 매수 의견이 우세하다는 뜻입니다.")
+            _metric_with_help(
+                "투자의견 평균", snapshot.get("투자의견") or "N/A",
+                "5점 만점에 가까울수록 매수 의견이 우세하다는 뜻입니다.",
+                key="ai_recomm",
+            )
         with col3.container(key="metric_small_ai_per"):
-            st.metric("PER", snapshot.get("PER") or "N/A", help=f"EPS {snapshot.get('EPS') or '-'}")
+            _metric_with_help(
+                "PER", snapshot.get("PER") or "N/A",
+                f"EPS {snapshot.get('EPS') or '-'}", key="ai_per",
+            )
         with col4.container(key="metric_small_ai_52w"):
             st.metric("52주 고/저", f"{snapshot.get('52주최고') or '-'} / {snapshot.get('52주최저') or '-'}")
 
@@ -4934,13 +5055,20 @@ def _render_tab_ai():
     if not os.environ.get("GEMINI_API_KEY"):
         st.info("AI 분석을 사용하려면 GEMINI_API_KEY 환경변수를 설정해주세요.")
     else:
-        use_search = st.toggle(
-            "업종·매크로 뉴스까지 넓게 수집",
-            key="ai_use_search", value=True,
-            help="종목명으로만 뉴스를 모으면 '올랐다/내렸다'는 시황 기사만 쌓여서 원인을 못 짚습니다.\n\n"
-                 "이 옵션을 켜면 HBM·메모리 업황·D램 가격·엔비디아·반도체 수출로도 각각 검색해서, "
-                 "주가가 왜 움직였는지에 해당하는 재료를 같이 넘깁니다. 수집에 몇 초 더 걸립니다.",
-        )
+        # 토글은 지표가 아니라 겹쳐 띄울 자리가 없다. 제목 옆 물음표와 같은 방식으로
+        # 토글 바로 오른쪽에 팝오버 버튼을 붙인다 (help_row_ CSS가 한 줄로 붙여준다).
+        with st.container(key="help_row_ai_search"):
+            _toggle_col, _toggle_help = st.columns([0.9, 0.1], vertical_alignment="center")
+            use_search = _toggle_col.toggle(
+                "업종·매크로 뉴스까지 넓게 수집",
+                key="ai_use_search", value=True,
+            )
+            with _toggle_help.popover("", icon=":material/help:"):
+                st.markdown(
+                    "종목명으로만 뉴스를 모으면 '올랐다/내렸다'는 시황 기사만 쌓여서 원인을 못 짚습니다.\n\n"
+                    "이 옵션을 켜면 HBM·메모리 업황·D램 가격·엔비디아·반도체 수출로도 각각 검색해서, "
+                    "주가가 왜 움직였는지에 해당하는 재료를 같이 넘깁니다. 수집에 몇 초 더 걸립니다."
+                )
         if st.button("지금 바로 분석하기"):
             try:
                 price_summary = st.session_state.get("current_price_summary", "현재가 데이터를 가져오지 못함")
@@ -4953,8 +5081,14 @@ def _render_tab_ai():
                         f"- 최근 {len(recent)}거래일 {col} 순매수 합계: {recent[col].sum():+,.0f}주"
                         for col in INVESTOR_COLUMNS if col in recent.columns
                     ]
-                    if "거래량" in investor_df.columns and investor_df["거래량"].notna().any():
-                        vols = investor_df["거래량"].astype(float)
+                    # 거래량은 수급보다 먼저 확정되므로 빠른 경로를 우선 쓴다
+                    try:
+                        _ohlcv = fetch_daily_ohlcv(TICKER, DEFAULT_LOOKBACK_DAYS)
+                    except Exception:
+                        _ohlcv = pd.DataFrame()
+                    _vol_src = _ohlcv if not _ohlcv.empty else investor_df
+                    if "거래량" in _vol_src.columns and _vol_src["거래량"].notna().any():
+                        vols = _vol_src["거래량"].astype(float)
                         lines.append(
                             f"- 절대 거래량: 최근 {vols.iloc[-1]:,.0f}주, "
                             f"기간 평균 {vols.mean():,.0f}주 대비 {vols.iloc[-1] / vols.mean() - 1:+.0%} "
