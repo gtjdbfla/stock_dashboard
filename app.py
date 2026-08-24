@@ -192,9 +192,11 @@ def _metric_with_help(label: str, value, help_text: str, key: str, **metric_kwar
     (라벨 길이가 제각각이라 라벨 바로 옆에 붙이면 줄이 흔들린다).
     """
     with st.container(key=f"metric_help_{key}"):
-        st.metric(label, value, **metric_kwargs)
-        with st.popover("", icon=":material/help:"):
-            st.markdown(help_text)
+        # 라벨과 물음표를 한 줄에 붙인다 ('장중 주가 추이'와 같은 방식).
+        # 지표 칸 오른쪽 끝에 고정했더니 라벨이 짧을수록 멀리 떨어져 보였다.
+        _bold_label_with_help(label, help_text, key=f"metric_{key}")
+        # 라벨은 위에서 직접 그렸으므로 지표 자체의 라벨은 접는다
+        st.metric(label, value, label_visibility="collapsed", **metric_kwargs)
 
 
 def _style_chart_mobile(fig, title: str | None = None, show_legend: bool = True) -> None:
@@ -308,54 +310,33 @@ st.markdown(
     div[class*="st-key-help_row_"] button > div {
         gap: 0 !important;
     }
-    /* 지표(st.metric)에 붙는 물음표. 라벨 길이가 제각각이라 라벨 옆이 아니라
-       지표 칸 오른쪽 위에 띄워 고정한다. 클릭해야 열리는 팝오버라 hover 툴팁과 동작이 같다. */
-    div[class*="st-key-metric_help_"] {
-        position: relative !important;
+    /* 지표에 붙는 물음표는 help_row_ 구조를 그대로 쓴다(라벨 바로 옆). 다만 지표 라벨은
+       제목이 아니라 값의 설명이므로, 굵은 제목 톤 대신 Streamlit 기본 지표 라벨 톤으로 낮춘다. */
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] p {
+        font-size: 0.875rem !important;
+        font-weight: 400 !important;
+        opacity: 0.7;
+        margin-bottom: 0 !important;
     }
-    /* 팝오버 컨테이너와 버튼은 기본값이 칸 전체 폭이라, 그대로 두면 물음표 버튼이
-       라벨 글자 위를 통째로 덮어 라벨 아무 데나 눌러도 열린다. 아이콘 크기로 좁힌다. */
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] {
-        position: absolute !important;
-        top: 0 !important;
-        right: 0 !important;
-        width: auto !important;
-        min-width: 0 !important;
-        z-index: 1;
+    /* 라벨 줄과 값 사이가 벌어지지 않게. 물음표 없는 일반 지표는 이 간격이 0이라
+       거기에 맞춘다 (팝오버 버튼이 라벨보다 키가 커서 줄 높이가 늘어난 만큼 당겨준다). */
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] {
+        margin-bottom: -0.85rem !important;
     }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] > div,
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button {
-        width: auto !important;
-        min-width: 0 !important;
-    }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button {
-        background: none !important;
-        border: none !important;
-        box-shadow: none !important;
-        padding: 0 !important;
-        margin: 0 !important;
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
+        div[data-testid="stHorizontalBlock"] {
         min-height: 0 !important;
-        height: auto !important;
+    }
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] button {
         opacity: 0.45;
     }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button:hover {
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] button:hover {
         opacity: 1;
     }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button div[aria-hidden="true"] {
-        display: none !important;
-    }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button [data-testid="stIconMaterial"] {
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] button [data-testid="stIconMaterial"] {
         font-size: 0.95rem !important;
         width: 0.95rem !important;
         height: 0.95rem !important;
-        margin: 0 !important;
-    }
-    div[class*="st-key-metric_help_"] div[data-testid="stPopover"] button > div {
-        gap: 0 !important;
-    }
-    /* 물음표가 값 위에 겹치지 않도록 라벨 오른쪽에 자리를 비워둔다 */
-    div[class*="st-key-metric_help_"] [data-testid="stMetricLabel"] {
-        padding-right: 1.2rem !important;
     }
     div[data-baseweb="tooltip"] {
         max-width: min(85vw, 320px) !important;
@@ -388,8 +369,25 @@ st.markdown(
             width: 100% !important;
             min-width: 100% !important;
         }
+        /* 위 47% 규칙은 price_row_ 안에 '중첩된' 칸까지 잡는다. 라벨+물음표 줄이 그 안에 있어서
+           라벨 칸이 47%로 늘어나면 물음표가 멀리 밀린다. 라벨 줄은 글자 너비에 맞춰 되돌린다. */
+        div[class*="st-key-help_row_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
+            flex: 0 1 auto !important;
+            width: auto !important;
+            min-width: 0 !important;
+        }
+        div[class*="st-key-help_row_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {
+            flex: 0 0 auto !important;
+            width: auto !important;
+            min-width: 0 !important;
+        }
         /* 라벨이 길어(예: "80일선 괴리율 (현재가 기준)") 두 줄로 넘어가도 값이 밀리지 않게 */
         div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"] {
+            font-size: 0.68rem !important;
+            line-height: 1.25 !important;
+        }
+        /* 물음표가 붙은 지표는 라벨을 직접 그리므로 그쪽도 같은 크기로 줄인다 */
+        div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] p {
             font-size: 0.68rem !important;
             line-height: 1.25 !important;
         }
