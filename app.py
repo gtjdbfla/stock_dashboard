@@ -4483,7 +4483,7 @@ _tab_map = dict(zip(_visible_tab_labels, tabs))
 # (SVG width=700, 오른쪽 끝 716px). config의 responsive는 window resize를 듣고 다시 그리므로,
 # 탭을 누른 뒤 resize를 한 번 쏴 주면 제 폭을 찾는다(실측 700 -> 343).
 # 리런마다 이 iframe이 새로 생기므로, 부모 창에 표시를 남겨 리스너가 겹쳐 붙지 않게 한다.
-st.components.v1.html(
+st.iframe(
     """
     <script>
     (function () {
