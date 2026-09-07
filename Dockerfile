@@ -14,6 +14,13 @@ COPY app.py .
 COPY over_market.py .
 COPY collector.py .
 COPY flow_probe.py .
+COPY ai_analysis.py .
+COPY analyst_digest.py .
+COPY analyst_targets.py .
+COPY disclosure.py .
+COPY financial_digest.py .
+COPY fnguide.py .
+COPY llm.py .
 COPY .streamlit/ .streamlit/
 
 EXPOSE 8501

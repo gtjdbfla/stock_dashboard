@@ -1,7 +1,11 @@
+import csv
 import datetime as dt
+import json
 import os
 import re
 import threading
+import time
+import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
@@ -13,6 +17,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import ai_analysis
+import analyst_digest
+import analyst_targets
+import disclosure
+import financial_digest
+import fnguide
 import over_market as om
 from bs4 import BeautifulSoup
 from google import genai
@@ -61,6 +71,9 @@ ALL_TAB_LABELS = [
     "상승 조기신호",
     "DRAM 시세",
     "빅테크 Capex",
+    "재무 데이터",
+    "공시",
+    "애널리스트",
     "커뮤니티",
     "AI 분석",
 ]
@@ -98,6 +111,17 @@ NEGATIVE_KEYWORDS = [
 # '투자자별'만 훑어야 하는 곳(그래프·누적추세·AI 요약)이 열 목록을 여기서 가져다 쓴다.
 INVESTOR_COLUMNS = ("개인", "외국인", "기관")
 DEFAULT_LOOKBACK_DAYS = 30
+
+# 하락·상승 조기신호의 조건값. 원래는 각 탭 함수 안에 있었는데, AI 분석에도 같은 값을
+# 넘기게 되면서 두 곳이 어긋날 수 있어 여기로 올렸다.
+DECLINE_PATTERN_WINDOW = 20
+DECLINE_PATTERN_VOL_WINDOW = 20
+DECLINE_HORIZON = 10
+DECLINE_DRAWDOWN_THRESHOLD = 0.07
+RALLY_PATTERN_WINDOW = 20
+RALLY_PATTERN_VOL_WINDOW = 20
+RALLY_HORIZON = 10
+RALLY_DRAWDOWN_THRESHOLD = 0.07
 DEFAULT_COMMUNITY_POST_COUNT = 60
 # 가격 과열도 기본 파라미터. 이동평균 7종 x 예측기간 5종 x 임계폭 5종(168개 유효 조합)을 SK하이닉스
 # 700거래일로 백테스트해, 괴리율 밴드가 커질수록 하락확률이 오르는 단조성(스피어만 ρ)이 가장 뚜렷하고
@@ -109,18 +133,217 @@ OVERHEAT_DEFAULT_THRESHOLD = 0.10
 DRAM_HISTORY_FILE = os.environ.get("DRAM_HISTORY_FILE", "data/dram_spot_history.csv")
 # 프리장/애프터장 시세는 over_market.py가 담당한다. 수집은 collector.py(별도 컨테이너)가 상시로 하고,
 # 화면은 쌓인 기록을 읽어 그래프에 이어붙이기만 한다.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-# 무료 요금제는 모델마다 하루 요청 수가 따로 잡힌다(예: gemini-3.7-flash 는 20회).
-# 기본 모델이 소진되면 아래 순서로 갈아타서 분석이 아예 안 되는 상황을 피한다.
+# 같은 프롬프트(15,800자)로 네 모델을 직접 재봤다. 섹션은 10개가 정상이다.
+#   gemini-flash-latest        첫글자 10.6초 / 완료 14.4초 / 섹션 2·10  187자   <- 망가진 답
+#   gemini-3.6-flash           첫글자  1.6초 / 완료 15.2초 / 섹션 10·10 3,322자
+#   gemini-flash-lite-latest   첫글자  1.2초 / 완료  9.8초 / 섹션 10·10 2,621자
+#   gemini-3.5-flash-lite      첫글자  1.2초 / 완료  9.7초 / 섹션 10·10 2,942자
+# gemini-flash-latest는 느린 게 아니라 이 프롬프트에서 답을 제대로 못 만든다(2/10 섹션에서 잘림).
+# 그런데도 기본값이라 매번 맨 먼저 불렀고, 응답이 늦은 날은 정체 감지에 25초를 더 버렸다.
+# 품질이 가장 좋은 3.6-flash를 기본으로 두고, 망가진 별칭은 맨 뒤로 미룬다.
+# (별칭이라 구글이 가리키는 대상이 바뀌면 다시 쓸 만해질 수 있어 목록에서 빼지는 않는다.)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# 무료 요금제는 모델마다 하루 요청 수가 따로 잡힌다. 기본 모델이 소진되면 갈아타되,
+# **아무 모델이나 쓰면 결과 편차가 그대로 사용자에게 간다.** 같은 프롬프트로 재본 값:
+#   gemini-3.6-flash          섹션 10/10  3,322자  출처태그 14  숫자 57   <- 기본
+#   gemini-3.5-flash-lite     섹션 10/10  2,942자  출처태그 12  숫자 54
+#   gemini-flash-lite-latest  섹션 10/10  2,621자  출처태그 12  숫자 51
+#   gemini-flash-latest       섹션  2/10    187자  <- 잘린 답. 목록에서 뺐다.
+# gemini-flash-latest는 폴백으로 두는 것이 실패보다 나쁘다. 잘린 분석이 멀쩡한 척 보이기 때문이다.
 GEMINI_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
-        "GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-flash-lite-latest,gemini-3.5-flash-lite"
+        "GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-flash-lite-latest"
     ).split(",") if m.strip()
 ]
+# 기본 모델이 한 번 지연·빈 응답이라고 바로 내려가면 품질 좋은 모델을 놓친다.
+# 폴백으로 내려가기 전에 기본 모델을 이만큼 더 시도한다.
+GEMINI_PRIMARY_RETRIES = int(os.environ.get("GEMINI_PRIMARY_RETRIES", "1"))
 
 
 def _is_quota_error(exc: Exception) -> bool:
     return "RateLimit" in type(exc).__name__ or "429" in str(exc)
+
+
+# 오늘 한도에 걸린 모델을 기억한다. 한도는 하루 단위라 한 번 막히면 그날은 계속 막히는데,
+# 매번 첫 모델부터 부르면 확정된 429를 받으려고 5초씩 버리게 된다(실측 5.2초).
+_GEMINI_EXHAUSTED: dict[str, dt.date] = {}
+
+
+def _gemini_models_to_try() -> list[str]:
+    order = ([GEMINI_MODEL] * (1 + GEMINI_PRIMARY_RETRIES)
+             + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL])
+    today = dt.datetime.now(om.KST).date()
+    fresh = [m for m in order if _GEMINI_EXHAUSTED.get(m) != today]
+    # 전부 소진으로 기록돼 있으면 그래도 한 번씩은 시도한다 (한도가 이미 풀렸을 수 있다)
+    return fresh or order
+
+
+def _mark_exhausted(model: str) -> None:
+    _GEMINI_EXHAUSTED[model] = dt.datetime.now(om.KST).date()
+
+
+# 한때 low로 낮춰 뒀었다. 속도만 보면 옳았지만(첫 글자 5.6초), 정확도를 재보니 그 대가가
+# 있었다. 2026-09-01 실제 프롬프트(16,324자)로 같은 질문을 던져 본 값:
+#   low   첫 글자  6.0초 / 완료 21.8초 / 2,939자 · 출처태그 10 · 동일업종 등락률을 틀림
+#   high  첫 글자 21.7초 / 완료 34.9초 / 2,675자 · 출처태그 14 · 등락률 정확
+# low는 "한미반도체 -2.54%"라고 썼는데 데이터에 적힌 값은 -2.49%였다(옆 종목인
+# 이수페타시스의 값을 끌어왔다). high는 두 번 돌려 두 번 다 맞혔다. 나열된 줄에서
+# 이름과 숫자의 짝을 맞추는 건 '검산'이라, 생각할 시간을 안 주면 틀린다.
+# 프롬프트로 "숫자를 검산해라"라고 시켜도 봤지만 low의 오류는 그대로였다.
+# 분석은 하루 몇 번 보는 것이고 스트리밍이라 기다림이 화면에 보인다. 13초 더 쓰고 정확한 쪽을 쓴다.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "high").strip()
+
+
+# max_output_tokens는 일부러 안 넣는다. 답이 중간에 잘리길래 상한을 직접 잡아봤는데,
+# 같은 모델에 1024·2048·4096·16384를 넣으면 전부 빈 응답이 오고 8192는 될 때도 안 될 때도 있었다.
+# 값 크기 문제가 아니라 이 필드를 얹으면 응답이 통째로 비는 일이 잦다. 잘림은 아래
+# _looks_truncated()로 알아채서 화면에 알리는 쪽으로 처리한다.
+def _gemini_gen_config() -> dict:
+    return {"generation_config": {"thinking_level": GEMINI_THINKING_LEVEL}} if GEMINI_THINKING_LEVEL else {}
+
+
+# 스트리밍 도중 "지금까지 받은 건 버리고 다시 시작한다"는 신호.
+# 잘린 답을 뱉은 모델을 버리고 다음 모델로 넘어갈 때, 화면에 이미 흘러간 글자를
+# 지우지 않으면 두 모델의 답이 이어붙어 보인다.
+_RESTART = object()
+
+# 이보다 짧으면서 마지막 섹션까지 없으면 '망가진 답'으로 보고 다음 모델로 넘어간다.
+# 실측: 망가진 응답은 187자, 정상은 2,600~3,400자였다. 그 사이에 선을 긋는다.
+# 길지만 마지막 섹션만 빠진 답은 버리지 않는다. 쓸 만한 데다, 다시 부르면 10초 넘게 더 든다.
+GEMINI_MIN_USABLE = int(os.environ.get("GEMINI_MIN_USABLE", "1000"))
+
+
+def _looks_truncated(text: str) -> bool:
+    """답이 중간에 끊겼는지. 마지막 섹션이 없으면 끊긴 것으로 본다.
+
+    모델이 스트림을 예고 없이 끝내는 일이 있다(실제로 "52주 최고가 대비 -44.1"에서 끊기고
+    마지막 섹션이 통째로 사라졌다). 잘린 걸 멀쩡한 답처럼 보여주면 안 되니 화면에 알린다.
+    """
+    if not text.strip():
+        return False        # 아예 빈 응답은 다른 경로에서 처리한다
+    return "앞으로 확인할 것" not in text
+
+
+def _md_safe(text: str) -> str:
+    """st.markdown에 넘겨도 글자가 안 깨지게 만든다.
+
+    st.markdown은 $...$ 사이를 LaTeX 수식으로 해석한다. DRAM 현물가를 '$227.500' 형식으로
+    넘겨주다 보니 AI가 그대로 인용했고, 한 줄에 달러 기호가 두 번 나오는 순간
+    '$227.500 (+1.11%), DDR5 RDIMM 32GB $' 가 통째로 수식으로 바뀌면서 글꼴이 달라지고
+    달러 기호까지 사라졌다. 달러 기호를 escape 해서 그냥 글자로 남긴다.
+    """
+    return re.sub(r"(?<!\\)\$", r"\\$", text)
+
+
+def _md_stream_safe(partial: str) -> str:
+    """스트리밍 도중의 조각용. 아직 안 닫힌 코드 표시가 뒷글을 통째로 먹지 않게 한다."""
+    out = _md_safe(partial)
+    if out.count("`") % 2:
+        i = out.rfind("`")
+        out = out[:i] + out[i + 1:]
+    return out
+
+
+def _is_thinking_unsupported(exc: Exception) -> bool:
+    """thinking_level을 못 받는 모델이 낸 400인지.
+
+    기본 모델 이름이 gemini-flash-latest 라는 '별칭'이라, 구글이 가리키는 대상을 바꾸면
+    이 필드를 안 받는 모델이 될 수 있다. 그때 분석이 통째로 죽지 않게 한 번은 빼고 재시도한다.
+    """
+    return "thinking_level" in str(exc)
+
+
+# 모델이 응답을 시작하지도, 이어가지도 않고 붙잡고 있을 때 몇 초까지 기다릴지.
+# 스트리밍이라 이 값은 '조각과 조각 사이 간격' 상한이 된다. 일단 글이 흐르기 시작하면
+# 조각 간격은 1초 미만이라 정상 응답을 자르지 않는다.
+# 실제로 gemini-flash-latest가 "hi" 한 마디에 122초 걸린 날이 있었고(한도 문제가 아니라
+# 그냥 느렸다), 그게 첫 시도 모델이라 분석 한 번이 288초까지 늘어졌다.
+# thinking_level=high는 말문을 떼기까지 오래 붙잡고 있는다. 같은 프롬프트를 며칠에 걸쳐
+# 재본 첫 글자까지의 시간: 21.7초(9/1) · 38.9초 · 48.1초 · 49.7초(9/4).
+# 길이 탓이 아니다 — 15,600자로 줄여도 48초가 나왔다. 그날그날 API가 얼마나 붐비냐의 문제다.
+# 60초로 두면 붐비는 날 정상 응답이 '지연'으로 버려지고, 애써 올린 정확도 대신 폴백 모델의
+# 답이 나온다. 넉넉히 준다. 이 값은 상한일 뿐이라 빨리 오는 날 손해 볼 것이 없다.
+GEMINI_STALL_SEC = float(os.environ.get("GEMINI_STALL_SEC", "120"))
+# 스트리밍 중 화면을 다시 그리는 최소 간격.
+STREAM_PAINT_SEC = float(os.environ.get("STREAM_PAINT_SEC", "0.4"))
+
+
+def _is_timeout(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    return "timeout" in name or "timeout" in str(exc).lower()
+
+
+def _stream_gemini(prompt: str, used: dict):
+    """모델을 순서대로 시도하며 응답 조각을 흘려준다.
+
+    한 번에 다 받으면 그동안 화면이 멈춘 것처럼 보인다. 흘려보내면 첫 문장이 곧바로 뜬다.
+    thinking_level까지 낮춘 뒤 실측(프롬프트 12,400자): 첫 글자 5.6초 / 완료 12.2초.
+    실제로 답한 모델명은 used["model"]에 넣어 호출부에 알린다.
+    """
+    client = genai.Client()
+    tried: list[str] = []
+    last_exc: Exception | None = None
+    order = _gemini_models_to_try()
+    # 오늘 이미 한도에 걸린 걸로 기억해서 아예 부르지도 않은 모델들. 이유를 함께 남겨야
+    # "왜 기본 모델을 안 썼나"를 화면에서 온전히 설명할 수 있다.
+    for skipped_model in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+        if skipped_model not in order:
+            used.setdefault("skipped", []).append((skipped_model, "오늘 무료 한도 소진"))
+    for pos, model in enumerate(order):
+        tried.append(model)
+        produced = False
+        got: list[str] = []            # 이 모델이 뱉은 것만 따로 모아 품질을 본다
+        for cfg in (_gemini_gen_config(), {}):
+            try:
+                for event in client.interactions.create(
+                        model=model, input=prompt, stream=True,
+                        timeout=GEMINI_STALL_SEC, **cfg):
+                    delta = getattr(event, "delta", None)
+                    text = getattr(delta, "text", None) if delta is not None else None
+                    if text:
+                        produced = True
+                        used["model"] = model
+                        got.append(text)
+                        yield text
+                if produced:
+                    whole = "".join(got)
+                    # 짧은 데다 마지막 섹션까지 없으면 쓸 수 없는 답이다. 남은 모델이 있으면
+                    # 그 답을 버리고 다시 시작한다(_RESTART로 화면에 흘린 글자도 지운다).
+                    if (_looks_truncated(whole) and len(whole) < GEMINI_MIN_USABLE
+                            and pos + 1 < len(order)):
+                        used.setdefault("skipped", []).append(
+                            (model, f"답이 {len(whole)}자에서 잘려 버림"))
+                        used.pop("model", None)
+                        yield _RESTART
+                        break
+                    return
+                # 예외 없이 조각을 하나도 안 준 경우다. 이것도 건너뛴 이유로 남겨야 한다.
+                # 안 남기면 화면에 "(사용 불가)"라고만 떠서 왜 다른 모델을 썼는지 알 수 없다.
+                used.setdefault("skipped", []).append((model, "빈 응답"))
+                break
+            except Exception as exc:
+                last_exc = exc
+                # 이미 글자가 나간 뒤 끊기면 다른 모델로 다시 시작할 수 없다. 그대로 올린다.
+                if produced:
+                    raise
+                # thinking_level을 못 받는 모델이면 그 옵션만 빼고 같은 모델로 한 번 더
+                if cfg and _is_thinking_unsupported(exc):
+                    continue
+                if _is_quota_error(exc):
+                    _mark_exhausted(model)
+                    used.setdefault("skipped", []).append((model, "오늘 무료 한도 소진"))
+                    break
+                # 말문을 못 떼고 붙잡고 있는 모델은 버리고 다음 모델로 간다.
+                # 오늘 소진으로 기록하지는 않는다. 한도가 아니라 그때그때의 지연이다.
+                if _is_timeout(exc):
+                    used.setdefault("skipped", []).append(
+                        (model, f"{GEMINI_STALL_SEC:.0f}초 동안 응답 없음"))
+                    break
+                raise
+    raise RuntimeError(
+        f"사용 가능한 모델을 찾지 못했습니다. 시도한 모델: {', '.join(tried)}. "
+        f"마지막 오류: {type(last_exc).__name__ if last_exc else '응답 없음'}"
+    )
 
 
 def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
@@ -132,15 +355,26 @@ def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
     client = genai.Client()
     tried: list[str] = []
     last_exc: Exception | None = None
-    for model in [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]:
+    for model in _gemini_models_to_try():
         tried.append(model)
-        try:
-            kwargs = {"tools": tools} if tools else {}
-            interaction = client.interactions.create(model=model, input=prompt, **kwargs)
-            return (interaction.output_text or "", model)
-        except Exception as exc:
-            last_exc = exc
-            if not _is_quota_error(exc):
+        for cfg in (_gemini_gen_config(), {}):
+            try:
+                kwargs = {"tools": tools} if tools else {}
+                kwargs.update(cfg)
+                # 이쪽은 스트리밍이 아니라 답을 다 만들 때까지 기다려야 한다.
+                # 그래서 상한을 넉넉히 잡는다(정상 생성이 30초대까지 걸린다).
+                interaction = client.interactions.create(
+                    model=model, input=prompt, timeout=GEMINI_STALL_SEC * 4, **kwargs)
+                return (interaction.output_text or "", model)
+            except Exception as exc:
+                last_exc = exc
+                if cfg and _is_thinking_unsupported(exc):
+                    continue
+                if _is_quota_error(exc):
+                    _mark_exhausted(model)
+                    break
+                if _is_timeout(exc):    # 붙잡고 있는 모델은 버리고 다음 모델로
+                    break
                 raise
     raise RuntimeError(
         f"사용 가능한 모델을 찾지 못했습니다. 시도한 모델: {', '.join(tried)}. "
@@ -157,9 +391,6 @@ FLOW_SIGNAL_WINDOW = 20        # 정규화된 순매수를 누적할 창
 # 기관 순매수는 장 마감 후에 공시되므로 t일 신호로는 t일 종가에 살 수 없다.
 # t+1일 종가 체결을 가정해 2일 밀어서 성과를 계산한다 (보수적).
 FLOW_SIGNAL_EXEC_LAG = 2
-# 국내 개인 온라인 계좌 기준 비용. 매도 시 증권거래세/농특세 0.15%가 추가된다.
-FLOW_COST_BUY = 0.00015 + 0.0010          # 위탁수수료 + 슬리피지
-FLOW_COST_SELL = 0.00015 + 0.0015 + 0.0010  # 위탁수수료 + 거래세 + 슬리피지
 FLOW_BACKTEST_DAYS = 1200
 
 
@@ -197,6 +428,13 @@ def _metric_with_help(label: str, value, help_text: str, key: str, **metric_kwar
         _bold_label_with_help(label, help_text, key=f"metric_{key}")
         # 라벨은 위에서 직접 그렸으므로 지표 자체의 라벨은 접는다
         st.metric(label, value, label_visibility="collapsed", **metric_kwargs)
+
+
+# Plotly는 숨겨진 탭(display:none) 안에서 그려지면 컨테이너 폭을 못 재고 기본 700px로 그린다.
+# 그리고 탭이 보이게 돼도 스스로 다시 계산하지 않는다. 데스크톱에서는 폭이 700 근처라 티가 안 났지만,
+# 모바일 375px에서는 차트 절반이 잘려 나갔다(SVG width=700, 오른쪽 끝 716px).
+# responsive를 켜면 컨테이너 크기 변화에 맞춰 다시 레이아웃한다.
+PLOTLY_CONFIG = {"displayModeBar": False, "responsive": True}
 
 
 def _style_chart_mobile(fig, title: str | None = None, show_legend: bool = True) -> None:
@@ -401,6 +639,31 @@ st.markdown(
         div[data-testid="stTable"] table,
         div[data-testid="stDataFrame"] {
             font-size: 0.8rem !important;
+        }
+        /* 글자만 줄여서는 부족하다. TrendForce 표는 그래도 제 칸을 9px 넘겨서 오른쪽이 잘렸다.
+           표를 칸 너비에 묶고 넘치는 만큼은 표 안에서 굴리게 한다. */
+        div[data-testid="stDataFrame"] {
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow-x: auto !important;
+        }
+        /* AI 분석의 '원본 데이터 보기'는 st.text로 긴 줄을 그대로 뿌린다. <pre>는 줄바꿈이
+           없어서 한 줄이 화면을 넘기면 블록마다 가로 스크롤이 생긴다. 접어서 보여준다. */
+        div[data-testid="stText"], div[data-testid="stText"] pre {
+            white-space: pre-wrap !important;
+            word-break: break-word !important;
+            font-size: 0.75rem !important;
+        }
+        /* 분석 본문의 표(강세/약세 비교 등)도 넘치면 가로로 굴린다 */
+        div[data-testid="stMarkdown"] table {
+            display: block !important;
+            overflow-x: auto !important;
+            width: 100% !important;
+        }
+        /* 물음표 설명은 글이 길다. 기본 팝오버 폭(약 400px)이 화면보다 넓어 오른쪽이 잘린다. */
+        div[data-testid="stPopoverBody"] {
+            max-width: 88vw !important;
+            font-size: 0.85rem !important;
         }
         /* 탭 이름이 많아 한 줄을 넘칠 때 가로 스크롤 */
         div[data-testid="stTabs"] div[role="tablist"] {
@@ -1480,6 +1743,16 @@ def _to_number(text: object) -> float | None:
         return None
 
 
+# 뉴스 카드에 붙는 게재 시점("3분 전", "2026.08.25."). 날짜 없이 제목만 넘기면 AI가
+# 일주일 전 기사를 '오늘 뉴스'로 옮겨 적는다. 실제로 그런 문장이 나왔다.
+_NEWS_WHEN_PAT = re.compile(r"^(\d+\s*(?:분|시간|일|주|개월)\s*전|\d{4}\.\d{2}\.\d{2}\.?)$")
+
+
+def _clean_text(text: str) -> str:
+    """<mark> 때문에 생기는 이중 공백만 정리한다. 낱말 사이 한 칸은 남긴다."""
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
 @st.cache_data(ttl=1800, show_spinner="불러오는 중...")
 def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
     """뉴스 제목만이 아니라 본문 요약까지 같이 가져온다.
@@ -1493,20 +1766,36 @@ def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
 
     items = []
     for head in soup.select("span.sds-comps-text-type-headline1")[:count]:
-        title = head.get_text(strip=True)
+        # 네이버는 검색어에 <mark>를 씌운다. strip=True를 주면 태그 안팎 조각을 각각
+        # 다듬은 뒤 공백 없이 붙여서 "반도체 수출209% 증가"가 된다(검색어는 늘 강조되므로
+        # 사실상 모든 제목이 해당된다). 구분자를 주면 이번엔 "반도체 주"처럼 없던 공백이
+        # 생긴다. strip 없이 뽑아야 태그 사이의 원문 공백이 그대로 남는다.
+        title = _clean_text(head.get_text())
         summary = ""
+        when = ""
         node = head
-        # 헤드라인에서 위로 올라가며 기사 카드를 찾고, 그 안에서 요약문을 뽑는다
+        # 헤드라인에서 위로 올라가며 요약문과 게재 시점을 뽑는다.
+        # 둘이 서로 다른 높이에 있어서, 요약을 찾자마자 멈추면 시점을 놓친다(실제로 0건이 나왔다).
+        # 둘 다 채워질 때까지 계속 올라간다.
         for _ in range(8):
             node = node.parent
             if node is None:
                 break
-            bodies = [b.get_text(strip=True) for b in node.select("span.sds-comps-text-type-body1")]
-            bodies = [b for b in bodies if len(b) > 40 and b != title]
-            if bodies:
-                summary = bodies[0]
+            if not when:
+                for sp in node.select("span"):
+                    t = sp.get_text(strip=True)
+                    if _NEWS_WHEN_PAT.match(t):
+                        when = t
+                        break
+            if not summary:
+                bodies = [_clean_text(b.get_text())
+                          for b in node.select("span.sds-comps-text-type-body1")]
+                bodies = [b for b in bodies if len(b) > 40 and b != title]
+                if bodies:
+                    summary = bodies[0]
+            if when and summary:
                 break
-        items.append({"제목": title, "요약": summary})
+        items.append({"제목": title, "요약": summary, "시점": when})
     return items
 
 
@@ -1565,6 +1854,108 @@ def fetch_market_flow() -> dict | None:
         "차익": (prg or {}).get("차익거래 순매수"),
         "비차익": (prg or {}).get("비차익거래 순매수"),
     }
+
+
+# ── 외국계 창구 추정 순매수 (장중) ──────────────────────────────────────────────
+# 종목별 투자자 3분류(외국인/기관/개인)는 장중에 공개되지 않는다. 무료 경로뿐 아니라
+# 증권사 공식 API도 '종목별 투자자매매동향(일별)'만 있고, 장중은 '회원사 실시간 매매동향(틱)'
+# 즉 거래원 기준뿐이다. 거래소가 그렇게 공개하기 때문이지 출처를 못 찾아서가 아니다.
+#
+# 다만 네이버 종목 페이지의 거래원 표에는 '외국계추정합'이 있고 이건 장중에 갱신된다.
+# 외국계 증권사 창구를 거친 거래만 합산한 추정치라 확정 수급과 다르고 외국인만 잡히지만,
+# '오늘 외국인이 사는 쪽인가 파는 쪽인가'의 방향은 장중에 볼 수 있는 유일한 값이다.
+FOREIGN_DESK_NOTE = (
+    "외국계 증권사 창구를 거친 거래만 합산한 **추정치**입니다. 국내 증권사로 주문한 외국인은 "
+    "빠지고, 외국계 창구를 쓴 내국인은 섞입니다. 마감 후 확정 수급과 다릅니다."
+)
+
+
+# 실측(2026-08-28 12:54~13:15, 3분 간격 8회 + 13:03~13:07 45초 간격 12회):
+#   12:57 변경 -> 13:03까지 6분간 그대로 -> 이후 13:06, 13:07, 13:09, 13:12 연달아 변경
+# 갱신 간격이 45초~6분으로 들쭉날쭉하다. 캐시를 길게 잡으면 그 계단을 통째로 놓치므로 60초로 둔다.
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_foreign_desk(ticker: str) -> dict:
+    """거래원 표에서 외국계추정합과 매도·매수 상위 증권사를 뽑는다."""
+    r = requests.get(NAVER_FRGN_URL, params={"code": ticker},
+                     headers={"User-Agent": "Mozilla/5.0",
+                              "Referer": "https://finance.naver.com/"}, timeout=10)
+    r.raise_for_status()
+    r.encoding = "euc-kr"
+    table = None
+    for tb in pd.read_html(StringIO(r.text)):
+        if list(tb.columns)[:2] == ["매도상위", "거래량"]:
+            table = tb
+            break
+    if table is None:
+        return {}
+
+    hit = table[table["매도상위"].astype(str).str.contains("외국계추정합", na=False)]
+    if hit.empty:
+        return {}
+    row = hit.iloc[0]
+    sell, buy = _to_number(row["거래량"]), _to_number(row["거래량.1"])
+    if sell is None or buy is None:
+        return {}
+
+    # 상위 증권사 목록. '외국계추정합' 줄과 빈 줄을 걷어낸다.
+    brokers = table[~table["매도상위"].astype(str).str.contains("외국계추정합", na=False)]
+    brokers = brokers.dropna(subset=["매도상위", "매수상위"])
+
+    # 페이지에 찍힌 시각. 다만 이건 '시세' 블록의 시각이고, 거래원 표에는 자체 시각 표기가 없다.
+    # 거래원 값이 정확히 언제 것인지는 네이버가 밝히지 않으므로 '조회 시각'으로만 쓴다.
+    stamp = None
+    m = re.search(r"(\d{2})시\s*(\d{2})분\s*기준", re.sub(r"<[^>]+>", " ", r.text))
+    if m:
+        stamp = f"{m.group(1)}:{m.group(2)}"
+    return {"매도": sell, "매수": buy, "순매수": buy - sell,
+            "기준": stamp, "상위": brokers[["매도상위", "거래량", "매수상위", "거래량.1"]]}
+
+
+def _render_foreign_desk_line() -> None:
+    """이 종목의 장중 외국계 추정 순매수를 한 줄로. 현재가 fragment 안이라 자동 갱신된다."""
+    try:
+        d = fetch_foreign_desk(TICKER)
+    except Exception:
+        return
+    if not d:
+        return
+    net = d["순매수"]
+    color = "green" if net > 0 else ("red" if net < 0 else "gray")
+    word = "순매수" if net > 0 else ("순매도" if net < 0 else "보합")
+    stamp = f" · {d['기준']} 조회" if d.get("기준") else ""
+    _bold_label_with_help(
+        f"외국계 창구 추정 {word} :{color}[{abs(net):,.0f}주]{stamp}",
+        "종목별 외국인·기관·개인 수급은 장 마감 후에야 공개됩니다. 장중에 볼 수 있는 건 "
+        f"거래원(증권사 창구) 기준인 이 값뿐입니다. {FOREIGN_DESK_NOTE}\n\n"
+        "**기관·개인은 여기에 없습니다.** 갱신 간격은 45초~6분으로 일정하지 않고, "
+        "표시된 시각은 페이지를 조회한 시각입니다.",
+        key="foreign_desk",
+    )
+
+
+def build_foreign_desk_summary(ticker: str) -> str:
+    """AI 분석에 넘길 한 덩어리. 추정치라는 점을 반드시 함께 넘긴다."""
+    try:
+        d = fetch_foreign_desk(ticker)
+    except Exception:
+        return ""
+    if not d:
+        return ""
+    lines = [
+        f"- 외국계 창구 추정 순매수 {d['순매수']:+,.0f}주"
+        f" (매수 {d['매수']:,.0f}주 / 매도 {d['매도']:,.0f}주"
+        + (f", {d['기준']} 조회" if d.get("기준") else "") + ")",
+        "- 이 값은 외국계 증권사 창구를 거친 거래만 합산한 추정치다. 국내 증권사로 주문한"
+        " 외국인은 빠지고 외국계 창구를 쓴 내국인은 섞이므로, 마감 후 확정 수급과 다르다.",
+        "- 기관·개인은 장중에 종목별로 공개되지 않는다. 이 값으로 기관이나 개인의 매매를 추측하지 마라.",
+    ]
+    top = d.get("상위")
+    if top is not None and not top.empty:
+        sell_top = " · ".join(f"{r['매도상위']} {r['거래량']:,.0f}" for _, r in top.head(3).iterrows())
+        buy_top = " · ".join(f"{r['매수상위']} {r['거래량.1']:,.0f}" for _, r in top.head(3).iterrows())
+        lines.append(f"- 매도 상위 창구: {sell_top}")
+        lines.append(f"- 매수 상위 창구: {buy_top}")
+    return "\n".join(lines)
 
 
 def build_market_flow_summary() -> str:
@@ -1640,7 +2031,7 @@ def fetch_disclosures(ticker: str, count: int = 20, body_days: int = 3) -> str:
     return "\n".join(lines)
 
 
-def build_community_summary(ticker: str, stock_name: str, titles_per_source: int = 35) -> str:
+def build_community_summary(ticker: str, stock_name: str, titles_per_source: int = 20) -> str:
     """AI 분석에 넘길 커뮤니티 여론. 비율만이 아니라 '제목 원문'까지 같이 넘긴다.
 
     커뮤니티 탭은 기본으로 꺼져 있어서 탭 렌더링에 기대면 안 된다. 그래서 여기서 직접 모은다.
@@ -1748,6 +2139,12 @@ SECTOR_NEWS_QUERIES = [
     "D램 가격",
     "엔비디아 실적 AI 반도체",
     "반도체 수출 실적",
+    # 네이버 리서치는 13개 증권사만 싣는다. 여기 없는 증권사(예: LS증권)가 목표주가를
+    # 크게 바꿔도 리포트 목록에는 안 잡히는데, 기사로는 당일 나온다. 그 구멍을 이 질의가 메운다.
+    # 문구는 재보고 골랐다. 2026-08-31 LS증권 하향(330만->240만) 기준으로
+    # '투자의견'은 관련 기사 3건을 제목에서 바로 잡았고, '목표주가'/'증권가 리포트'는
+    # 0건이었다(네이버 뉴스가 관련도순이 아니라 최신순이라 시황 기사에 밀린다).
+    "{name} 투자의견",
 ]
 
 
@@ -1762,12 +2159,15 @@ def fetch_sector_news(stock_name: str, per_query: int = 3) -> str:
     queries = [t.format(name=stock_name) for t in SECTOR_NEWS_QUERIES]
 
     def one(query: str):
+        # 투자의견 질의는 한 건 더 받는다. 목표주가를 바꾼 날은 관련 기사가 여러 개 쏟아지는데,
+        # 상위 3건이 시황 기사로 채워지면 정작 숫자가 든 제목('330만->240만')이 밀려난다.
+        n = per_query + 1 if query.endswith("투자의견") else per_query
         try:
-            return query, fetch_news_with_summary(query, count=per_query)
+            return query, fetch_news_with_summary(query, count=n)
         except Exception:
             return query, []
 
-    # 질의 5개를 순서대로 던지면 왕복 지연이 그대로 쌓인다. 한꺼번에 보내고 결과만 순서대로 정리한다.
+    # 질의를 순서대로 던지면 왕복 지연이 그대로 쌓인다. 한꺼번에 보내고 결과만 순서대로 정리한다.
     # 워커가 캐시된 fetch_news_with_summary를 부르므로 컨텍스트를 붙인 풀을 쓴다.
     with _streamlit_pool(len(queries)) as pool:
         fetched = list(pool.map(one, queries))
@@ -1780,22 +2180,14 @@ def fetch_sector_news(stock_name: str, per_query: int = 3) -> str:
             if it["제목"] in seen_titles:      # 질의끼리 겹치는 기사는 한 번만
                 continue
             seen_titles.add(it["제목"])
-            rows.append(f"- {it['제목']}" + (f"\n  요약: {it['요약']}" if it["요약"] else ""))
+            # 업종 뉴스는 질의 5개 x 3건이라 요약까지 넣으면 프롬프트가 2,700자 불어난다.
+            # 프롬프트가 길수록 글자가 나오는 속도가 급격히 느려져서(실측 16,600자에서 34자/초,
+            # 14,700자에서 130자/초) 여기는 제목만 넘긴다. 종목 뉴스는 요약을 그대로 둔다.
+            rows.append(f"- {it['제목']}"
+                        + (f" [{it['시점']}]" if it.get("시점") else " [게재 시점 미확인]"))
         if rows:
             blocks.append(f"[검색어: {query}]\n" + "\n".join(rows))
     return "\n\n".join(blocks)
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner="불러오는 중...")
-def fetch_news_headlines(query: str, count: int = 6) -> list[str]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(
-        NAVER_NEWS_URL, params={"where": "news", "query": query, "sort": "1"}, headers=headers, timeout=10
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    headlines = [el.get_text(strip=True) for el in soup.select("span.sds-comps-text-type-headline1")]
-    return headlines[:count]
 
 
 TRENDFORCE_SEMICONDUCTOR_URL = "https://www.trendforce.com/research/category/Semiconductors"
@@ -1837,7 +2229,9 @@ def fetch_trendforce_news(count: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows[:count])
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="불러오는 중...")
+# 리포트 목록은 하루에도 여러 번 올라온다. 6시간 캐시였을 때는 아침에 올라온 리포트가
+# 오후까지 화면에 안 보였다. 조회가 0.1초라 짧게 잡아도 부담이 없다.
+@st.cache_data(ttl=900, show_spinner="불러오는 중...")
 def fetch_analyst_reports(ticker: str, count: int = 5) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(
@@ -1847,7 +2241,26 @@ def fetch_analyst_reports(ticker: str, count: int = 5) -> pd.DataFrame:
     tables = pd.read_html(StringIO(resp.text))
     df = tables[0].dropna(subset=["제목"]).copy()
     df["작성일"] = pd.to_datetime(df["작성일"], format="%y.%m.%d").dt.strftime("%Y-%m-%d")
-    return df[["제목", "증권사", "작성일"]].head(count)
+    cols = ["제목", "증권사", "작성일"]
+    # 원문 PDF 링크. 표에는 없어서 같은 페이지의 행을 직접 훑어 제목과 짝지어 붙인다.
+    # 링크 개수만 세어 순서대로 붙이면 첨부가 없는 리포트에서 한 칸씩 밀린다(실제로 30행 28링크였다).
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        link_by_title = {}
+        for tr in soup.select("tr"):
+            title_el = tr.select_one("td.file + td, td a[href*='company_read']") or tr.select_one("a")
+            pdf = tr.select_one("a[href$='.pdf']")
+            title = (title_el.get_text(strip=True) if title_el else "")
+            if title and pdf:
+                link_by_title[title] = pdf["href"]
+        if link_by_title:
+            df["url"] = df["제목"].map(lambda t: link_by_title.get(str(t).strip()))
+            cols.append("url")
+    except Exception:
+        pass
+    if "조회수" in df.columns:
+        cols.append("조회수")
+    return df[cols].head(count)
 
 
 @st.cache_data(ttl=1800, show_spinner="불러오는 중...")
@@ -2181,6 +2594,23 @@ def _pct_text_color(value: object) -> str:
     return ""
 
 
+def _stale_note(last_update: str | None, warn_days: int = 8) -> str:
+    """사이트 기준일이 오래됐으면 그 사실을 한 마디로. 표의 'N일 전 대비'는 이 기준일
+    시점에서 센 값이라, 기준일이 밀리면 라벨과 실제가 어긋난다(모듈은 원래 주 1회 갱신인데
+    2026-08-24 이후 2주간 멈춰 있었다). 숫자만 보고 오늘 오른 것으로 읽지 않게 알린다."""
+    if not last_update:
+        return ""
+    try:
+        d = dt.datetime.strptime(str(last_update)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return ""
+    days = (dt.datetime.now(om.KST).date() - d).days
+    if days < warn_days:
+        return ""
+    return (f"  ⚠️ {days}일째 갱신이 없습니다. 아래 변동률은 모두 이 기준일 시점에서 센 값이라 "
+            "오늘까지의 변화가 아닙니다.")
+
+
 def _render_dram_price_table(display_df: pd.DataFrame, pct_cols: list[str]) -> None:
     """변동률 열을 상승=초록 / 하락=빨강으로 칠해서 표를 그린다."""
     styler = display_df.style.map(_pct_text_color, subset=pct_cols)
@@ -2324,6 +2754,45 @@ def _fetch_company_standalone_capex_quarters(cik: str) -> list[dict]:
     return sorted(quarters, key=lambda q: q["end"])
 
 
+# ── FnGuide 재무 데이터 ────────────────────────────────────────────────────────
+# 파싱은 fnguide.py에 있다. 수집기(collector.py)도 같은 코드를 써야 해서 밖으로 뺐다.
+# 여기서는 캐시만 씌운다.
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="재무 데이터를 가져오는 중...")
+def fetch_fnguide_page(ticker: str) -> str:
+    return fnguide.fetch_page(ticker)
+
+
+def fetch_financials(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    try:
+        return fnguide.financial_frames(fetch_fnguide_page(ticker))
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def fetch_short_balance(ticker: str) -> pd.DataFrame:
+    """차입공매도 비중 주간 추이.
+
+    예전에 KRX·KOFIA·세이브로를 다 뒤지고 '무료로는 못 가져온다'고 결론냈는데,
+    재무 데이터를 붙이다가 같은 fnguide 페이지 안에서 발견했다. 주간 단위이고
+    기간도 1년치뿐이라 KRX 원본만큼 상세하지는 않다.
+    """
+    try:
+        return fnguide.short_balance(fetch_fnguide_page(ticker))
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_target_price_history(ticker: str) -> pd.DataFrame:
+    """컨센서스 목표주가 주간 추이(약 1년)."""
+    try:
+        return fnguide.target_price_history(fetch_fnguide_page(ticker))
+    except Exception:
+        return pd.DataFrame()
+
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner="불러오는 중...")
 def fetch_bigtech_capex() -> pd.DataFrame:
     """빅테크(마이크로소프트/구글/아마존/메타)의 분기별 설비투자(capex) 실적을 SEC 공시(XBRL)에서 가져온다."""
@@ -2350,6 +2819,461 @@ def fetch_bigtech_capex() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+# ── AI 분석에 넘길 추가 재료 ──────────────────────────────────────────────────
+# 아래 넷은 대시보드가 이미 계산하거나 받아오던 값인데 프롬프트에는 안 들어가고 있었다.
+# (빅테크 Capex는 심지어 프롬프트가 "이걸 보라"고 시키면서 데이터는 안 주고 있었다.)
+
+def build_market_state_summary() -> str:
+    """지금이 장중인지 마감 뒤인지, 그래서 어떤 숫자가 아직 안 굳었는지 못 박는다.
+
+    AI가 장중인데도 "종가"라고 쓰는 일이 있었다. 원인은 모델이 아니라 우리가 준 재료였고
+    (현재가 문자열이 늘 '종가'로 시작했다), 그걸 고친 뒤에도 시각만 주면 모델이 알아서
+    장 상태를 추측한다. 추측하지 않게 상태와 그 결과를 문장으로 적어 준다.
+    """
+    now = dt.datetime.now(om.KST)
+    session = _korea_session_now(now)
+    is_open = bool(st.session_state.get("market_is_open"))
+    lines = [f"- 지금 시각: {now:%Y-%m-%d %H:%M} (한국시간, 요일 {'월화수목금토일'[now.weekday()]})"]
+
+    if is_open and session:
+        lines.append(f"- 지금은 **{session} 진행 중**이다. 오늘 가격은 아직 확정되지 않았다.")
+        lines.append("- 따라서 오늘 값을 '종가'라고 부르지 마라. '현재가' 또는 "
+                     "'{}시 기준'처럼 진행 중임이 드러나게 써라.".format(now.strftime("%H")))
+        lines.append("- 오늘의 시가·고가·저가·거래량도 장이 끝나기 전까지는 더 바뀔 수 있다.")
+    elif session and not is_open:
+        lines.append(f"- 시간상 {session} 구간이지만 거래소는 체결이 없다고 알린다"
+                     " (공휴일이거나 아직 첫 체결 전일 수 있다).")
+    else:
+        lines.append("- 지금은 **정규장 시간이 아니다**. 오늘 정규장 가격은 종가로 확정됐다.")
+        if now.weekday() >= 5:
+            lines.append("- 주말이다. 마지막 거래일 기준 값이다.")
+
+    # 수급은 마감 후 한참 뒤에야 올라온다. 이걸 모르면 '오늘 외국인이 샀다'고 지어낸다.
+    lines.append("- 투자자별 수급(개인·외국인·기관) 확정치는 장 마감 후 18:20~18:30에야 공개된다."
+                 " 그 전에는 아래 수급 숫자의 마지막 날짜가 오늘이 아니라 전 거래일이다."
+                 " 날짜를 확인하고, 오늘 수급인 것처럼 쓰지 마라.")
+    lines.append("- '코스피 시장 전체 수급'은 장중 잠정치라 마감 후 확정치와 달라질 수 있다.")
+    return "\n".join(lines)
+
+
+# Capex 그래프 보기 방식. 순서가 화면 라디오 버튼 순서이자 아래 분기 조건의 기준이다.
+# '연도별 누적(YTD)'도 있었는데 뺐다. TTM과 같은 말(투자가 가속 중)을 할 뿐인데
+# 1월이 되면 3개월치로 쪼그라들어 그때는 못 쓰고, 날짜 축에 그리면 해마다 0으로 떨어지는
+# 톱니가 되어 '작년 같은 분기와 비교'라는 원래 목적도 눈으로 할 수 없었다.
+CAPEX_VIEW_MODES = ("분기별", "최근 4분기 합(TTM)", "전체 누적")
+
+
+def _capex_accumulate(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """기업별로 누적 방식을 적용한 표를 돌려준다.
+
+    그냥 처음부터 더하기만 하는 '전체 누적'은 시작점이 데이터를 어디부터 받아왔는지로
+    정해질 뿐이라 정보량이 적다. 추세를 보려면 TTM(최근 4분기 합)을 쓴다.
+    """
+    out = []
+    for company, g in df.sort_values("분기말").groupby("기업"):
+        g = g.copy()
+        if mode == CAPEX_VIEW_MODES[1]:          # TTM
+            g["capex_B"] = g["capex_B"].rolling(4).sum()
+        else:                                    # 전체 누적
+            g["capex_B"] = g["capex_B"].cumsum()
+        out.append(g)
+    if not out:
+        return df
+    return pd.concat(out, ignore_index=True).dropna(subset=["capex_B"])
+
+
+def build_capex_summary() -> str:
+    """빅테크 4사 분기 Capex. HBM 수요의 선행지표라 '왜 오르나'의 배경이 된다."""
+    df = fetch_bigtech_capex()
+    if df.empty:
+        return ""
+    lines = []
+    for company, g in df.groupby("기업"):
+        g = g.sort_values("분기말")
+        last = g.iloc[-1]
+        cur = float(last["capex_USD"]) / 1e9
+        line = f"- {company}: {last['분기말']:%Y-%m} 분기 ${cur:,.1f}B"
+        if len(g) >= 5:      # 1년 전 같은 분기와 비교해야 계절성에 안 속는다
+            yoy = float(g.iloc[-5]["capex_USD"]) / 1e9
+            if yoy:
+                line += f" (전년 동기 ${yoy:,.1f}B 대비 {cur / yoy - 1:+.0%})"
+        lines.append(line)
+    total = df[df["분기말"] == df["분기말"].max()]["capex_USD"].sum() / 1e9
+    lines.append(f"- 4사 합계(최근 분기): ${total:,.1f}B")
+    return "\n".join(lines)
+
+
+def build_early_signal_summary(ticker: str) -> str:
+    """하락·상승 조기신호. 탭에는 있는데 프롬프트에는 빠져 있던 값이다.
+
+    두 탭과 같은 함수·같은 상수를 써서 화면과 AI가 다른 숫자를 보는 일이 없게 한다.
+    """
+    if ticker != DEFAULT_TICKER:      # 이 두 지표는 SK하이닉스에서만 검증됐다
+        return ""
+    try:
+        hist = fetch_backtest_history_live(ticker, target_days=700)
+    except Exception:
+        return ""
+    if len(hist) < 40:
+        return ""
+
+    lines = []
+    try:
+        foreign_slope = _rolling_slope(hist["외국인"], DECLINE_PATTERN_WINDOW)
+        vol_ratio = hist["거래량"] / hist["거래량"].rolling(DECLINE_PATTERN_VOL_WINDOW).mean()
+        bt = run_boolean_pattern_backtest(
+            hist["종가"], hist["날짜"], (foreign_slope < 0) & (vol_ratio > 1.0),
+            DECLINE_HORIZON, drawdown_threshold=DECLINE_DRAWDOWN_THRESHOLD)
+        matched = bool(bt["current_match"])
+        down = bt["match_down_rate"] if matched else bt["rest_down_rate"]
+        lines.append(
+            f"- 하락 조기신호(외국인 순매도 + 거래량 증가): 현재 "
+            f"{'조건 충족' if matched else '조건 미충족'} "
+            f"(외국인 {DECLINE_PATTERN_WINDOW}일 기울기 {float(foreign_slope.dropna().iloc[-1]):,.0f}, "
+            f"거래량 {float(vol_ratio.dropna().iloc[-1]):.2f}배). "
+            f"이 상태의 과거 {DECLINE_HORIZON}거래일 내 "
+            f"{DECLINE_DRAWDOWN_THRESHOLD:.0%} 하락 확률 "
+            + (f"{down:.1%}" if down is not None else "N/A"))
+    except Exception:
+        pass
+
+    try:
+        inst_slope = _rolling_slope(hist["기관"], RALLY_PATTERN_WINDOW)
+        retail_slope = _rolling_slope(hist["개인"], RALLY_PATTERN_WINDOW)
+        vol_ratio = hist["거래량"] / hist["거래량"].rolling(RALLY_PATTERN_VOL_WINDOW).mean()
+        bt = run_boolean_pattern_backtest(
+            hist["종가"], hist["날짜"],
+            (inst_slope > 0) & (retail_slope < 0) & (vol_ratio > 1.0),
+            RALLY_HORIZON, drawdown_threshold=RALLY_DRAWDOWN_THRESHOLD)
+        matched = bool(bt["current_match"])
+        up = bt["match_up_rate"] if matched else bt["rest_up_rate"]
+        lines.append(
+            f"- 상승 조기신호(기관 순매수 + 개인 순매도 + 거래량 증가): 현재 "
+            f"{'조건 충족' if matched else '조건 미충족'}. "
+            f"이 상태의 과거 {RALLY_HORIZON}거래일 내 상승 확률 "
+            + (f"{up:.1%}" if up is not None else "N/A")
+            + " (앞반기에서는 방향이 뒤집혀 신뢰도가 낮은 지표다)")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_foreign_hold_ratio(ticker: str) -> pd.DataFrame:
+    """외국인 보유율 일별 추이. 스냅샷에는 '오늘 값' 하나만 있어서 방향을 알 수 없었다."""
+    r = requests.get(f"https://m.stock.naver.com/api/stock/{ticker}/trend",
+                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"},
+                     timeout=10)
+    r.raise_for_status()
+    js = r.json()
+    rows = js if isinstance(js, list) else ((js or {}).get("dealTrendInfos") or [])
+    if not rows:
+        return pd.DataFrame(columns=["날짜", "외국인보유율"])
+    out = pd.DataFrame([{
+        "날짜": dt.datetime.strptime(str(x["bizdate"]), "%Y%m%d").date(),
+        "외국인보유율": _to_number(x.get("foreignerHoldRatio")),
+    } for x in rows if x.get("bizdate")])
+    return out.dropna().sort_values("날짜").reset_index(drop=True)
+
+
+def build_recent_price_summary(ticker: str, days: int = 10) -> str:
+    """최근 며칠의 종가·등락률·거래량과 외국인 보유율 추이.
+
+    지금까지는 '오늘 하루'와 '5일 순매수 합계'만 넘겨서, 오늘의 움직임이
+    연속 하락 끝의 반등인지 상승 5일차인지를 AI가 구분할 수 없었다.
+    """
+    try:
+        ohlcv = fetch_daily_ohlcv(ticker, days + 15)
+    except Exception:
+        return ""
+    if ohlcv.empty or "종가" not in ohlcv.columns:
+        return ""
+    tail = ohlcv.tail(days + 1).copy()
+    tail["등락률"] = tail["종가"].astype(float).pct_change() * 100
+    tail = tail.tail(days)
+
+    ratio_by_date = {}
+    try:
+        fh = fetch_foreign_hold_ratio(ticker)
+        ratio_by_date = dict(zip(fh["날짜"], fh["외국인보유율"]))
+    except Exception:
+        pass
+
+    # 장중에는 일봉 마지막 줄이 '오늘 진행 중인 값'이다. 그대로 두면 확정 종가로 읽힌다.
+    today = dt.datetime.now(om.KST).date()
+    market_open = bool(st.session_state.get("market_is_open"))
+
+    lines = []
+    for idx, row in tail.iterrows():
+        day = idx.date() if hasattr(idx, "date") else idx
+        label = "현재가(장중, 미확정)" if (market_open and day == today) else "종가"
+        line = (f"    {day} {label} {float(row['종가']):,.0f} "
+                f"({float(row['등락률']):+.2f}%) 거래량 {float(row['거래량']):,.0f}")
+        held = ratio_by_date.get(day)
+        if held is not None:
+            line += f" 외국인보유율 {held:.2f}%"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    head = "- 최근 일별 종가 · 등락률 · 거래량:"
+    closes = tail["종가"].astype(float)
+    streak, direction = 0, None
+    for chg in reversed(tail["등락률"].tolist()):
+        cur = "상승" if chg > 0 else ("하락" if chg < 0 else None)
+        if cur is None or (direction and cur != direction):
+            break
+        direction, streak = cur, streak + 1
+    tail_note = ""
+    if direction and streak >= 2:
+        tail_note = f"\n- 최근 흐름: {streak}거래일 연속 {direction}"
+    if len(closes) >= 2:
+        tail_note += (f"\n- 이 구간 누적 등락률: "
+                      f"{(closes.iloc[-1] / closes.iloc[0] - 1) * 100:+.2f}%")
+    return head + "\n" + "\n".join(lines) + tail_note
+
+
+# 이 종목의 주가를 흔드는 해외 실적 발표. AI가 "엔비디아 실적을 앞두고"라고 쓰면서
+# 정작 날짜를 모르는 채로 쓰고 있었다. 며칠 뒤인지, 이미 지났는지를 알려준다.
+EARNINGS_WATCH = {
+    "NVDA": "엔비디아 (HBM 최대 수요처)",
+    "MU": "마이크론 (직접 경쟁사)",
+    "AMD": "AMD",
+    "AVGO": "브로드컴",
+    "TSM": "TSMC",
+    "INTC": "인텔",
+    "WDC": "웨스턴디지털 (낸드)",
+    "STX": "씨게이트 (낸드)",
+}
+EARNINGS_LOOKAHEAD_DAYS = 10
+
+
+def _nasdaq_earnings_on(day: dt.date) -> list[tuple[str, str]]:
+    r = requests.get("https://api.nasdaq.com/api/calendar/earnings",
+                     params={"date": day.isoformat()},
+                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                     timeout=10)
+    r.raise_for_status()
+    rows = ((r.json() or {}).get("data") or {}).get("rows") or []
+    return [(x["symbol"], x.get("time") or "") for x in rows
+            if x.get("symbol") in EARNINGS_WATCH]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_earnings_calendar() -> str:
+    """앞으로 열흘 안에 실적을 발표하는 반도체 관련 기업."""
+    today = dt.datetime.now(om.KST).date()
+    days = [today + dt.timedelta(days=i) for i in range(EARNINGS_LOOKAHEAD_DAYS)]
+
+    def one(day: dt.date) -> list[tuple[str, str]]:
+        try:                       # 한 날짜가 실패해도 나머지 날짜는 살린다
+            return _nasdaq_earnings_on(day)
+        except Exception:
+            return []
+
+    # 날짜별로 독립된 조회라 동시에 받는다
+    found: list[str] = []
+    with _streamlit_pool(min(5, len(days))) as pool:
+        for day, res in zip(days, pool.map(one, days)):
+            for symbol, when in res:
+                d_left = (day - today).days
+                label = "오늘" if d_left == 0 else ("내일" if d_left == 1 else f"{d_left}일 뒤")
+                slot = {"time-after-hours": "장 마감 후",
+                        "time-pre-market": "개장 전"}.get(when, "")
+                found.append(f"- {day} ({label}) {EARNINGS_WATCH[symbol]}"
+                             + (f" — 미국장 {slot}" if slot else ""))
+    return "\n".join(found)
+
+
+# 컨센서스는 '지금 얼마인가'보다 '올라가고 있나 내려가고 있나'가 주가를 움직인다.
+# 그런데 네이버는 현재값만 주고 과거 추이를 안 준다. 그래서 매일 한 줄씩 직접 쌓는다.
+# 오늘부터 쌓이기 시작하므로 처음 며칠은 "비교할 과거 기록 없음"으로 나온다.
+CONSENSUS_LOG = os.path.join("data", "consensus_log.csv")
+
+
+def record_consensus_snapshot(ticker: str, snapshot: dict) -> None:
+    """하루 한 번 컨센서스를 파일에 남긴다. 같은 날 중복 기록은 하지 않는다."""
+    target = _to_number(snapshot.get("목표주가"))
+    opinion = _to_number(snapshot.get("투자의견"))
+    if not target:
+        return
+    today = dt.datetime.now(om.KST).date().isoformat()
+    try:
+        os.makedirs(os.path.dirname(CONSENSUS_LOG) or ".", exist_ok=True)
+        # '파일이 있나'가 아니라 '내용이 있나'로 판단한다. 빈 파일이 한 번 생기면
+        # (쓰는 도중 프로세스가 죽으면 그렇게 된다) read_csv가 EmptyDataError를 내는데,
+        # 예전 코드는 그 예외를 통째로 삼켜서 그 뒤로 영원히 기록이 안 됐다.
+        has_rows = os.path.exists(CONSENSUS_LOG) and os.path.getsize(CONSENSUS_LOG) > 0
+        if has_rows and not _consensus_log(ticker).empty:
+            if today in set(_consensus_log(ticker)["날짜"].astype(str)):
+                return
+        with open(CONSENSUS_LOG, "a", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh)
+            if not has_rows:
+                w.writerow(["날짜", "종목", "목표주가", "투자의견"])
+            w.writerow([today, ticker, f"{target:.0f}", f"{opinion:.2f}" if opinion else ""])
+    except Exception:
+        pass          # 기록 실패로 분석이 멈추면 안 된다
+
+
+def _consensus_log(ticker: str) -> pd.DataFrame:
+    """쌓아둔 컨센서스 기록에서 이 종목 것만. 읽을 수 없으면 빈 표를 준다.
+
+    종목코드는 반드시 문자열로 읽어야 한다. 그냥 두면 pandas가 000660을 정수 660으로
+    바꿔버려서 종목 비교가 영원히 거짓이 된다.
+    """
+    try:
+        log = pd.read_csv(CONSENSUS_LOG, dtype={"종목": str})
+    except Exception:
+        return pd.DataFrame(columns=["날짜", "종목", "목표주가", "투자의견"])
+    if "종목" not in log.columns:
+        return pd.DataFrame(columns=["날짜", "종목", "목표주가", "투자의견"])
+    log["종목"] = log["종목"].astype(str).str.zfill(6)
+    return log[log["종목"] == ticker].sort_values("날짜").reset_index(drop=True)
+
+
+def build_consensus_trend_summary(ticker: str, snapshot: dict) -> str:
+    """쌓인 기록으로 목표주가가 상향인지 하향인지 알려준다."""
+    target = _to_number(snapshot.get("목표주가"))
+    if not target:
+        return ""
+    lines = [f"- 현재 컨센서스 목표주가 {target:,.0f}원"
+             f" (투자의견 {snapshot.get('투자의견') or 'N/A'}/5,"
+             f" 기준일 {snapshot.get('컨센서스일자') or '-'})"]
+
+    # FnGuide에 주간 1년치가 이미 있다. 직접 쌓은 기록(consensus_log)보다 훨씬 길어서 이쪽을 먼저 쓴다.
+    try:
+        hist = fetch_target_price_history(ticker)
+    except Exception:
+        hist = pd.DataFrame()
+    if len(hist) >= 2:
+        now = dt.datetime.now(om.KST)
+        for label, weeks in (("1개월 전", 4), ("3개월 전", 13), ("1년 전", 52)):
+            cutoff = pd.Timestamp(now.date() - dt.timedelta(weeks=weeks))
+            past = hist[hist["일자"] <= cutoff]
+            if past.empty:
+                continue
+            old = float(past.iloc[-1]["목표주가"])
+            if old:
+                lines.append(
+                    f"- {label}({past.iloc[-1]['일자']:%Y-%m-%d}) 목표주가 {old:,.0f}원 대비"
+                    f" {target / old - 1:+.1%}"
+                    f" ({'상향' if target > old else '하향' if target < old else '변화 없음'})")
+        lines.append("- (목표주가 추이는 FnGuide 주간 데이터. 목표주가는 수준보다 방향이 중요하다)")
+        return "\n".join(lines)
+
+    log = _consensus_log(ticker)
+    if len(log) < 2:
+        lines.append("- 목표주가 변화: 비교할 과거 기록이 아직 없음"
+                     " (오늘부터 매일 한 줄씩 쌓는 중)")
+        return "\n".join(lines)
+    for label, back in (("1주 전", 7), ("1개월 전", 30)):
+        cutoff = (dt.datetime.now(om.KST).date() - dt.timedelta(days=back)).isoformat()
+        past = log[log["날짜"] <= cutoff]
+        if past.empty:
+            continue
+        old = float(past.iloc[-1]["목표주가"])
+        if old:
+            lines.append(f"- {label}({past.iloc[-1]['날짜']}) 목표주가 {old:,.0f}원 대비"
+                         f" {target / old - 1:+.1%} ({'상향' if target > old else '하향' if target < old else '변화 없음'})")
+    return "\n".join(lines)
+
+
+def build_short_sale_summary(ticker: str) -> str:
+    """차입공매도 비중 추이.
+
+    "숏커버링이었나"를 판단할 재료가 대시보드에 통째로 없었다. KRX·KOFIA·세이브로가 다 막혀
+    포기했었는데 FnGuide 페이지 안에 주간 1년치가 있었다. 주간이라 일별 급등락은 못 짚는다.
+    """
+    try:
+        df = fetch_short_balance(ticker)
+    except Exception:
+        return ""
+    if df.empty:
+        return ""
+    last = df.iloc[-1]
+    avg = float(df["차입공매도비중"].mean())
+    cur = float(last["차입공매도비중"])
+    lines = [f"- 최근 {last['일자']:%Y-%m-%d} 기준 차입공매도 비중 {cur:.2f}%"
+             f" (최근 1년 평균 {avg:.2f}%, 최고 {df['차입공매도비중'].max():.2f}%,"
+             f" 최저 {df['차입공매도비중'].min():.2f}%)"]
+    if len(df) >= 5:
+        prev = float(df.iloc[-5]["차입공매도비중"])
+        lines.append(f"- 4주 전 {prev:.2f}% 대비 {cur - prev:+.2f}%p"
+                     f" ({'증가' if cur > prev else '감소' if cur < prev else '변화 없음'})")
+    lines.append("- 주간 단위 값이라 특정 날짜의 급등락은 설명하지 못한다."
+                 " 비중이 높다고 곧 하락이 아니고, 되레 숏커버링이 상승 재료가 되기도 한다.")
+    return "\n".join(lines)
+
+
+# 통합 신호와 선물 경보는 AI 분석에 넣지 않는다. 지표 자체가 이 종목에 맞지 않는다는
+# 판단이다(2026-09-02). 탭은 남겨 둬서 궁금하면 볼 수 있지만, 프롬프트에는 안 들어간다.
+# 덤으로 재현성 문제도 사라졌다 — 탭을 켜고 끄는 것과 무관하게 분석 입력이 같아진다.
+#
+# 과열도 요약은 여전히 프롬프트에 들어가는데, 이것도 그 탭이 그려질 때 전역 변수에
+# 채워지는 구조다. 탭을 꺼 두면 계산이 안 돌고 "…미실행" 문구만 들어가는데, 그대로 넘기면
+# 모델은 그게 데이터인 줄 알고 "신호 없음"으로 읽는다 — 실제로는 안 켜본 것뿐인데.
+# 그래서 계산 안 된 항목은 데이터가 아니라 '없음'으로 못박아 넘긴다.
+# '표본 부족으로 계산되지 않음'은 여기 넣지 않는다. 그건 탭을 켜고 계산까지 해본 결과라
+# 그 자체가 정보다("데이터가 모자라 판단 못 함"). 탭이 꺼졌다고 말하면 거짓이 된다.
+def _price_summary_fallback() -> str:
+    """세션에 현재가 요약이 없을 때(탭이 그려지기 전에 분석을 만드는 경우) 직접 만든다."""
+    try:
+        q = fetch_current_price(TICKER) or {}
+        close = q.get("closePrice")
+        chg = q.get("compareToPreviousClosePrice")
+        pct = q.get("fluctuationsRatio")
+        state = (q.get("marketStatus") or "").upper()
+        if close:
+            return f"종가 {close}원, 전일대비 {chg}원 ({pct}%) ({state})"
+    except Exception:
+        pass
+    return "현재가 데이터를 가져오지 못함"
+
+
+def _log_ai_analysis_error(exc: Exception) -> None:
+    """분석 생성 실패는 화면을 막지 않는다. 저장된 이전 분석이 계속 보이면 되고,
+    실패 사실만 남겨 둔다(연속 실패하면 화면의 기준 시각이 안 바뀌는 것으로 드러난다)."""
+    try:
+        print(f"[ai_analysis] 생성 실패: {type(exc).__name__}: {exc}", flush=True)
+    except Exception:
+        pass
+
+
+def _dated_digest(payload: dict) -> str:
+    """미리 만들어 둔 요약에 '언제 만든 것인지'를 붙인다.
+
+    이 요약들은 새 재료가 있을 때만 다시 만든다. 그래서 며칠 전 것이 그대로 쓰이는 게
+    정상인데, 날짜를 안 알려주면 모델은 그걸 '오늘의 증권가 시각'으로 읽는다.
+    리포트가 일주일째 안 나온 날과, 오늘 아침에 갱신된 날을 구분할 수 있어야 한다.
+    """
+    text = (payload or {}).get("text") or ""
+    if not text:
+        return ""
+    when = (payload or {}).get("date") or "시점 미상"
+    return f"(이 정리는 {when} 기준이다. 그 뒤로 새 자료가 없어서 그대로 쓰고 있다)\n{text}"
+
+
+_TAB_SUMMARY_UNSET = ("미실행",)
+
+
+def _tab_summary(summary: str, tab_name: str) -> str:
+    if not summary or any(k in summary for k in _TAB_SUMMARY_UNSET):
+        return (f"(계산되지 않음 — '{tab_name}' 탭이 꺼져 있다. "
+                "이 항목은 근거로 쓰지도, 언급하지도 마라)")
+    return summary
+
+
+def missing_tab_summaries() -> list[str]:
+    """AI가 못 받은 항목. 화면에서 사용자에게 알려주려고 쓴다.
+
+    통합 신호·선물 경보는 애초에 프롬프트에 안 넣으므로 여기서도 세지 않는다.
+    """
+    pairs = ((overheat_summary, "가격 과열도"),)
+    return [name for value, name in pairs
+            if not value or any(k in value for k in _TAB_SUMMARY_UNSET)]
+
+
 @st.cache_data(ttl=3600, show_spinner="불러오는 중...")
 def generate_ai_analysis(
     stock_label: str,
@@ -2360,9 +3284,7 @@ def generate_ai_analysis(
     reports_md: str,
     dram_summary: str,
     community_summary: str,
-    composite_summary: str,
     overheat_summary: str,
-    futures_summary: str,
     trendforce_md: str = "",
     snapshot_md: str = "",
     news_md: str = "",
@@ -2374,11 +3296,29 @@ def generate_ai_analysis(
     over_market_md: str = "",
     intraday_md: str = "",
     market_flow_md: str = "",
+    capex_md: str = "",
+    early_signal_md: str = "",
+    recent_price_md: str = "",
+    earnings_md: str = "",
+    consensus_md: str = "",
+    market_state_md: str = "",
+    short_sale_md: str = "",
+    foreign_desk_md: str = "",
+    analyst_view_md: str = "",
+    broker_targets_md: str = "",
+    disclosure_view_md: str = "",
+    financial_view_md: str = "",
+    # 밑줄로 시작하는 인자는 st.cache_data가 해시(=캐시 키)에서 빼준다.
+    # 콜백 함수는 해시가 안 되고, 캐시 키에 들어가서도 안 된다.
+    _stream_to=None,
 ) -> tuple[str, str | None]:
     prompt = f"""오늘은 {time_label}입니다. 다음은 이 시점 기준 {stock_label} 관련 데이터입니다.
 
 **중요**: 아래 데이터에 적힌 사실만 쓰세요. 학습 시점에 알고 있던 과거 뉴스나 날짜를 끌어오지 마세요.
 (실제로 이 지시가 없으면 몇 년 전 사건을 '최근 뉴스'라고 답하는 일이 생깁니다.)
+
+[지금 시장 상태 — 다른 무엇보다 먼저 읽어라]
+{market_state_md if market_state_md else "(상태 확인 실패 - 장중 여부를 단정하지 마라)"}
 
 [오늘 주가]
 {price_summary}
@@ -2389,11 +3329,17 @@ def generate_ai_analysis(
 [정규장 밖 움직임 — 프리장 · 애프터장(NXT)]
 {over_market_md if over_market_md else "(오늘 시간외 기록 없음)"}
 
-[전자공시 — 최근순, 최근 것은 본문 요지 포함]
+[전자공시 — 최근순 목록. 오늘 것은 본문 요지 포함]
 {disclosure_md if disclosure_md else "(수집 실패)"}
+
+[공시 정리 — 최근 공시 15건을 본문까지 읽고 미리 정리해 둔 것. 금액·주식수·기간이 들어 있다]
+{disclosure_view_md if disclosure_view_md else "(정리된 요약 없음)"}
 
 [밸류에이션 · 컨센서스 · 동일업종 · 수급추이]
 {snapshot_md if snapshot_md else "(수집 실패)"}
+
+[최근 일별 주가 흐름 — 오늘을 그 앞 며칠과 이어서 봐라]
+{recent_price_md if recent_price_md else "(수집 실패)"}
 
 [최근 수급 동향 — 이 종목, 일별 확정치]
 {supply_summary}
@@ -2401,35 +3347,64 @@ def generate_ai_analysis(
 [코스피 시장 전체 수급 — 종목별 아님, 장중 잠정치]
 {market_flow_md if market_flow_md else "(수집 실패)"}
 
-[통합 매수/매도 신호 — 실험적 백테스트, 매매 신호 아님]
-{composite_summary}
+[이 종목의 외국계 창구 추정 순매수 — 장중, 추정치. 확정 수급이 아니다]
+{foreign_desk_md if foreign_desk_md else "(수집 실패)"}
 
 [가격 과열도 백테스트 — 과거 통계 참고용, 매매 신호 아님]
-{overheat_summary}
+{_tab_summary(overheat_summary, "가격 과열도")}
 
-[코스피200 선물 외국인 순매도 하락 경보 — 과거 통계 참고용, 매매 신호 아님]
-{futures_summary}
+[하락 · 상승 조기신호 — 과거 통계 참고용, 매매 신호 아님]
+{early_signal_md if early_signal_md else "(해당 없음)"}
 
-[DRAM 현물가]
+[DRAM 현물가 — 현물가만 있고 고정거래가(계약가)는 없음. 실적에 직결되는 건 고정가이므로 현물가만으로 단정하지 마라]
 {dram_summary}
+
+[빅테크 분기 설비투자(Capex) — HBM 수요의 선행지표]
+{capex_md if capex_md else "(수집 실패)"}
+
+[다가오는 반도체 관련 실적 발표]
+{earnings_md if earnings_md else "(앞으로 열흘 내 예정 없음 또는 수집 실패)"}
 
 [관련 뉴스 (제목 + 본문 요약)]
 {news_md if news_md else (chr(10).join(f"- {h}" for h in headlines) if headlines else "(수집된 뉴스 없음)")}
 
-[최근 애널리스트 리포트]
+[최근 애널리스트 리포트 — 제목 목록]
 {reports_md if reports_md else "(수집된 리포트 없음)"}
 
-[업종 · 전방수요 · 매크로 관련 뉴스]
+[증권가 시각 정리 — 리포트 PDF 본문까지 읽고 미리 정리해 둔 것. 증권사별 목표주가와 추정 실적이 들어 있다]
+{analyst_view_md if analyst_view_md else "(정리된 요약 없음)"}
+
+[재무 정리 — 재무제표(FnGuide)를 읽고 미리 정리해 둔 것. 매출·영업이익 추이와 추정치]
+{financial_view_md if financial_view_md else "(정리된 요약 없음)"}
+
+[업종 · 전방수요 · 매크로 뉴스 + 증권사 투자의견 변경 기사]
+※ 위 리포트 목록은 네이버가 싣는 13개 증권사뿐이다. 그 밖의 증권사가 목표주가를
+   바꾼 건은 여기 '투자의견' 검색어 기사에만 나오니, 있으면 [리포트] 갈래로 함께 다뤄라.
 {sector_news_md if sector_news_md else "(수집 안 함)"}
 
 [해외 반도체 산업 리서치 뉴스 — TrendForce]
 {trendforce_md if trendforce_md else "(수집된 자료 없음)"}
 
-[거시경제 지표]
+[거시경제 지표 — 모두 '직전 미국장 종가' 기준이다. 한국이 장중이면 이 값은 어젯밤 것이고,
+오늘 한국 장중 움직임의 배경은 될 수 있어도 '오늘 미국 증시'라고 쓰면 틀린다]
 {macro_md if macro_md else "(수집 실패)"}
 
 [해외 상장분(ADR) 괴리율]
 {adr_md if adr_md else "(해당 없음)"}
+
+[증권사별 목표주가 — 리포트 상세에서 숫자만 뽑아 모은 원자료. '직접 집계' 컨센서스]
+{broker_targets_md if broker_targets_md else "(집계 없음)"}
+
+[컨센서스 목표주가와 그 변화 — FnGuide 제공]
+{consensus_md if consensus_md else "(수집 실패)"}
+
+※ 위 두 컨센서스는 값이 다르다. 어느 쪽이 틀린 게 아니라 세는 대상이 다르다.
+   FnGuide는 네이버에 리포트를 싣지 않는 증권사까지 포함하고, 직접 집계는 네이버
+   게재분만 대신 증권사별 내역이 있다. 목표주가를 인용할 때는 **어느 쪽 값인지 반드시
+   밝혀라**(예: "컨센서스 3,279,565원(FnGuide)"). 두 값을 평균 내거나 섞지 마라.
+
+[차입공매도 비중 — 주간, 최근 1년]
+{short_sale_md if short_sale_md else "(수집 실패)"}
 
 [투자자 커뮤니티 — 게시글 원문. 여론이지 사실이 아님]
 {community_summary if community_summary else "(수집 실패)"}
@@ -2437,72 +3412,69 @@ def generate_ai_analysis(
 아래 형식 그대로, 한국어로 작성해줘.
 
 ## 한 줄 요약
-오늘 이 종목에서 가장 중요한 사실 한 문장.
+오늘 가장 중요한 사실 한 문장.
 
 ## 오늘 이렇게 움직인 이유
-정규장 등락을 '언제 무엇 때문에'로 설명해라. 장중 흐름에서 급했던 구간을 짚고,
-그 시각 전후의 공시·뉴스와 연결해라. 연결할 근거가 없으면 "직접 연결되는 재료는 데이터에 없음"이라고 써라.
-**정규장이 끝난 뒤 시간외에서 방향이 바뀌었다면 반드시 별도 문단으로 짚어라.**
-종가만 보면 놓치는 부분이고, 공시가 마감 직후에 나오는 경우가 잦다.
-시간외 등락률은 정규장 종가 대비 값을 쓰고, 전일 종가 대비와 헷갈리지 마라.
+먼저 '최근 일별 주가 흐름'으로 오늘을 앞 며칠과 이어서 한 문장(연속 하락 끝 반등인지, 상승 며칠째인지).
+그다음 장중에서 급했던 구간을 짚고 그 시각의 공시·뉴스와 연결해라. 없으면 "직접 연결되는 재료는 데이터에 없음".
+시간외에서 방향이 바뀌었으면 별도 문단으로. 시간외 등락률은 정규장 종가 대비다.
 
 ## 종목 이슈인가, 업종 전체인가
-'동일업종' 등락률과 비교해서 판단해줘. 동종 종목들이 비슷하게 움직였으면 업종/매크로 요인이고,
-이 종목만 튀었으면 개별 이슈다. 반드시 다른 종목 등락률 숫자를 인용해서 근거를 대줘.
+'동일업종' 등락률 숫자를 인용해 개별 이슈인지 업종 전체인지 판단해라.
 
 ## 강세 근거
 ## 약세 근거 / 리스크
-
-이 두 항목이 이 분석의 핵심이다. 다음 규칙을 지켜라.
-
-1) 아래 여섯 갈래를 **모두** 훑어보고, 각 갈래에서 나온 근거를 빠짐없이 배치해라.
-   `[공시]`   전자공시 (규모·기간 같은 숫자를 본문에서 인용해라)
-   `[뉴스]`   종목 뉴스 + 업종·전방수요·매크로 뉴스
-   `[리포트]` 애널리스트 리포트
-   `[산업]`   TrendForce 산업 리서치 + DRAM 현물가
-   `[거시]`   거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 금리) + ADR 괴리율
-   `[대시보드]` 수급, 통합 신호, 가격 과열도, 선물 경보, 밸류에이션·컨센서스, 동일업종 등락률
-2) 각 항목은 **`[갈래] 내용 (근거 숫자·출처)`** 형식으로 써라.
-   말머리는 위 여섯 개(`[공시]` `[뉴스]` `[리포트]` `[산업]` `[거시]` `[대시보드]`)만 쓰고,
-   다른 이름을 지어내지 마라.
-   예: `[거시] SOX 20일 +6.37%로 반도체 업종 전반이 강세 (SOX 12,417.05)`
-3) 어느 갈래에서 쓸 만한 근거가 안 나오면 그 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음`이라고 한 줄로 적어라.
-   억지로 만들어내지 마라.
-4) 매크로 지표는 숫자만 옮기지 말고 **이 종목까지 어떻게 연결되는지** 한 마디로 붙여라
-   (예: 원화 약세면 수출 채산성에 유리, 금리 급등이면 성장주 밸류에이션에 부담).
-5) 강세만 길게 쓰고 약세를 형식적으로 채우지 마라. 양쪽을 같은 밀도로 써라.
+이 둘이 핵심이다.
+1) 여섯 갈래를 모두 훑고, 한 갈래에 다른 이야기가 여럿이면 항목을 나눠 적어라
+   (특히 `[산업]`의 DRAM 현물가/Capex, `[대시보드]`의 수급/과열도/조기신호는 각각 따로).
+   `[공시]` 전자공시(숫자 인용) · `[뉴스]` 종목+업종·매크로 뉴스 · `[리포트]` 애널리스트(증권가 시각 정리의 목표주가·추정 실적 숫자 인용)
+   `[산업]` TrendForce+DRAM 현물가+빅테크 Capex+실적 발표 일정
+   `[거시]` SOX·나스닥·달러인덱스·환율·금리+ADR 괴리율
+   `[대시보드]` 수급·과열도·조기신호·컨센서스·동일업종·외국인 보유율·차입공매도
+   `[재무]` 재무 정리의 매출·영업이익·이익률 추이와 추정치(숫자 인용)
+2) 형식은 `[갈래] 내용 (근거 숫자)`. 말머리는 위 일곱 개만.
+3) 쓸 근거가 없는 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음` 한 줄.
+4) 매크로 숫자는 이 종목까지 어떻게 연결되는지 한 마디 붙여라.
+5) 강세·약세를 같은 밀도로.
 
 ## 근거의 무게
-위 강세·약세 중 지금 더 무거운 쪽은 어디이고 왜인지 2–3문장.
-'확인된 실적·가격 데이터'가 '기대·심리'보다 무겁다는 기준으로 판단해라.
+어느 쪽이 더 무거운지 2문장. '확인된 데이터'가 '기대·심리'보다 무겁다.
 
 ## 커뮤니티 대세 반응
-게시글 제목을 실제로 읽고, 지금 개인 투자자 사이에서 **우세한 반응이 무엇인지** 2–3문장으로 짚어라.
-- 비율만 옮기지 마라("긍정 40% 부정 35%"는 그 자체로는 아무 말도 아니다).
-  무엇을 기대하고 무엇을 걱정하는지, 반복해서 나오는 화제가 무엇인지를 써라.
-- 근거로 실제 제목을 1–2개 짧게 인용해라.
-- 대세와 다른 소수 의견이 눈에 띄면 한 줄로 덧붙여라.
-- 여론이 위 강세·약세 근거와 어긋나면 그 점을 지적해라 (예: 데이터는 우호적인데 여론은 공포).
-- 반어법·비꼬는 말투가 많은 곳이다. 표면 단어가 아니라 문맥으로 읽어라.
-- 이건 사실이 아니라 여론이다. 여기서 나온 이야기를 사실 근거로 올려 쓰지 마라.
+제목을 읽고 우세한 반응을 2문장. 비율만 옮기지 말고 무엇을 기대·걱정하는지 써라.
+실제 제목 1–2개 짧게 인용, 눈에 띄는 소수 의견 한 줄, 여론이 데이터와 어긋나면 지적.
+반어법이 많으니 문맥으로 읽고, 여론을 사실 근거로 올려 쓰지 마라.
+
+## 수요 배경과 지표 점검
+아래 다섯 줄을 빠짐없이. 데이터가 없으면 "데이터에 없음".
+- 빅테크 Capex: 최근 분기와 전년 동기 대비 방향 + HBM 수요 의미 (중장기 배경이지 오늘 등락 원인 아님)
+- 하락·상승 조기신호: 충족 여부와 확률 ("백테스트 기반 참고치" 필수)
+- 다가오는 실적 발표: 며칠 뒤 무엇 (결과 예측 금지)
+- 목표주가 방향: 상향/하향 (기록 없으면 없다고)
+- 차입공매도 비중: 현재 수준과 1년 평균 대비 위치, 최근 방향
 
 ## 지금 위치
-현재가가 컨센서스 목표주가, 52주 고저, PER 대비 어디에 있는지 숫자로 정리해줘.
-컨센서스는 증권사들의 기대치일 뿐 보장이 아니라는 점도 한 줄로 덧붙여줘.
+현재가가 목표주가·52주 고저·PER 대비 어디인지 숫자로. 목표주가는 어느 집계인지 괄호로
+밝히고(FnGuide / 직접 집계), 두 값이 다르면 그 사실도 한 줄로. 컨센서스는 기대치일 뿐이라는 단서 한 줄.
+**실적이 어디까지 왔는지도 한 줄** — 재무 정리의 매출·영업이익 추이와 추정치를 숫자로.
+지금 밸류에이션이 그 실적 대비 어디인지 짚어라.
 
 ## 앞으로 확인할 것
-막연한 말("시장을 주시") 말고, 구체적으로 무엇을 보면 판단이 갈리는지 2–3개.
-가능하면 이 대시보드에서 볼 수 있는 지표(DRAM 현물가, 기관 순매수, 빅테크 Capex 등)로 짚어줘.
+무엇을 보면 판단이 갈리는지 구체적으로 2–3개. 이 대시보드에서 볼 수 있는 지표로.
 
 작성 규칙:
-- 위 데이터에 없는 사실은 지어내지 마. 모르면 "데이터에 없음"이라고 써.
-- 숫자를 인용할 때는 위 데이터의 값을 그대로 써.
-- "긍정적 흐름이 예상된다" 같은 하나 마나 한 문장은 쓰지 마.
-- 통합 신호·가격 과열도·선물 경보는 과거 통계를 돌린 참고 지표다. 근거로 써도 되지만,
-  쓸 때는 "백테스트 기반 참고치" 같은 단서를 반드시 함께 붙여라. 단독 근거로 결론을 내지 마.
-- 커뮤니티 심리는 사실이 아니라 여론이다. 사실 근거와 같은 급으로 취급하지 마.
-- 매수/매도 추천이나 목표가 제시는 하지 마. 사실과 해석만.
-- 날짜를 쓸 때는 위 데이터에 있는 날짜만 써. 기억에 의존한 날짜는 쓰지 마.
+- **짧게.** 초당 40자로 나오므로 길어진 만큼 기다린다. 전체 2,000자 안쪽. 항목을 빼지 말고 문장을 눌러 담아라.
+- 각 근거는 한 줄. 서론·맺음말·재요약 금지.
+- 데이터에 없는 사실·날짜·숫자를 지어내지 마. 모르면 "데이터에 없음".
+- 과열도·조기신호는 "백테스트 기반 참고치" 단서를 붙이고 단독 근거로 쓰지 마.
+- 실적 발표가 3일 이내면 관망세 배경으로 짚되 결과는 예측 금지.
+- 목표주가는 수준보다 방향(상향/하향)이 중요. 기록 없으면 없다고 써라.
+- '외국계 창구 추정 순매수'는 거래원 기반 추정치다. '추정'임을 밝히고, 이 값으로 기관·개인을 추측하지 마라.
+- 차입공매도 비중은 주간 값이다. 특정 날짜의 원인으로 쓰지 말고 평균 대비 수준·방향으로만.
+  높다고 하락을 예상하지 마라(숏커버링이 상승 재료가 되기도 한다).
+- 커뮤니티는 여론이지 사실이 아니다. 매수/매도 추천·목표가 제시 금지.
+- 장중에는 오늘 값을 '종가'·'마감'으로 쓰지 마. [지금 시장 상태]대로 진행 중임이 드러나게.
+- 수급 숫자는 날짜를 확인해라. 장중이면 오늘 수급은 아직 없다.
 - 같은 내용을 여러 갈래에 중복해서 적지 마. 한 근거는 가장 잘 맞는 갈래 한 곳에만."""
 
     note = None
@@ -2517,10 +3489,43 @@ def generate_ai_analysis(
         except Exception:
             note = "구글 검색 grounding에 실패해, 수집된 뉴스만으로 분석했습니다."
 
-    text, used = _call_gemini(prompt)
+    skipped: list[tuple[str, str]] = []
+    if _stream_to is None:
+        text, used = _call_gemini(prompt)
+    else:
+        # 스트리밍: 받는 대로 화면에 흘려보낸다. 총 시간은 같지만 첫 글자가 곧바로 보인다.
+        used_holder: dict = {}
+        chunks: list[str] = []
+        last_paint = 0.0
+        for piece in _stream_gemini(prompt, used_holder):
+            if piece is _RESTART:
+                # 앞 모델의 답을 버리고 다음 모델 답으로 갈아끼운다.
+                # 안 지우면 두 모델의 글이 화면에 이어붙는다.
+                chunks.clear()
+                last_paint = 0.0
+                _stream_to("")
+                continue
+            chunks.append(piece)
+            # 조각마다 그리면 브라우저가 글 전체를 60번 넘게 다시 파싱한다. 조각은 약 900ms
+            # 간격으로 오므로 0.4초로 묶어도 끊겨 보이지 않으면서 렌더 횟수는 절반이 된다.
+            now = time.monotonic()
+            if now - last_paint >= STREAM_PAINT_SEC:
+                last_paint = now
+                _stream_to("".join(chunks))
+        text = "".join(chunks)
+        _stream_to(text)          # 마지막 묶음이 화면에 빠지지 않게 한 번 더
+        used = used_holder.get("model", GEMINI_MODEL)
+        skipped = used_holder.get("skipped") or []
+
+    if _looks_truncated(text):
+        cut = "AI 응답이 중간에 끊겼습니다(마지막 항목이 빠졌습니다). 다시 눌러 보세요."
+        note = f"{note} {cut}" if note else cut
+
     if used != GEMINI_MODEL:
-        # 기본 모델이 일일 한도에 걸려 다른 모델로 넘어간 경우 그 사실을 알려준다
-        switched = f"{GEMINI_MODEL}의 오늘 무료 한도가 소진되어 {used} 모델로 분석했습니다."
+        # 기본 모델을 건너뛴 이유를 그대로 알려준다. 예전에는 이유를 묻지 않고 늘
+        # "한도가 소진되어"라고 적었는데, 응답이 느려서 넘어간 경우까지 한도 탓으로 말해버렸다.
+        why = ", ".join(f"{m}: {reason}" for m, reason in skipped) if skipped else "사용 불가"
+        switched = f"{used} 모델로 분석했습니다 ({why})."
         note = f"{note} {switched}" if note else switched
     return (text or "AI가 응답을 생성하지 못했습니다.", note)
 
@@ -2576,7 +3581,10 @@ def _note_optional_failure(what: str, exc: Exception) -> None:
     장중 그래프가 통째로 없어진 걸 한참 뒤에야 알아챈 적이 두 번 있었다
     (빈 DataFrame dtype 문제, plotly 5.x가 모르는 속성 문제).
     나머지 화면은 그대로 두되 무엇이 왜 빠졌는지는 반드시 남긴다."""
+    # 예외 종류와 메시지만으로는 어느 줄에서 났는지 못 찾는다. 실제로 '.dt accessor' 오류가
+    # 났을 때 후보 줄을 하나씩 눌러보느라 시간을 버렸다. 트레이스백까지 남긴다.
     print(f"[render_current_price] {what} 실패: {type(exc).__name__}: {exc}", flush=True)
+    print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
     st.caption(f":gray[{what}를 표시하지 못했습니다 ({type(exc).__name__}).]")
 
 
@@ -2609,7 +3617,13 @@ def render_current_price():
         volume = price_info.get("accumulatedTradingVolume", "-")
 
         with st.container(key="price_row_columns"):
-            price_col, open_col, high_col, low_col, volume_col = st.columns(5)
+            # 시가총액은 폴링 응답에 marketValueFull(원 단위)로 이미 들어 있다.
+            # 주가와 같은 주기로 갱신되므로 다른 지표와 같은 줄에 둔다.
+            cap_raw = _to_number(data.get("marketValueFullRaw")) or _to_number(data.get("marketValueFull"))
+            cap_txt = f"{cap_raw / 1e12:,.1f}조" if cap_raw else "-"
+
+            (price_col, open_col, high_col,
+             low_col, volume_col, cap_col) = st.columns(6)
             price_col.metric(
                 label="현재가 (시세 지연)",
                 value=f"{close_price:,}원",
@@ -2624,6 +3638,13 @@ def render_current_price():
             ]:
                 with col.container(key=f"metric_small_{key}"):
                     st.metric(label, value)
+            with cap_col.container(key="metric_small_marketcap"):
+                _metric_with_help(
+                    "시가총액", cap_txt,
+                    "상장예정주식수까지 포함한 시가총액입니다(보통주+우선주). "
+                    "주가와 같은 주기로 갱신되므로 장중에는 계속 바뀝니다.",
+                    key="marketcap",
+                )
 
         # 프리장/애프터장(NXT) 실시간 시세. 정규장이 닫혀 있어도 이 구간에는 값이 움직인다.
         # 기준가는 '직전 정규장 종가'로 잡는다 — 프리장이면 전 거래일 종가, 애프터장이면 당일 종가라
@@ -2746,7 +3767,18 @@ def render_current_price():
             _note_optional_failure("괴리율·ADR", exc)
 
         st.caption(f"시장상태: {market_status} · 갱신시각: {updated_at}")
-        st.session_state["current_price_summary"] = f"종가 {close_price:,}원, 전일대비 {change:+,}원 ({change_pct:+.2f}%)"
+        # 장중에도 '종가'라고 적어 넘기는 바람에 AI가 진행 중인 가격을 확정 종가로 말했다.
+        # 네이버가 필드 이름을 closePrice로 쓸 뿐 장중에는 현재가다. 상태에 맞는 말로 넘긴다.
+        is_open = str(market_status).upper() == "OPEN"
+        st.session_state["market_is_open"] = is_open
+        st.session_state["market_status_raw"] = market_status
+        st.session_state["price_updated_at"] = updated_at
+        if is_open:
+            _label, _state = "현재가", f"{_korea_session_now() or '정규장'} 진행 중 · {updated_at} 체결"
+        else:
+            _label, _state = "종가", f"정규장 마감 · {updated_at} 확정"
+        st.session_state["current_price_summary"] = (
+            f"{_label} {close_price:,}원, 전일대비 {change:+,}원 ({change_pct:+.2f}%) ({_state})")
         # AI 분석 탭에서 컨센서스 목표주가 대비 상승여력을 계산할 때 쓴다
         st.session_state["current_price_value"] = close_price
 
@@ -3077,7 +4109,7 @@ def render_current_price():
                             "오늘 국내 체결이 쌓이면 **본주 / ADR 전환 버튼**이 생깁니다."
                         )
                 _bold_label_with_help("장중 주가 추이", "\n\n".join(help_lines), key="intraday")
-                st.plotly_chart(fig_intraday, width="stretch", key="chart_intraday_price", config={"displayModeBar": False})
+                st.plotly_chart(fig_intraday, width="stretch", key="chart_intraday_price", config=PLOTLY_CONFIG)
         except Exception as exc:
             _note_optional_failure("장중 주가 추이", exc)
 
@@ -3088,12 +4120,18 @@ def render_current_price():
                 live = flow["is_today"]
                 flow_help = (
                     "**이 종목이 아니라 코스피 시장 전체 수급입니다.**\n\n"
-                    "종목별 장중 수급은 한국거래소가 장 마감 후에만 공개해서 무료로는 구할 수 없습니다. "
-                    "증권사 HTS가 장중에 보여주는 종목별 수급은 거래소 유료 실시간 피드입니다.\n\n"
+                    "외국인·기관·개인 3분류를 종목별로 장중에 보는 방법은 없습니다. 거래소가 마감 후에만 "
+                    "공개하기 때문이고, 증권사 공식 API도 종목별은 일별만 제공합니다. "
+                    "바로 위의 '외국계 창구 추정'이 장중에 볼 수 있는 유일한 종목별 단서인데, "
+                    "그건 외국인만 잡히는 추정치입니다.\n\n"
                     "시장 전체 잠정치는 장중 1~2분마다 갱신됩니다. 이 종목의 수급으로 읽지 말고, "
                     "'오늘 시장에서 외국인이 사는 날인가 파는 날인가' 정도의 배경으로만 보세요.\n\n"
                     "종목별 일별 확정 수급은 **수급 현황** 탭에 있습니다."
                 )
+                # 아래는 '시장 전체' 수급이라 이 종목 얘기가 아니다. 바로 위에 이 종목의
+                # 장중 단서를 한 줄만 둔다(자세한 창구별 내역까지는 여기서 다루지 않는다).
+                _render_foreign_desk_line()
+
                 _bold_label_with_help(
                     f"코스피 전체 수급 ({'장중 잠정' if live else flow['날짜'] + ' 확정'}, 억원)",
                     flow_help, key="market_flow",
@@ -3130,6 +4168,10 @@ REFRESH_CHECK_INTERVAL_SEC = 60  # 예약된 시각이 지났는지 확인하는
 MARKET_DATA_REFRESH_HOURS = [16, 17, 18, 19]  # 수급현황·가격과열도·선물경보·통합신호·조기신호(종가/수급 기반)
 DRAM_REFRESH_HOURS = [13, 16, 20]
 BIGTECH_CAPEX_REFRESH_HOURS = [16]
+# AI 분석: 장 전(8시) · 장중 매시(9~15) · 마감 후 확정판(16시). 하루 9번.
+# 무료 등급이 모델당 하루 20회쯤이고 리포트·공시·재무 요약이 0~5번을 쓰므로 여유가 있다.
+AI_ANALYSIS_REFRESH_HOURS = [int(h) for h in os.environ.get(
+    "AI_ANALYSIS_REFRESH_HOURS", "8,9,10,11,12,13,14,15,16").split(",") if h.strip()]
 
 
 # 선물·통합 신호 계열 탭이 쓰는 데이터. 코스피200 선물 이력은 페이지마다 다음 조회 날짜가
@@ -3174,10 +4216,21 @@ def _refresh_bigtech_capex_cache() -> None:
     fetch_bigtech_capex()
 
 
+def _mark_ai_analysis_due() -> None:
+    """여기서 바로 만들지 않고 '만들어야 함' 표시만 남긴다.
+
+    이 함수가 불리는 시점은 탭이 그려지기 **전**이다. 과열도·DRAM 요약은 그 탭이
+    그려질 때 전역 변수에 채워지므로, 여기서 만들면 그 둘이 '계산되지 않음'으로 빠진다.
+    실제 생성은 파일 맨 끝(탭을 다 그린 뒤)에서 한다.
+    """
+    st.session_state["_ai_refresh_pending"] = True
+
+
 REFRESH_GROUPS = [
     ("market_data", "수급 현황 / 가격 과열도", MARKET_DATA_REFRESH_HOURS, _refresh_market_data_caches),
     ("dram", "DRAM 시세", DRAM_REFRESH_HOURS, _refresh_dram_caches),
     ("bigtech_capex", "빅테크 Capex", BIGTECH_CAPEX_REFRESH_HOURS, _refresh_bigtech_capex_cache),
+    ("ai_analysis", "AI 분석", AI_ANALYSIS_REFRESH_HOURS, _mark_ai_analysis_due),
 ]
 
 
@@ -3414,7 +4467,7 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         fig = px.line(hist, x="날짜", y="평균가(USD)")
         _style_chart_mobile(fig, title=selected, show_legend=False)
         fig.update_xaxes(rangeslider_visible=True)
-        st.plotly_chart(fig, width="stretch", key=chart_key, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
         st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
 
 
@@ -3424,6 +4477,29 @@ DOWNTREND_WINDOW = 20
 _visible_tab_labels = [label for label in ALL_TAB_LABELS if label in visible_tab_labels] or ALL_TAB_LABELS
 tabs = st.tabs(_visible_tab_labels)
 _tab_map = dict(zip(_visible_tab_labels, tabs))
+
+# Plotly는 숨겨진 탭(display:none) 안에서 그려질 때 컨테이너 폭을 못 재고 기본 700px로 그린다.
+# 탭이 보이게 돼도 스스로 다시 재지 않아서, 모바일 375px에서는 차트 오른쪽 절반이 잘려 나갔다
+# (SVG width=700, 오른쪽 끝 716px). config의 responsive는 window resize를 듣고 다시 그리므로,
+# 탭을 누른 뒤 resize를 한 번 쏴 주면 제 폭을 찾는다(실측 700 -> 343).
+# 리런마다 이 iframe이 새로 생기므로, 부모 창에 표시를 남겨 리스너가 겹쳐 붙지 않게 한다.
+st.components.v1.html(
+    """
+    <script>
+    (function () {
+      const w = window.parent, d = w.document;
+      if (w.__plotlyResizeHooked) return;
+      w.__plotlyResizeHooked = true;
+      const kick = () => setTimeout(() => w.dispatchEvent(new Event('resize')), 150);
+      d.addEventListener('click', (e) => {
+        if (e.target.closest && e.target.closest('[role="tab"]')) kick();
+      }, true);
+      kick();
+    })();
+    </script>
+    """,
+    height=0,
+)
 
 # 각 탭의 렌더링 코드는 아래에서 함수로 정의되고, 파일 맨 끝의 디스패치 루프에서
 # 사용자가 사이드바에서 선택한(숨기지 않은) 탭만 실제로 호출된다.
@@ -3445,12 +4521,9 @@ def _render_tab_supply():
     lookback_days = st.session_state.get("lookback_days_slider", DEFAULT_LOOKBACK_DAYS)
     _subheader_with_help(
         f"최근 {lookback_days}일 투자자별 순매수 거래량",
-        "개인·기관·외국인이 이 종목을 하루에 얼마나 순매수(매수-매도)했는지와, 그 누적 추세를 봅니다. "
-        "아래 표의 기울기는 누적 순매수 추세선의 하루 평균 기울기로, 양수면 매수 우위입니다.\n\n"
-        "개인 순매수는 네이버가 따로 제공하지 않아 기관·외국인 합산의 잔차로 추정한 값이라 "
-        "기타법인 등의 소액 오차가 섞일 수 있습니다.\n\n"
-        "**절대 거래량**도 같이 그립니다. 순매수는 '누가 샀나'만 알려줄 뿐이라, 같은 순매수라도 "
-        "거래량이 평소의 3배인 날과 절반인 날은 의미가 다릅니다 (자세한 설명은 그 그래프 옆 ❓에).",
+        "개인·기관·외국인의 일별 순매수와 그 누적 추세입니다. 표의 기울기는 하루 평균이고 "
+        "양수면 매수 우위입니다.\n\n"
+        "개인 순매수는 네이버가 안 줘서 기관·외국인 합산의 잔차로 추정한 값이라 오차가 섞일 수 있습니다.",
         key="supply",
     )
     lookback_days = st.slider(
@@ -3468,7 +4541,7 @@ def _render_tab_supply():
             df_long = flows.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="순매수")
             fig_bar = px.bar(df_long, x="날짜", y="순매수", color="투자자", barmode="group")
             _style_chart_mobile(fig_bar, title="일별 순매수 거래량(주)")
-            st.plotly_chart(fig_bar, width="stretch", key="chart_investor_bar", config={"displayModeBar": False})
+            st.plotly_chart(fig_bar, width="stretch", key="chart_investor_bar", config=PLOTLY_CONFIG)
 
             # 절대 거래량. 순매수는 '누가 샀나'만 말해줄 뿐 그 날 얼마나 활발했는지는 안 보인다.
             # 같은 순매수라도 거래량이 평소의 3배인 날과 절반인 날은 의미가 다르다.
@@ -3503,20 +4576,15 @@ def _render_tab_supply():
                 # 설명은 제목 옆 ? 안으로. 그래프 아래 캡션으로 길게 깔면 화면이 어수선해진다.
                 _bold_label_with_help(
                     "일별 거래량(주)",
-                    "막대 색은 그 날 종가가 전일 대비 올랐으면 초록, 내렸으면 빨강입니다. "
-                    f"회색 선은 {avg_window}일 이동평균이고, 조회 기간에 맞춰 자동으로 조정됩니다.\n\n"
-                    "거래량은 일봉 경로에서 따로 받아서, 마감 직후 오늘치가 바로 들어옵니다. "
-                    "위 순매수 그래프는 투자자 수급이 공개된 뒤에야 오늘치가 채워지므로, "
-                    "마감 직후에는 거래량 쪽이 하루 앞서 있을 수 있습니다.\n\n"
-                    "거래량이 평소보다 크게 늘어난 날은 위 순매수 그래프에서 누가 움직였는지 같이 보세요. "
-                    "다만 거래량 자체는 이 종목 과거 데이터에서 방향 예측력이 없었습니다 — "
-                    "크기의 참고치로만 쓰세요.",
+                    f"막대 색은 그 날 등락, 회색 선은 {avg_window}일 이동평균입니다.\n\n"
+                    "거래량은 마감 직후 바로 들어오지만 위 순매수는 18시가 넘어야 채워져서, "
+                    "마감 직후에는 하루 앞서 있을 수 있습니다. 거래량 자체에 방향 예측력은 없었습니다.",
                     key="volume",
                 )
                 _style_chart_mobile(fig_vol)
                 fig_vol.update_yaxes(title_text="거래량(주)")
                 st.plotly_chart(fig_vol, width="stretch", key="chart_volume",
-                                config={"displayModeBar": False})
+                                config=PLOTLY_CONFIG)
 
                 latest_vol = float(vol.iloc[-1])
                 base_vol = float(vol_avg.iloc[-1])
@@ -3538,7 +4606,7 @@ def _render_tab_supply():
             df_cum_long = df_cum.reset_index().melt(id_vars="날짜", var_name="투자자", value_name="누적 순매수")
             fig_line = px.line(df_cum_long, x="날짜", y="누적 순매수", color="투자자")
             _style_chart_mobile(fig_line, title="누적 순매수 추세")
-            st.plotly_chart(fig_line, width="stretch", key="chart_investor_line", config={"displayModeBar": False})
+            st.plotly_chart(fig_line, width="stretch", key="chart_investor_line", config=PLOTLY_CONFIG)
 
             slopes = {col: calc_slope(df_cum[col]) for col in df_cum.columns}
             slope_df = pd.DataFrame(
@@ -3564,13 +4632,9 @@ def _render_tab_overheat():
 
     _subheader_with_help(
         "가격 과열도 백테스트",
-        "이동평균 대비 괴리율(과열·침체) 구간별로, 향후 일정 기간 내 일정 폭 이상 하락할 확률이 "
-        "어떻게 달라지는지 보는 참고용 통계입니다. 기본값(80일·15거래일·10%)은 파라미터 168개 조합을 "
-        "백테스트해 괴리율과 하락확률의 단조 관계가 가장 뚜렷하고 검증구간에서도 유지된 조합으로 정했습니다. "
-        "상승 확률은 괴리율과 뚜렷한 관계가 없어(양 극단에서 모두 높은 U자형) 표시하지 않습니다. "
-        "매매 신호가 아닙니다.\n\n"
-        "화면 맨 위의 '괴리율 (현재가 기준)'은 같은 값을 장중 현재가로 계산한 것이라, 확정 종가로 계산하는 "
-        "이 탭보다 장중에 먼저 움직입니다. 이동평균 기간은 아래 설정을 함께 따릅니다.",
+        "이동평균 대비 괴리율 구간별로 향후 하락 확률이 어떻게 달라지는지 보는 통계입니다. "
+        "기본값은 168개 조합을 백테스트해 고른 값입니다.\n\n"
+        "상승 확률은 괴리율과 관계가 없어(U자형) 표시하지 않습니다. 매매 신호가 아닙니다.",
         key="overheat",
     )
 
@@ -3701,7 +4765,7 @@ def _render_tab_overheat():
                 fig_breakdown.update_xaxes(title_text="괴리율", tickformat=".0%")
                 fig_breakdown.update_yaxes(title_text=f"{OVERHEAT_HORIZON}거래일 내 확률", tickformat=".0%")
                 _style_chart_mobile(fig_breakdown)
-                st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config={"displayModeBar": False})
+                st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config=PLOTLY_CONFIG)
 
                 overheat_hist_ma = overheat_hist.copy()
                 overheat_hist_ma["MA"] = overheat_hist_ma["종가"].rolling(OVERHEAT_MA_WINDOW).mean()
@@ -3731,7 +4795,7 @@ def _render_tab_overheat():
                 fig_overheat.update_yaxes(title_text="괴리율", tickformat=".0%", secondary_y=False)
                 fig_overheat.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_overheat.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_overheat, width="stretch", key="chart_overheat", config={"displayModeBar": False})
+                st.plotly_chart(fig_overheat, width="stretch", key="chart_overheat", config=PLOTLY_CONFIG)
                 st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
 
                 down_summary_parts = [
@@ -3817,7 +4881,7 @@ def _render_tab_overheat():
                             ))
                         _style_chart_mobile(fig_strategy, title="전략 vs buy & hold 누적 수익률 (%)")
                         fig_strategy.update_yaxes(title_text="누적 수익률 (%)")
-                        st.plotly_chart(fig_strategy, width="stretch", key="chart_overheat_strategy", config={"displayModeBar": False})
+                        st.plotly_chart(fig_strategy, width="stretch", key="chart_overheat_strategy", config=PLOTLY_CONFIG)
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
 
@@ -3945,7 +5009,7 @@ def _render_tab_futures():
                 fig_futures_breakdown.update_xaxes(title_text="기울기")
                 fig_futures_breakdown.update_yaxes(title_text=f"{FUTURES_HORIZON}거래일 내 확률", tickformat=".0%")
                 _style_chart_mobile(fig_futures_breakdown)
-                st.plotly_chart(fig_futures_breakdown, width="stretch", key="chart_futures_breakdown", config={"displayModeBar": False})
+                st.plotly_chart(fig_futures_breakdown, width="stretch", key="chart_futures_breakdown", config=PLOTLY_CONFIG)
 
                 futures_chart_df = pd.DataFrame(
                     {
@@ -3975,7 +5039,7 @@ def _render_tab_futures():
                 fig_futures.update_yaxes(title_text="기울기", secondary_y=False)
                 fig_futures.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_futures.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_futures, width="stretch", key="chart_futures", config={"displayModeBar": False})
+                st.plotly_chart(fig_futures, width="stretch", key="chart_futures", config=PLOTLY_CONFIG)
                 st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
 
                 futures_down_parts = [
@@ -4011,13 +5075,9 @@ def _render_tab_composite():
 
     _subheader_with_help(
         "통합 매수/매도 신호 (실험적)",
-        "기관 수급, 미국 반도체지수(SOX), 달러인덱스(DXY)를 통계적 유의성에 따라 가중합산한 실험적 종합 신호입니다 "
-        "(다른 지표들은 백테스트 결과 상관관계가 낮거나 정보가 중복돼 제외했습니다). "
-        f"종합 신호가 매수/매도 우위일 때 향후 {COMPOSITE_HORIZON}거래일 내 하락/상승 확률이 어떻게 달라지는지 봅니다.\n\n"
-        "매매 신호가 아니라 백테스트 기반 참고 자료이며, 가중치를 같은 기간 데이터로 정한 인-샘플 결과입니다. "
-        "학습 구간(초반)과 검증 구간(후반)을 60/70/80%로 나눠 각각 확인해보니, 하락 확률 차이는 세 분할 모두 "
-        "통계적으로 유의했지만(p<0.01), 상승 확률 차이는 세 분할 모두 유의하지 않았습니다(p=0.14–0.95). "
-        "즉 하락 경보로는 어느 정도 근거가 있지만, 상승 예측으로는 신뢰하기 어렵습니다.",
+        "기관 수급·SOX·달러인덱스를 유의성에 따라 가중합산한 실험적 신호입니다.\n\n"
+        "**하락 경보로는 근거가 있지만 상승 예측으로는 못 씁니다.** 검증 결과 하락 확률 차이만 "
+        "유의했고(p<0.01) 상승은 아니었습니다(p=0.14–0.95). 매매 신호가 아닙니다.",
         key="composite",
     )
 
@@ -4126,7 +5186,7 @@ def _render_tab_composite():
             fig_composite.update_yaxes(title_text="종합 신호", secondary_y=False)
             fig_composite.update_yaxes(title_text="종가(원)", secondary_y=True)
             fig_composite.update_xaxes(rangeslider_visible=True)
-            st.plotly_chart(fig_composite, width="stretch", key="chart_composite", config={"displayModeBar": False})
+            st.plotly_chart(fig_composite, width="stretch", key="chart_composite", config=PLOTLY_CONFIG)
             composite_caption = "차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다."
             if show_downtrend_composite:
                 composite_caption += f" 빨간 음영 구간은 주가가 최근 {DOWNTREND_WINDOW}일간 {downtrend_pct_composite}% 이상 하락한 하락장 구간입니다."
@@ -4150,17 +5210,9 @@ def _render_tab_composite():
 def _render_tab_signal():
     _subheader_with_help(
         "매매 신호 (기관 수급 기반)",
-        "기관 순매수를 최근 평균 거래량으로 나눠 20일 누적한 값이 양수면 '보유', 음수면 '현금'으로 판정합니다.\n\n"
-        "대시보드가 쓰는 후보 지표 19종(이동평균 괴리율, 모멘텀, 외국인 수급, SOX, 달러인덱스, 거래량 등)을 "
-        "SK하이닉스 10년치로 검증해 유일하게 살아남은 지표입니다. SOX는 학습구간과 검증구간에서 상관 부호가 "
-        "뒤집혔고, 달러인덱스와 괴리율은 중첩 표본을 보정하면 유의성이 사라졌습니다.\n\n"
-        "이 신호의 정체는 '기관이 사면 오른다'는 일반 법칙이 아니라, **글로벌 반도체 업황의 선행 지표**입니다. "
-        "SK하이닉스에 대한 한국 기관의 순매수는 마이크론(+0.24)·대만 메모리 3사(+0.17–+0.23)·"
-        "도쿄일렉트론(+0.25)·ASML(+0.20)까지 예측했지만, 반도체와 무관한 종목(코카콜라·JP모건·도요타 등)은 "
-        "전혀 예측하지 못했습니다(평균 +0.05, 유의성 없음). 이 구별이 신호가 진짜라는 근거입니다.\n\n"
-        "반대로 '각 종목의 자기 기관 수급으로 그 종목을 예측'하는 방식은 통하지 않습니다. "
-        "정보를 가진 건 하이닉스에 들어오는 기관 자금이지, 아무 종목의 기관 수급이 아닙니다.\n\n"
-        "아래 '검증 상세와 한계'를 반드시 읽으세요. 백테스트일 뿐이고, 남는 위험이 있습니다.",
+        "기관 순매수를 거래량으로 나눠 20일 누적한 값이 양수면 '보유', 음수면 '현금'입니다. "
+        "후보 지표 19종 중 10년 검증을 통과한 유일한 지표로, 실은 글로벌 반도체 업황의 선행 지표입니다.\n\n"
+        "백테스트일 뿐입니다. 아래 '검증 상세와 한계'를 읽으세요.",
         key="flow_signal",
     )
 
@@ -4237,7 +5289,7 @@ def _render_tab_signal():
         ))
         _style_chart_mobile(fig_equity, title="원금 1로 놓았을 때의 자산 곡선")
         fig_equity.update_yaxes(title_text="자산 배수", type="log")
-        st.plotly_chart(fig_equity, width="stretch", key="chart_flow_equity", config={"displayModeBar": False})
+        st.plotly_chart(fig_equity, width="stretch", key="chart_flow_equity", config=PLOTLY_CONFIG)
         st.caption("세로축은 로그 눈금입니다. 같은 간격이 같은 배수를 뜻합니다.")
 
         fig_signal = make_subplots(specs=[[{"secondary_y": True}]])
@@ -4254,7 +5306,7 @@ def _render_tab_signal():
         fig_signal.update_yaxes(title_text="신호값", secondary_y=False)
         fig_signal.update_yaxes(title_text="종가(원)", secondary_y=True)
         fig_signal.update_xaxes(rangeslider_visible=True)
-        st.plotly_chart(fig_signal, width="stretch", key="chart_flow_signal", config={"displayModeBar": False})
+        st.plotly_chart(fig_signal, width="stretch", key="chart_flow_signal", config=PLOTLY_CONFIG)
         st.caption("파란 선이 0 위로 올라오면 보유, 아래로 내려가면 현금 구간입니다.")
 
         with st.expander("검증 상세와 한계 (실제 매매 전에 꼭 읽어주세요)"):
@@ -4337,18 +5389,12 @@ def _render_tab_signal():
 
 
 def _render_tab_decline():
-    DECLINE_PATTERN_WINDOW = 20
-    DECLINE_PATTERN_VOL_WINDOW = 20
-    DECLINE_HORIZON = 10
-    DECLINE_DRAWDOWN_THRESHOLD = 0.07
-
     _subheader_with_help(
         "큰폭 하락 조기 신호 (SK하이닉스 전용, 참고용)",
-        "과거 SK하이닉스의 큰폭 하락(고점 대비 15% 이상) 8건을 분석해서 만든 조건(외국인 순매도 + 거래량 증가)이 실제로 "
-        f"향후 {DECLINE_HORIZON}거래일 내 {DECLINE_DRAWDOWN_THRESHOLD:.0%} 이상 하락할 확률을 높이는지 백테스트했습니다.\n\n"
-        "전체 기간(38.0% vs 24.2%, p=0.001)과, 데이터를 앞/뒤 절반으로 나눠 따로 검증했을 때도 방향이 일관되게 유지됐습니다 "
-        "(뒷반기 p=0.003, 앞반기는 표본이 적어 유의하진 않았지만 같은 방향). 코스피 시가총액 상위 10개 종목 전체로는 "
-        "일반화되지 않는 것으로 확인되어, SK하이닉스 개별 참고용으로만 제공합니다. 매매 신호가 아닙니다.",
+        "과거 큰폭 하락 8건에서 뽑은 조건(외국인 순매도 + 거래량 증가)이 "
+        f"향후 {DECLINE_HORIZON}거래일 내 {DECLINE_DRAWDOWN_THRESHOLD:.0%} 하락 확률을 높이는지 본 백테스트입니다"
+        " (38.0% vs 24.2%, p=0.001).\n\n"
+        "앞/뒤 절반 검증에서도 방향은 일관됐습니다. 다른 종목에는 일반화되지 않습니다. 매매 신호가 아닙니다.",
         key="decline",
     )
     if TICKER != DEFAULT_TICKER:
@@ -4465,7 +5511,7 @@ def _render_tab_decline():
                 fig_decline_foreign.update_yaxes(title_text="기울기", secondary_y=False)
                 fig_decline_foreign.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_decline_foreign.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_decline_foreign, width="stretch", key="chart_decline_foreign", config={"displayModeBar": False})
+                st.plotly_chart(fig_decline_foreign, width="stretch", key="chart_decline_foreign", config=PLOTLY_CONFIG)
 
                 fig_decline_volume = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_decline_volume.add_trace(
@@ -4481,27 +5527,18 @@ def _render_tab_decline():
                 fig_decline_volume.update_yaxes(title_text="거래량비율(배)", secondary_y=False)
                 fig_decline_volume.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_decline_volume.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_decline_volume, width="stretch", key="chart_decline_volume", config={"displayModeBar": False})
+                st.plotly_chart(fig_decline_volume, width="stretch", key="chart_decline_volume", config=PLOTLY_CONFIG)
                 st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
         except Exception as e:
             st.error(f"조기 신호 조회에 실패했습니다: {e}")
 
 def _render_tab_rally():
-    RALLY_PATTERN_WINDOW = 20
-    RALLY_PATTERN_VOL_WINDOW = 20
-    RALLY_HORIZON = 10
-    RALLY_DRAWDOWN_THRESHOLD = 0.07
-
     _subheader_with_help(
         "큰폭 상승 조기 신호 (SK하이닉스 전용, 참고용)",
-        "과거 SK하이닉스의 큰폭 상승(저점 대비 15% 이상) 16건을 분석해서 만든 조건(기관 순매수 + 개인 순매도 + 거래량 증가)이 "
-        f"실제로 향후 {RALLY_HORIZON}거래일 내 하락/상승 확률에 영향을 주는지 백테스트했습니다.\n\n"
-        "전체 기간으로는 하락 확률 12.8% vs 29.0%(p=0.003), 상승 확률 65.4% vs 50.4%(p=0.013)로 유의했지만, "
-        "데이터를 앞/뒤 절반으로 나눠 각각 확인하면 뒷반기에서만 강하게 나타나고 앞반기에서는 방향이 뒤집히거나 "
-        "무의미했습니다. 즉 특정 시기에 치우친 결과일 가능성이 높아 다른 조건들보다 신뢰도가 낮습니다. "
-        "코스피 시가총액 상위 10개 종목 전체로도 일반화되지 않는 것으로 확인되어"
-        "(특히 거래량 조건은 다른 종목에서 오히려 반대로 나타남), SK하이닉스 개별 참고용으로만 제공합니다. "
-        "매매 신호가 아닙니다.",
+        "과거 큰폭 상승 16건에서 뽑은 조건(기관 순매수 + 개인 순매도 + 거래량 증가)이 "
+        f"향후 {RALLY_HORIZON}거래일 확률을 바꾸는지 본 백테스트입니다.\n\n"
+        "**신뢰도가 낮습니다.** 앞/뒤 절반으로 나누면 뒷반기에서만 나타나 시기에 치우친 결과일 수 있고, "
+        "다른 종목에는 일반화되지 않습니다. 매매 신호가 아닙니다.",
         key="rally",
     )
     if TICKER != DEFAULT_TICKER:
@@ -4633,7 +5670,7 @@ def _render_tab_rally():
                 fig_rally_flow.update_yaxes(title_text="기울기", secondary_y=False)
                 fig_rally_flow.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_rally_flow.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_rally_flow, width="stretch", key="chart_rally_flow", config={"displayModeBar": False})
+                st.plotly_chart(fig_rally_flow, width="stretch", key="chart_rally_flow", config=PLOTLY_CONFIG)
 
                 fig_rally_volume = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_rally_volume.add_trace(
@@ -4649,7 +5686,7 @@ def _render_tab_rally():
                 fig_rally_volume.update_yaxes(title_text="거래량비율(배)", secondary_y=False)
                 fig_rally_volume.update_yaxes(title_text="종가(원)", secondary_y=True)
                 fig_rally_volume.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_rally_volume, width="stretch", key="chart_rally_volume", config={"displayModeBar": False})
+                st.plotly_chart(fig_rally_volume, width="stretch", key="chart_rally_volume", config=PLOTLY_CONFIG)
                 st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
         except Exception as e:
             st.error(f"조기 신호 조회에 실패했습니다: {e}")
@@ -4663,8 +5700,7 @@ def _render_tab_dram():
         "DRAM 현물가 (모듈 + 칩)",
         "DRAMeXchange에 공시되는 DRAM 현물가입니다. 칩(반도체 단품)과 모듈(칩을 붙인 완제품) 가격을 각각 보여줍니다. "
         "현물가는 기업 간 장기 계약가(고정가)보다 먼저 움직이는 편이라, 메모리 업황의 선행 지표로 참고합니다.\n\n"
-        "'변동률(%)'은 사이트가 표시하는 직전 갱신 대비 값이고, 'N일 전 대비'는 이 대시보드가 쌓아온 이력에서 "
-        "슬라이더로 고른 기간만큼 이전 값과 비교한 것입니다. 그 기간만큼 이력이 없으면 N/A로 표시됩니다. "
+        "'변동률(%)'은 사이트의 직전 갱신 대비, 'N일 전 대비'는 이 대시보드가 쌓은 이력과 비교한 값입니다. "
         "사이트의 Last Update가 바뀔 때만 새 기록이 쌓입니다.",
         key="dram",
     )
@@ -4682,6 +5718,13 @@ def _render_tab_dram():
                 dram_summary = "\n".join(
                     f"- {row['품목']}: ${row['평균가(USD)']:,.3f} ({_signed_pct(row)})" for _, row in combined_df.iterrows()
                 )
+                # 기준일을 안 붙이면 AI가 며칠 전 시세를 '오늘 올랐다'로 옮겨 적는다.
+                _asof = " · ".join(x for x in (
+                    f"모듈 {module_last_update}" if module_last_update else "",
+                    f"칩 {chip_last_update}" if chip_last_update else "") if x)
+                if _asof:
+                    dram_summary += (f"\n- (TrendForce 기준일: {_asof}. 매일 갱신되지는 않으므로"
+                                     " 이 날짜를 확인하고 인용해라)")
                 history = save_dram_snapshot(module_df, module_last_update, chip_df, chip_last_update)
 
                 chip_hist = history[history["품목"].isin(chip_df["품목"])]
@@ -4701,7 +5744,8 @@ def _render_tab_dram():
                     key="dram_chip_label",
                 )
                 st.caption(
-                    f"사이트 기준 업데이트: {chip_last_update} (GMT+8)" if chip_last_update
+                    (f"사이트 기준 업데이트: {chip_last_update} (GMT+8)"
+                     + _stale_note(chip_last_update)) if chip_last_update
                     else "사이트의 업데이트 시각을 확인하지 못해 조회 시각으로 기록했습니다."
                 )
                 if chip_max_days >= 2:
@@ -4735,7 +5779,8 @@ def _render_tab_dram():
                     key="dram_module_label",
                 )
                 st.caption(
-                    f"사이트 기준 업데이트: {module_last_update} (GMT+8)" if module_last_update
+                    (f"사이트 기준 업데이트: {module_last_update} (GMT+8)"
+                     + _stale_note(module_last_update)) if module_last_update
                     else "사이트의 업데이트 시각을 확인하지 못해 조회 시각으로 기록했습니다."
                 )
                 if module_max_days >= 2:
@@ -4785,31 +5830,73 @@ def _render_tab_capex():
             else:
                 capex_df = capex_df_all[capex_df_all["기업"].isin(selected_companies)]
 
-                fig_capex = px.bar(
-                    capex_df, x="분기말", y="capex_B", color="기업", barmode="stack",
-                    labels={"capex_B": "Capex (10억달러)", "분기말": "분기"},
-                    color_discrete_map=CAPEX_COMPANY_COLORS,
-                )
-                totals = capex_df.groupby("분기말")["capex_B"].sum().reset_index().sort_values("분기말")
-                totals["qoq_pct"] = totals["capex_B"].pct_change() * 100
-                fig_capex.add_trace(
-                    go.Scatter(x=totals["분기말"], y=totals["capex_B"], name="합계", mode="lines+markers", line=dict(color="gray", dash="dot")),
-                )
-                fig_capex.add_trace(
-                    go.Scatter(
-                        x=totals["분기말"], y=totals["qoq_pct"], name="증감률",
-                        mode="lines+markers", line=dict(color="#d62728"), yaxis="y2",
+                # 예전 세션에 남아 있는 값(빠진 '연도별 누적' 등)이 그대로 있으면 st.radio가 터진다
+                if st.session_state.get("capex_view_mode") not in CAPEX_VIEW_MODES:
+                    st.session_state.pop("capex_view_mode", None)
+                _mode = st.radio(
+                    "보기 방식", CAPEX_VIEW_MODES, horizontal=True, key="capex_view_mode",
+                    help=(
+                        "**분기별** — 그 분기에 쓴 돈. 기본값입니다.\n\n"
+                        "**최근 4분기 합(TTM)** — 분기 들쭉날쭉함을 걷어낸 실제 투자 속도입니다. "
+                        "추세를 보려면 이걸 보세요.\n\n"
+                        "**전체 누적** — 첫 분기부터 계속 더합니다. 항상 우상향이라 보기엔 좋지만, "
+                        "시작점이 데이터를 어디부터 받아왔는지에 따라 정해질 뿐이라 "
+                        "읽어낼 수 있는 정보는 가장 적습니다."
                     ),
                 )
+
+                totals = capex_df.groupby("분기말")["capex_B"].sum().reset_index().sort_values("분기말")
+
+                if _mode == CAPEX_VIEW_MODES[0]:            # 분기별 (기존 그래프)
+                    fig_capex = px.bar(
+                        capex_df, x="분기말", y="capex_B", color="기업", barmode="stack",
+                        labels={"capex_B": "Capex (10억달러)", "분기말": "분기"},
+                        color_discrete_map=CAPEX_COMPANY_COLORS,
+                    )
+                    totals["qoq_pct"] = totals["capex_B"].pct_change() * 100
+                    fig_capex.add_trace(
+                        go.Scatter(x=totals["분기말"], y=totals["capex_B"], name="합계",
+                                   mode="lines+markers", line=dict(color="gray", dash="dot")),
+                    )
+                    fig_capex.add_trace(
+                        go.Scatter(
+                            x=totals["분기말"], y=totals["qoq_pct"], name="증감률",
+                            mode="lines+markers", line=dict(color="#d62728"), yaxis="y2",
+                        ),
+                    )
+                    fig_capex.update_layout(
+                        yaxis=dict(title="Capex (10억달러)"),
+                        yaxis2=dict(title="증감률(%)", overlaying="y", side="right", showgrid=False),
+                    )
+                    _capex_note = "차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다."
+                else:
+                    acc = _capex_accumulate(capex_df, _mode)
+                    fig_capex = px.line(
+                        acc, x="분기말", y="capex_B", color="기업", markers=True,
+                        labels={"capex_B": "Capex (10억달러)", "분기말": "분기"},
+                        color_discrete_map=CAPEX_COMPANY_COLORS,
+                    )
+                    tot_acc = acc.groupby("분기말")["capex_B"].sum().reset_index().sort_values("분기말")
+                    fig_capex.add_trace(
+                        go.Scatter(x=tot_acc["분기말"], y=tot_acc["capex_B"], name="4사 합계",
+                                   mode="lines+markers", line=dict(color="gray", dash="dot")),
+                    )
+                    fig_capex.update_layout(yaxis=dict(title="Capex (10억달러)"))
+                    if _mode == CAPEX_VIEW_MODES[1]:
+                        last, prev = tot_acc["capex_B"].iloc[-1], (
+                            tot_acc["capex_B"].iloc[-5] if len(tot_acc) >= 5 else None)
+                        _capex_note = (f"최근 4분기 합계 {last:,.0f}B 달러"
+                                       + (f" · 1년 전 같은 시점 {prev:,.0f}B 대비 {last/prev-1:+.0%}"
+                                          if prev else ""))
+                    else:
+                        _capex_note = ("첫 분기부터 계속 더한 값입니다. 시작점이 데이터 수집 시작일일 뿐이라"
+                                       " 기울기(=투자 속도)만 의미가 있습니다.")
+
                 _style_chart_mobile(fig_capex)
-                fig_capex.update_layout(
-                    yaxis=dict(title="Capex (10억달러)"),
-                    yaxis2=dict(title="증감률(%)", overlaying="y", side="right", showgrid=False),
-                    legend=dict(title=dict(text="")),
-                )
+                fig_capex.update_layout(legend=dict(title=dict(text="")))
                 fig_capex.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_capex, width="stretch", key="chart_bigtech_capex", config={"displayModeBar": False})
-                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
+                st.plotly_chart(fig_capex, width="stretch", key="chart_bigtech_capex", config=PLOTLY_CONFIG)
+                st.caption(_capex_note)
 
                 company_cols = st.columns(len(company_list))
                 for col, company in zip(company_cols, company_list):
@@ -4841,6 +5928,429 @@ def _render_tab_capex():
                     st.table(qoq_pivot.round(1), width="stretch")
     except Exception as e:
         st.error(f"빅테크 Capex 조회에 실패했습니다: {e}")
+
+def _render_financial_digest() -> None:
+    """재무 탭 맨 위 AI 요약. **여기서 만들지 않는다.**
+
+    예전에는 렌더 안에서 생성했는데, Streamlit이 보이는 탭을 매 리런마다 다시 그리는 탓에
+    생성이 필요한 순간 페이지 전체가 20~60초 멈췄다. 게다가 생성이 실패하면 저장할 게 없어
+    다음 리런에 또 시도했고, 모델이 전부 막힌 날은 클릭할 때마다 100초씩 멈췄다.
+    이제 생성은 수집기가 아침에 한 번 하고, 화면은 저장된 결과를 읽기만 한다.
+    """
+    saved = financial_digest.load()
+    col_a, col_b = st.columns([0.75, 0.25], vertical_alignment="center")
+    if saved.get("text"):
+        col_a.caption(f"요약 기준: {saved.get('date', '-')} · 매일 아침 값이 바뀌었을 때만 갱신")
+    else:
+        col_a.caption("아직 요약이 없습니다. 내일 아침 수집기가 만들거나, 지금 바로 만들 수 있습니다.")
+
+    if col_b.button("지금 갱신", key="fin_refresh",
+                    help="수집기를 기다리지 않고 지금 다시 만듭니다. 20~60초 걸립니다."):
+        with st.spinner("재무 데이터를 읽는 중..."):
+            try:
+                saved, _ = financial_digest.refresh(TICKER, f"{STOCK_NAME}({TICKER})", force=True)
+            except Exception as e:
+                st.error(f"요약 생성에 실패했습니다: {e}")
+
+    if saved.get("text"):
+        if saved.get("note"):
+            st.warning(saved["note"])
+        st.markdown(_md_safe(saved["text"]))
+        st.divider()
+
+
+def _fin_style(df: pd.DataFrame) -> pd.DataFrame:
+    """표에 넣을 수 있게 숫자를 사람이 읽는 형태로 바꾼다."""
+    def fmt(name, v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "-"
+        if "억원" in name:
+            return f"{v:,.0f}"
+        if "원)" in name:            # EPS·BPS
+            return f"{v:,.0f}"
+        return f"{v:,.2f}"
+    # 숫자 표에 문자열을 덮어쓰면 pandas가 dtype 경고를 낸다. 새 표를 만들어 돌려준다.
+    return pd.DataFrame(
+        [[fmt(idx, v) for v in df.loc[idx]] for idx in df.index],
+        index=df.index, columns=df.columns,
+    )
+
+
+def _render_tab_financials():
+    _subheader_with_help(
+        "재무 데이터",
+        "FnGuide(Company Guide)의 Financial Highlight를 그대로 가져옵니다. IFRS 연결 기준이며, "
+        "단위는 매출·이익이 억원, EPS·BPS가 원, 나머지는 %/배입니다.\n\n"
+        "**(E)가 붙은 열은 확정 실적이 아니라 증권사 추정치 평균**입니다. 확정치와 섞어서 "
+        "추세를 읽지 마세요.\n\n"
+        "순이익률·ROE·BPS는 지배주주 기준입니다.",
+        key="financials",
+    )
+    try:
+        annual, quarter = fetch_financials(TICKER)
+    except Exception as e:
+        st.error(f"재무 데이터를 가져오지 못했습니다: {e}")
+        return
+    if annual.empty and quarter.empty:
+        st.warning("재무 데이터를 가져오지 못했습니다.")
+        return
+
+    # 표보다 먼저 '이 숫자들이 무슨 뜻인지'를 읽히게 한다
+    _render_financial_digest()
+
+    if not annual.empty:
+        st.markdown("**연간 (IFRS 연결)**")
+        st.table(_fin_style(annual), width="stretch")
+
+        # 매출·이익 추이와 이익률을 한 그림에 둔다. 규모와 효율은 같이 봐야 뜻이 생긴다.
+        rev = annual.loc[[i for i in annual.index if i.startswith("매출액")]]
+        op = annual.loc[[i for i in annual.index if i.startswith("영업이익 ")]]
+        npf = annual.loc[[i for i in annual.index if i.startswith("당기순이익")]]
+        opm = annual.loc[[i for i in annual.index if i.startswith("영업이익률")]]
+        if not rev.empty:
+            periods = list(annual.columns)
+            fig = go.Figure()
+            for frame, name, color in ((rev, "매출액", "#4c78a8"),
+                                       (op, "영업이익", "#54a24b"),
+                                       (npf, "당기순이익", "#e45756")):
+                if not frame.empty:
+                    fig.add_trace(go.Bar(x=periods, y=list(frame.iloc[0]), name=name,
+                                         marker_color=color))
+            if not opm.empty:
+                fig.add_trace(go.Scatter(x=periods, y=list(opm.iloc[0]), name="영업이익률(%)",
+                                         mode="lines+markers", yaxis="y2",
+                                         line=dict(color="#f58518")))
+            _style_chart_mobile(fig)
+            fig.update_layout(
+                barmode="group",
+                yaxis=dict(title="억원"),
+                yaxis2=dict(title="영업이익률(%)", overlaying="y", side="right", showgrid=False),
+                legend=dict(title=dict(text="")),
+            )
+            st.plotly_chart(fig, width="stretch", key="chart_fin_annual",
+                            config=PLOTLY_CONFIG)
+
+    if not quarter.empty:
+        st.markdown("**분기 (IFRS 연결)**")
+        st.table(_fin_style(quarter), width="stretch")
+
+    st.divider()
+    _subheader_with_help(
+        "밸류에이션과 시장 평가",
+        "왼쪽은 증권사 컨센서스 목표주가가 어떻게 움직여왔는지, 오른쪽은 차입공매도 비중입니다. "
+        "둘 다 FnGuide 주간 데이터라 최근 1년치만 있습니다.\n\n"
+        "목표주가는 **수준보다 방향**이 중요합니다. 올라가는 중이면 실적 기대가 상향되고 있다는 뜻입니다.\n\n"
+        "차입공매도 비중은 전체 거래에서 공매도가 차지하는 비율입니다. 높다고 곧 하락은 아니고, "
+        "되레 숏커버링이 나오면 상승 재료가 되기도 합니다.",
+        key="valuation",
+    )
+    vcol1, vcol2 = st.columns(2)
+    try:
+        tp = fetch_target_price_history(TICKER)
+        with vcol1:
+            if tp.empty:
+                st.caption("목표주가 추이를 가져오지 못했습니다.")
+            else:
+                fig_t = go.Figure()
+                fig_t.add_trace(go.Scatter(x=tp["일자"], y=tp["목표주가"], name="목표주가",
+                                           mode="lines", line=dict(color="#4c78a8")))
+                fig_t.add_trace(go.Scatter(x=tp["일자"], y=tp["주가"], name="주가",
+                                           mode="lines", line=dict(color="#888", dash="dot")))
+                _style_chart_mobile(fig_t)
+                fig_t.update_layout(yaxis=dict(title="원"), legend=dict(title=dict(text="")))
+                st.plotly_chart(fig_t, width="stretch", key="chart_target_price",
+                                config=PLOTLY_CONFIG)
+                first, last = tp.iloc[0], tp.iloc[-1]
+                st.caption(f"{first['일자']:%Y-%m-%d} {first['목표주가']:,.0f}원 → "
+                           f"{last['일자']:%Y-%m-%d} {last['목표주가']:,.0f}원 "
+                           f"({last['목표주가'] / first['목표주가'] - 1:+.1%})")
+    except Exception as e:
+        vcol1.caption(f"목표주가 추이 실패: {type(e).__name__}")
+
+    try:
+        sb = fetch_short_balance(TICKER)
+        with vcol2:
+            if sb.empty:
+                st.caption("차입공매도 비중을 가져오지 못했습니다.")
+            else:
+                fig_s = go.Figure()
+                fig_s.add_trace(go.Scatter(x=sb["일자"], y=sb["차입공매도비중"],
+                                           name="차입공매도비중(%)", mode="lines",
+                                           line=dict(color="#e45756")))
+                fig_s.add_trace(go.Scatter(x=sb["일자"], y=sb["수정주가"], name="주가",
+                                           mode="lines", yaxis="y2",
+                                           line=dict(color="#888", dash="dot")))
+                _style_chart_mobile(fig_s)
+                fig_s.update_layout(
+                    yaxis=dict(title="공매도 비중(%)"),
+                    yaxis2=dict(title="주가", overlaying="y", side="right", showgrid=False),
+                    legend=dict(title=dict(text="")),
+                )
+                st.plotly_chart(fig_s, width="stretch", key="chart_short_balance",
+                                config=PLOTLY_CONFIG)
+                st.caption(f"최근 {sb.iloc[-1]['일자']:%Y-%m-%d} 기준 "
+                           f"{sb.iloc[-1]['차입공매도비중']:.2f}% · "
+                           f"1년 평균 {sb['차입공매도비중'].mean():.2f}%")
+    except Exception as e:
+        vcol2.caption(f"차입공매도 비중 실패: {type(e).__name__}")
+
+
+# ── 애널리스트 리포트 ──────────────────────────────────────────────────────────
+# 목록 조회·지문·요약 생성은 analyst_digest.py에 있다. 수집기(collector.py)가 아침에
+# 같은 코드로 갱신하기 때문에, 여기서 따로 구현하면 두 곳이 어긋난다.
+
+
+def _render_broker_targets():
+    """증권사별 목표주가와, 그걸로 직접 계산한 컨센서스.
+
+    FnGuide 컨센서스는 주 1회만 갱신돼서 목표주가 변경을 며칠 늦게 반영한다.
+    같은 방식(최근 3개월·증권사별 최신 1건)으로 직접 세면 실측 오차 0.3%였고,
+    새 리포트가 올라온 당일에 바로 반영된다.
+    """
+    _subheader_with_help(
+        "증권사별 목표주가",
+        "각 리포트 상세 페이지에서 목표주가·투자의견 숫자만 뽑아 모은 것입니다. "
+        "AI가 개입하지 않은 원자료라 숫자를 그대로 믿어도 됩니다.\n\n"
+        "**컨센서스 계산 방식** — 기간 안에서 증권사별로 가장 최근 리포트 한 건씩만 씁니다. "
+        "리포트를 자주 내는 증권사가 평균을 좌우하지 않게 하려는 것입니다.\n\n"
+        "한 곳이 크게 다른 값을 내면 평균이 끌려가므로 중앙값도 같이 봅니다. "
+        "네이버에 리포트를 싣지 않는 증권사(예: LS증권)는 여기 잡히지 않습니다.",
+        key="broker_targets",
+    )
+    months = st.slider("집계 기간 (개월)", min_value=1, max_value=12,
+                       value=analyst_targets.CONSENSUS_MONTHS, key="target_months",
+                       help="짧게 잡으면 최신 시각만, 길게 잡으면 표본이 늘지만 과거 목표가가 섞입니다.")
+    try:
+        best = analyst_targets.latest_by_broker(months=months)
+        con = analyst_targets.consensus(months=months)
+    except Exception as e:
+        st.warning(f"목표주가 집계를 읽지 못했습니다: {e}")
+        return
+    if not con:
+        st.info("아직 모인 목표주가가 없습니다. 수집기가 채우면 표시됩니다.")
+        return
+
+    cur = _to_number(st.session_state.get("current_price_value"))
+    row = st.container(key="price_row_broker_target")
+    c1, c2, c3, c4 = row.columns(4)
+    with c1.container(key="metric_small_bt_mean"):
+        _metric_with_help(
+            "직접 집계 (네이버 게재분)", f"{con['평균']:,}원",
+            f"최근 {months}개월 안에 목표주가를 낸 {con['기관수']}곳의 평균입니다. "
+            f"가장 최근 리포트는 {con['최신일']}자입니다.\n\n"
+            "AI 분석 탭의 '컨센서스 목표주가(FnGuide)'와 값이 다른 것이 정상입니다. "
+            "FnGuide는 네이버에 리포트를 싣지 않는 증권사까지 포함하고, 이 값은 "
+            "아래 표에서 증권사별 내역을 직접 확인할 수 있는 대신 네이버 게재분만 셉니다. "
+            "아래 캡션에 두 값의 차이를 적어 둡니다.",
+            key="bt_mean",
+            delta=(f"{(con['평균'] / cur - 1) * 100:+.0f}% 여력" if cur else None),
+            delta_color="normal",
+        )
+    with c2.container(key="metric_small_bt_median"):
+        _metric_with_help(
+            "중앙값", f"{con['중앙값']:,}원",
+            "가운데 값입니다. 평균과 크게 벌어져 있으면 한쪽에 치우친 목표가가 섞여 있다는 뜻입니다.",
+            key="bt_median",
+        )
+    with c3.container(key="metric_small_bt_range"):
+        _metric_with_help(
+            "최고 / 최저", f"{con['최고'] / 10000:,.0f} / {con['최저'] / 10000:,.0f}만원",
+            "증권가 시각이 얼마나 갈리는지 보여줍니다. 폭이 넓을수록 전망이 엇갈린다는 뜻입니다.",
+            key="bt_range",
+        )
+    with c4.container(key="metric_small_bt_count"):
+        _metric_with_help(
+            "집계 기관 수", f"{con['기관수']}곳",
+            "이 기간에 목표주가를 제시한 증권사 수입니다. 적을수록 평균이 흔들립니다.",
+            key="bt_count",
+        )
+
+    rows = []
+    for brk, r in sorted(best.items(), key=lambda x: -x[1]["목표주가"]):
+        rows.append({
+            "증권사": brk,
+            "목표주가": r["목표주가"],
+            # 백분율로 미리 바꿔 넣는다. "percent" 프리셋은 소수점 두 자리가 붙어(138.95%)
+            # 목표가처럼 큰 수에서는 자릿수만 늘린다.
+            "상승여력": (r["목표주가"] / cur - 1) * 100 if cur else None,
+            "투자의견": r.get("투자의견") or "-",
+            "작성일": r.get("작성일"),
+            "제목": r.get("제목"),
+        })
+    st.dataframe(
+        pd.DataFrame(rows), width="stretch", hide_index=True,
+        column_config={
+            # printf의 "%,d"는 없는 서식이고, 비율을 "%.0f%%"로 주면 0.15가 "0%"로 찍힌다.
+            # 스트림릿 프리셋을 쓴다("percent"가 100을 곱해준다).
+            "목표주가": st.column_config.NumberColumn("목표주가(원)", format="localized"),
+            "상승여력": st.column_config.NumberColumn("상승여력", format="%+.0f%%"),
+        },
+    )
+
+    # AI 분석 탭에 뜨는 FnGuide 값과 나란히 보여준다. 두 탭에 같은 이름의 다른 숫자가
+    # 떠 있으면 어느 쪽이 맞는지 알 수 없어서, 차이와 그 이유를 여기서 못박는다.
+    # 차이의 주된 원인은 갱신 시차가 아니라 모집단이다. 우리는 네이버 게재분만 세고,
+    # FnGuide는 LS증권처럼 네이버에 안 실리는 곳까지 넣는다. 실측 차이는 1~2% 안쪽이었다.
+    try:
+        snap_fn = fetch_stock_snapshot(TICKER) or {}
+        fn = _to_number(snap_fn.get("목표주가"))
+    except Exception:
+        snap_fn, fn = {}, None         # 비교용일 뿐이라 못 받아도 표는 그대로 보여준다
+    if fn:
+        gap = con["평균"] / fn - 1
+        st.caption(
+            f"AI 분석 탭의 **컨센서스 목표주가(FnGuide)** {fn:,.0f}원"
+            f"(기준일 {snap_fn.get('컨센서스일자') or '-'}) 대비 {gap * 100:+.1f}%. "
+            "두 값이 다른 건 어느 한쪽이 틀려서가 아니라 세는 대상이 달라서입니다 — "
+            "FnGuide는 네이버에 리포트를 싣지 않는 증권사까지 넣고, 위 표는 네이버 게재분만 "
+            "대신 증권사별로 내역을 보여줍니다."
+            + (" 차이가 큰 편이니 위 표의 작성일을 함께 보세요." if abs(gap) >= 0.05 else ""))
+
+
+def _render_tab_disclosure():
+    _subheader_with_help(
+        "공시",
+        "거래소·금감원에 접수된 전자공시입니다(네이버가 중계하는 KOSCOM 자료). "
+        "뉴스보다 빠르고 숫자가 확정적이라, 주가를 움직인 원인이 여기 한 줄인 경우가 많습니다.\n\n"
+        "맨 위 요약은 최근 공시 15건을 AI가 읽고 정리한 것으로, 그중 10건은 **본문까지** "
+        "읽혀 금액·주식수·기간 같은 숫자가 들어갑니다.\n\n"
+        "요약은 **새 공시가 떴을 때만** 다시 만듭니다(무료 AI 한도가 하루 20회라 매번 만들지 않습니다). "
+        "아래 표에서 각 공시를 펼치면 본문 원문을 그대로 볼 수 있습니다.\n\n"
+        "'주식선물·주식옵션 가격제한폭 확대요건 도달'처럼 거래소가 기계적으로 내는 공시도 "
+        "섞여 있습니다. 회사의 의사결정이 아닙니다.",
+        key="disclosure",
+    )
+    try:
+        df = disclosure.fetch_list(TICKER)
+    except Exception as e:
+        st.error(f"공시 목록을 가져오지 못했습니다: {e}")
+        return
+    if df.empty:
+        st.info("수집된 공시가 없습니다.")
+        return
+
+    saved = disclosure.load()
+    fp = disclosure.fingerprint(df)
+    new_items = bool(saved.get("fingerprint")) and saved["fingerprint"] != fp
+
+    col_a, col_b = st.columns([0.75, 0.25], vertical_alignment="center")
+    if saved.get("text"):
+        col_a.caption(
+            f"요약 기준: {saved.get('date', '-')} · 공시 {saved.get('count', '-')}건"
+            f"(본문 {saved.get('body_count', '-')}건)"
+            + (" · 새 공시가 있어 아직 반영 전입니다" if new_items else ""))
+    else:
+        col_a.caption("아직 요약이 없습니다. 수집기가 곧 만들거나, 지금 바로 만들 수 있습니다.")
+
+    # 생성은 수집기가 맡는다. 화면에서 자동으로 만들면 그동안 페이지가 통째로 멈춘다.
+    if col_b.button("요약 갱신", key="disc_refresh",
+                    help="새 공시가 없어도 강제로 다시 정리합니다. 20~60초 걸립니다."):
+        if not os.environ.get("GEMINI_API_KEY"):
+            st.info("요약을 만들려면 GEMINI_API_KEY 환경변수가 필요합니다.")
+        else:
+            with st.spinner("공시를 읽는 중..."):
+                try:
+                    saved, _ = disclosure.refresh(
+                        TICKER, f"{STOCK_NAME}({TICKER})", df=df, force=True)
+                except Exception as e:
+                    st.error(f"요약 생성에 실패했습니다: {e}")
+
+    if saved.get("text"):
+        st.markdown(_md_safe(saved["text"]))
+    elif not os.environ.get("GEMINI_API_KEY"):
+        st.info("요약을 보려면 GEMINI_API_KEY 환경변수를 설정해주세요.")
+
+    st.divider()
+    st.markdown(f"**공시 목록 ({len(df)}건)**")
+    st.dataframe(df[["일시", "제목", "출처"]], width="stretch", hide_index=True)
+
+    # 본문은 이미 받아 둔 것만 보여준다. 여기서 새로 받으면 탭을 열 때마다 수십 번
+    # 요청이 나간다(펼치지 않아도 expander 안은 매번 실행된다).
+    bodies = disclosure._load_bodies()
+    shown = [(r["일시"], r["제목"], bodies.get(str(r["공시ID"])))
+             for _, r in df.head(disclosure.BODY_COUNT).iterrows()]
+    shown = [x for x in shown if x[2]]
+    if shown:
+        st.markdown("**공시 본문 원문**")
+        for when, title, body in shown:
+            with st.expander(f"{when}  {title}"):
+                st.text(body)
+    else:
+        st.caption("본문은 요약을 한 번 만든 뒤에 여기 쌓입니다.")
+
+
+def _render_tab_analyst():
+    _subheader_with_help(
+        "애널리스트 리포트",
+        "네이버 금융이 모아주는 증권사 리포트 목록입니다. 맨 위 요약은 제목·증권사·날짜에 더해 "
+        "최근 몇 건은 **PDF 본문까지** 읽혀 정리한 것이라, 목표주가와 추정 실적 숫자가 들어갑니다.\n\n"
+        "그 아래 **증권사별 목표주가**는 리포트 상세 페이지에서 숫자만 따로 모아 누적한 것으로, "
+        "AI를 거치지 않은 원자료입니다. 컨센서스도 이 값으로 직접 계산합니다.\n\n"
+        "요약은 하루에 한 번, 그리고 **새 리포트가 올라왔을 때만** 다시 만듭니다. "
+        "무료 AI 호출 한도가 하루 20회라 매번 새로 만들지 않습니다.\n\n"
+        "리포트 제목은 홍보성으로 붙는 경우가 많아 단정적으로 읽지 마세요.",
+        key="analyst",
+    )
+    try:
+        df = fetch_analyst_reports(TICKER, count=40)
+    except Exception as e:
+        st.error(f"리포트 목록을 가져오지 못했습니다: {e}")
+        return
+    if df.empty:
+        st.info("수집된 리포트가 없습니다.")
+        return
+
+    fp = analyst_digest.fingerprint(df)
+    saved = analyst_digest.load()
+
+    # 새 리포트가 올라왔으면 알아서 다시 정리한다. 날짜만 바뀐 경우에는 다시 하지 않는다
+    # (내용이 그대로인데 매일 새로 부르면 하루 20회뿐인 무료 한도를 그냥 태운다).
+    # 평일 아침에는 수집기가 먼저 갱신해두므로, 보통 여기서는 파일을 읽기만 한다.
+    new_reports = bool(saved.get("fingerprint")) and saved["fingerprint"] != fp
+    first_time = not saved.get("text")
+
+    col_a, col_b = st.columns([0.75, 0.25], vertical_alignment="center")
+    if saved.get("text"):
+        col_a.caption(f"요약 기준: {saved.get('date', '-')} · 리포트 {saved.get('count', '-')}건"
+                      + (" · 새 리포트를 반영해 다시 정리했습니다" if new_reports else ""))
+    rerun = col_b.button("요약 갱신", key="analyst_refresh",
+                         help="내용이 그대로여도 강제로 다시 정리합니다.")
+
+    # 생성은 수집기가 아침에 맡는다. 화면에서 자동으로 만들면 그동안 페이지가 멈추고,
+    # 실패했을 때 리런마다 다시 시도해서 클릭할 때마다 화면이 굳는다.
+    if rerun and os.environ.get("GEMINI_API_KEY"):
+        with st.spinner("리포트를 읽는 중..."):
+            try:
+                saved, _ = analyst_digest.refresh(
+                    TICKER, f"{STOCK_NAME}({TICKER})", df=df, force=True)
+            except Exception as e:
+                st.error(f"요약 생성에 실패했습니다: {e}")
+
+    if saved.get("text"):
+        if saved.get("note"):
+            st.warning(saved["note"])
+        st.markdown(_md_safe(saved["text"]))
+    elif not os.environ.get("GEMINI_API_KEY"):
+        st.info("요약을 보려면 GEMINI_API_KEY 환경변수를 설정해주세요.")
+
+    st.divider()
+    _render_broker_targets()
+
+    st.divider()
+    st.markdown(f"**리포트 목록 ({len(df)}건)**")
+    show = df.copy()
+    if "url" in show.columns:
+        st.dataframe(
+            show, width="stretch", hide_index=True,
+            column_config={"url": st.column_config.LinkColumn("원문", display_text="PDF")},
+        )
+    else:
+        st.dataframe(show, width="stretch", hide_index=True)
+
+    if "증권사" in df.columns:
+        counts = df["증권사"].value_counts().head(8)
+        st.caption("리포트를 많이 낸 곳 — " + " · ".join(f"{k} {v}건" for k, v in counts.items()))
+
 
 def _render_tab_community():
     global community_summary
@@ -4903,7 +6413,7 @@ def _render_tab_community():
                     color_discrete_map={"긍정": _UP_COLOR, "부정": _DOWN_COLOR, "중립": "#7f7f7f"},
                 )
                 _style_chart_mobile(fig_sentiment)
-                st.plotly_chart(fig_sentiment, width="stretch", key="chart_sentiment", config={"displayModeBar": False})
+                st.plotly_chart(fig_sentiment, width="stretch", key="chart_sentiment", config=PLOTLY_CONFIG)
             else:
                 st.caption(f"조회된 게시글이 전부 {sentiment_df['날짜'].iloc[0]} 하루에 몰려 있어 일자별 비교는 아직 어렵습니다 (조회 개수를 늘려보세요).")
 
@@ -4982,7 +6492,7 @@ def _render_tab_community():
                     picks = st.session_state["dc_curation_picks"]
                     if picks:
                         for i, pick in enumerate(picks, 1):
-                            st.markdown(f"{i}. [{pick['제목']}]({pick['url']}) — {pick['이유']}")
+                            st.markdown(_md_safe(f"{i}. [{pick['제목']}]({pick['url']}) — {pick['이유']}"))
                     else:
                         st.info(st.session_state.get("dc_curation_raw", "").strip() or "조건에 맞는 분석글을 찾지 못했습니다.")
     except Exception as e:
@@ -4991,24 +6501,9 @@ def _render_tab_community():
 def _render_tab_ai():
     _subheader_with_help(
         "AI 분석: 오늘의 주가 변동 요인",
-        "강세 근거와 약세 근거를 여섯 갈래로 나눠서, 각 갈래를 빠짐없이 훑도록 시킵니다.\n\n"
-        "① **전자공시**(제목만이 아니라 본문 요지까지) ② 뉴스(종목 + 업종·전방수요·매크로) "
-        "③ 애널리스트 리포트 ④ TrendForce 산업 리서치 + DRAM 현물가 "
-        "⑤ 거시경제 지표(SOX·나스닥·달러인덱스·환율·미국 10년물 금리)와 ADR 괴리율 "
-        "⑥ 대시보드 지표(수급·통합 신호·가격 과열도·선물 경보·컨센서스·동일업종 등락률)\n\n"
-        "여기에 **오늘 장중 흐름**(언제 급했는지)과 **정규장 밖 움직임**(프리장·애프터장)을 같이 넘겨서, "
-        "'오늘 이렇게 움직인 이유'를 시각 단위로 설명하게 합니다. 마감 직후 공시가 떠서 시간외에서 "
-        "방향이 바뀌는 날은 종가만 봐서는 알 수 없기 때문입니다.\n\n"
-        "각 근거에는 `[갈래] 내용 (근거 숫자)` 형태로 출처를 달게 하고, 매크로 숫자는 이 종목까지 "
-        "어떻게 연결되는지 설명하게 합니다. 마지막에 어느 쪽 근거가 더 무거운지도 짚습니다.\n\n"
-        "**커뮤니티 대세 반응**도 따로 정리합니다. 비율만 넘기면 '의견이 갈린다'는 뻔한 답이 나와서, "
-        "네이버 종목토론방·디시 갤러리 게시글 **제목 원문**을 그대로 읽혀서 무엇을 기대하고 무엇을 "
-        "걱정하는지 짚게 했습니다. 반어법이 많은 곳이라 문맥으로 읽으라고 지시해뒀고, "
-        "여론이 데이터와 어긋나면 그 점도 지적하게 합니다. 커뮤니티 탭을 꺼놔도 들어갑니다.\n\n"
-        "동일업종 비교가 들어가면서 '오늘 움직임이 이 종목만의 이슈인지, 업종 전체가 같이 움직인 것인지'를 "
-        "구분할 수 있게 됐습니다. 위쪽 지표는 AI를 돌리지 않아도 바로 보입니다.\n\n"
-        "버튼을 누를 때만 실행됩니다(자동 갱신 없음). AI가 잘못 짚거나 지어낼 수 있으니, "
-        "투자 조언이 아닌 참고용 정리로만 보세요. 컨센서스 목표주가는 증권사 기대치일 뿐 보장이 아닙니다.",
+        "공시·뉴스·리포트·DRAM·매크로·대시보드 지표에 장중 흐름과 시간외까지 넘겨서, "
+        "강세/약세 근거를 갈래별로 정리하게 합니다. 커뮤니티 여론도 따로 짚습니다.\n\n"
+        "버튼을 눌러야 실행됩니다. AI가 지어낼 수 있으니 참고용으로만 보세요.",
         key="ai",
     )
 
@@ -5020,15 +6515,37 @@ def _render_tab_ai():
         snapshot = None
 
     if snapshot:
+        # 목표주가 추이는 아무도 안 주므로 직접 쌓는다. 같은 날 두 번은 안 쓴다.
+        record_consensus_snapshot(TICKER, snapshot)
         target = _to_number(snapshot.get("목표주가"))
         cur = _to_number(st.session_state.get("current_price_value"))
-        col1, col2, col3, col4 = st.columns(4)
+        # price_row_ 접두어를 붙여야 좁은 화면에서 2열로 접힌다.
+        # 안 붙이면 지표 넷이 세로로 쌓여 모바일에서 화면 한 판을 다 먹는다.
+        snapshot_row = st.container(key="price_row_ai_snapshot")
+        col1, col2, col3, col4 = snapshot_row.columns(4)
         with col1.container(key="metric_small_ai_target"):
             upside = f"{(target / cur - 1) * 100:+.0f}% 여력" if (target and cur) else None
+            # 애널리스트 탭에는 우리가 직접 센 컨센서스가 따로 있다. 모집단이 달라서
+            # 값이 조금 다른데(FnGuide는 네이버 미게재 증권사까지 포함), 두 탭에 같은
+            # 이름의 다른 숫자가 떠 있으면 어느 쪽이 맞는지 알 수 없다. 출처를 이름에 박고
+            # 도움말에서 다른 쪽 값을 함께 보여준다.
+            try:
+                _own = analyst_targets.consensus()
+            except Exception:
+                _own = {}
+            _cmp = ""
+            if _own and target:
+                _gap = _own["평균"] / target - 1
+                _cmp = (f"\n\n애널리스트 탭의 **직접 집계**는 {_own['평균']:,}원입니다"
+                        f"(네이버 게재 {_own['기관수']}곳, 최신 {_own['최신일']}). "
+                        f"이 값과 {_gap * 100:+.1f}% 차이인데, 둘 중 하나가 틀린 게 아니라 "
+                        "모집단이 다릅니다 — FnGuide는 네이버에 리포트를 싣지 않는 증권사까지 "
+                        "포함하고, 직접 집계는 증권사별 내역을 눈으로 확인할 수 있습니다.")
             _metric_with_help(
-                "컨센서스 목표주가", f"{target:,.0f}원" if target else "N/A",
+                "컨센서스 목표주가 (FnGuide)", f"{target:,.0f}원" if target else "N/A",
                 f"증권사 평균 목표주가 (기준일 {snapshot.get('컨센서스일자') or '-'}). "
-                "기대치일 뿐 보장이 아닙니다.",
+                "네이버·FnGuide가 제공하는 값으로 주 1회 갱신됩니다. 기대치일 뿐 보장이 아닙니다."
+                + _cmp,
                 key="ai_target", delta=upside, delta_color="normal",
             )
         with col2.container(key="metric_small_ai_recomm"):
@@ -5043,7 +6560,12 @@ def _render_tab_ai():
                 f"EPS {snapshot.get('EPS') or '-'}", key="ai_per",
             )
         with col4.container(key="metric_small_ai_52w"):
-            st.metric("52주 고/저", f"{snapshot.get('52주최고') or '-'} / {snapshot.get('52주최저') or '-'}")
+            # 고가와 저가를 "1,758,000 / 890,000"처럼 한 줄에 붙이면 좁은 화면에서 잘린다.
+            # 고가를 값으로, 저가를 아래 줄로 내려 두 줄에 나눠 담는다.
+            st.metric(
+                "52주 최고", f"{snapshot.get('52주최고') or '-'}",
+                delta=f"최저 {snapshot.get('52주최저') or '-'}", delta_color="off",
+            )
 
         peers = snapshot.get("동일업종") or []
         if peers:
@@ -5065,199 +6587,294 @@ def _render_tab_ai():
                 st.markdown(
                     "종목명으로만 뉴스를 모으면 '올랐다/내렸다'는 시황 기사만 쌓여서 원인을 못 짚습니다.\n\n"
                     "이 옵션을 켜면 HBM·메모리 업황·D램 가격·엔비디아·반도체 수출로도 각각 검색해서, "
-                    "주가가 왜 움직였는지에 해당하는 재료를 같이 넘깁니다. 수집에 몇 초 더 걸립니다."
+                    "주가가 왜 움직였는지에 해당하는 재료를 같이 넘깁니다. 수집에 몇 초 더 걸립니다.\n\n"
+                    "'투자의견' 검색도 함께 돕니다. 아래 리포트 목록은 네이버가 싣는 13개 증권사뿐이라, "
+                    "그 밖의 증권사가 목표주가를 바꾼 건은 이 기사로만 잡힙니다."
                 )
-        if st.button("지금 바로 분석하기"):
+        # 꺼진 탭의 항목은 계산 자체가 안 돌아서 AI가 못 본다. 조용히 빠지면
+        # "왜 이건 분석에 안 나오지?" 하게 되므로 미리 알려주고 켜는 법도 적어 둔다.
+        _missing = missing_tab_summaries()
+        if _missing:
+            st.caption(
+                f"참고 — {' · '.join(_missing)}은(는) 해당 탭이 꺼져 있어 이번 분석에서 빠집니다. "
+                "왼쪽 사이드바 '표시할 탭 선택'에서 켜면 다음 분석부터 반영됩니다."
+            )
+
+        _render_saved_ai_analysis()
+
+
+def _build_and_save_ai_analysis(use_search: bool = True, stream_to=None) -> bool:
+    """분석을 만들어 파일에 저장한다. 화면은 이 파일을 읽기만 한다.
+
+    자동 새로고침 시각과 '지표 새로고침' 버튼이 이 함수를 부른다. 예전처럼 화면에서
+    직접 만들지 않는 이유는 ai_analysis.py 주석에 적어 뒀다(매번 30~100초를 기다려야 했다).
+    반환값은 성공 여부.
+    """
+    if not os.environ.get("GEMINI_API_KEY"):
+        return False
+    snapshot = None
+    try:
+        snapshot = fetch_stock_snapshot(TICKER)
+    except Exception:
+        snapshot = {}
+    investor_df = pd.DataFrame()
+    try:
+        investor_df = fetch_investor_netbuy(TICKER, DEFAULT_LOOKBACK_DAYS)
+    except Exception:
+        pass
+    try:
+        price_summary = st.session_state.get("current_price_summary") or _price_summary_fallback()
+
+        # 바깥에서 받아오는 재료는 전부 서로 무관하다. 하나씩 순서대로 받으면
+        # 왕복 지연이 그대로 쌓인다(실측 순차 3.9초 + 병렬 3.7초 = 합계 7.6초).
+        # 한 번에 몰아서 받으면 가장 느린 하나(커뮤니티·조기신호)만큼만 걸린다.
+        def _quiet(fn):
             try:
-                price_summary = st.session_state.get("current_price_summary", "현재가 데이터를 가져오지 못함")
+                return fn()
+            except Exception:
+                return ""
 
-                if not investor_df.empty:
-                    recent = investor_df.tail(5)
-                    # 순매수 열만 돈다. 같은 표에 거래량·종가가 붙어 있어서 전체 열을 돌면
-                    # '거래량 순매수 합계' 같은 말이 안 되는 줄이 생긴다.
-                    lines = [
-                        f"- 최근 {len(recent)}거래일 {col} 순매수 합계: {recent[col].sum():+,.0f}주"
-                        for col in INVESTOR_COLUMNS if col in recent.columns
-                    ]
-                    # 거래량은 수급보다 먼저 확정되므로 빠른 경로를 우선 쓴다
-                    try:
-                        _ohlcv = fetch_daily_ohlcv(TICKER, DEFAULT_LOOKBACK_DAYS)
-                    except Exception:
-                        _ohlcv = pd.DataFrame()
-                    _vol_src = _ohlcv if not _ohlcv.empty else investor_df
-                    if "거래량" in _vol_src.columns and _vol_src["거래량"].notna().any():
-                        vols = _vol_src["거래량"].astype(float)
-                        lines.append(
-                            f"- 절대 거래량: 최근 {vols.iloc[-1]:,.0f}주, "
-                            f"기간 평균 {vols.mean():,.0f}주 대비 {vols.iloc[-1] / vols.mean() - 1:+.0%} "
-                            f"(기간 최대 {vols.max():,.0f}주)"
-                        )
-                    supply_summary = "\n".join(lines)
-                else:
-                    supply_summary = "수급 데이터를 가져오지 못함"
+        cur_close = _to_number(st.session_state.get("current_price_value"))
+        cur_close = int(cur_close) if cur_close else None
+        _snap = snapshot or {}
+        _fetch_jobs = (
+            lambda: fetch_news_with_summary(STOCK_NAME),
+            lambda: fetch_analyst_reports(TICKER),
+            lambda: fetch_trendforce_news(),
+            lambda: fetch_macro_summary(),
+            lambda: (fetch_sector_news(STOCK_NAME) if use_search else ""),
+            # 본문은 '오늘 것'만 받는다. 그 앞의 공시는 disclosure.py가 15건을
+            # 본문까지 읽어 정리해 두므로(아래 disclosure_view_md), 3일치 본문을
+            # 여기서 또 넣으면 같은 내용이 프롬프트에 두 번 들어간다.
+            lambda: fetch_disclosures(TICKER, count=10, body_days=1),
+            lambda: build_intraday_summary(TICKER, cur_close),
+            lambda: build_over_market_summary(TICKER, cur_close),
+            lambda: build_market_flow_summary(),
+            lambda: build_community_summary(TICKER, STOCK_NAME),
+            lambda: fetch_daily_ohlcv(TICKER, DEFAULT_LOOKBACK_DAYS),
+            lambda: build_capex_summary(),
+            lambda: build_early_signal_summary(TICKER),
+            lambda: build_recent_price_summary(TICKER),
+            lambda: fetch_earnings_calendar(),
+            lambda: build_consensus_trend_summary(TICKER, _snap),
+            lambda: build_market_state_summary(),
+            lambda: build_short_sale_summary(TICKER),
+            lambda: build_foreign_desk_summary(TICKER),
+            # 리포트 본문을 원문 그대로 넣으면 12,000자가 붙어 프롬프트가 두 배가 된다.
+            # 이미 본문을 읽고 정리해 둔 요약(약 1,500자)을 대신 넘긴다.
+            lambda: _dated_digest(analyst_digest.load()),
+            # 증권사별 목표주가는 파일에서 읽기만 한다(수집기가 채운다). 비용 없음.
+            lambda: analyst_targets.summary_md(),
+            # 공시 요약도 파일에서 읽기만 한다. 수집기가 새 공시가 뜰 때만 만든다.
+            lambda: _dated_digest(disclosure.load()),
+            # 재무 요약은 여태 재무 탭에서만 쓰고 AI 분석에는 안 넣고 있었다.
+            # 매출·영업이익 추이와 추정치는 분석의 바탕이라 같이 넘긴다.
+            lambda: _dated_digest(financial_digest.load()),
+        )
+        with _streamlit_pool(len(_fetch_jobs)) as _pool:
+            (news_items, reports_df, trendforce_df, macro_md, sector_news_md,
+             disclosure_md, intraday_md, over_market_md, market_flow_md,
+             community_md, _ohlcv, capex_md, early_signal_md, recent_price_md,
+             earnings_md, consensus_md, market_state_md, short_sale_md,
+             foreign_desk_md, analyst_view_md, broker_targets_md,
+             disclosure_view_md, financial_view_md) = list(_pool.map(_quiet, _fetch_jobs))
 
-                news_items = fetch_news_with_summary(STOCK_NAME)
-                headlines = [n["제목"] for n in news_items]
-                news_md = "\n".join(
-                    f"- {n['제목']}" + (f"\n  요약: {n['요약']}" if n["요약"] else "") for n in news_items
+        # 실패한 자리에는 _quiet가 ""를 넣는다. 표를 기대하는 쪽은 빈 표로 되돌린다.
+        news_items = news_items or []
+        if not isinstance(reports_df, pd.DataFrame):
+            reports_df = pd.DataFrame()
+        if not isinstance(trendforce_df, pd.DataFrame):
+            trendforce_df = pd.DataFrame()
+        if not isinstance(_ohlcv, pd.DataFrame):
+            _ohlcv = pd.DataFrame()
+
+        if not investor_df.empty:
+            recent = investor_df.tail(5)
+            # 어느 날짜까지의 확정치인지 밝힌다. 안 밝히면 장중에 AI가
+            # 전 거래일 수급을 '오늘 외국인이 샀다'로 옮겨 적는다.
+            _span = ""
+            try:
+                _span = (f" (확정 구간 {recent.index.min():%Y-%m-%d}"
+                         f"~{recent.index.max():%Y-%m-%d})")
+            except Exception:
+                pass
+            # 순매수 열만 돈다. 같은 표에 거래량·종가가 붙어 있어서 전체 열을 돌면
+            # '거래량 순매수 합계' 같은 말이 안 되는 줄이 생긴다.
+            lines = [
+                f"- 최근 {len(recent)}거래일 {col} 순매수 합계: {recent[col].sum():+,.0f}주{_span}"
+                for col in INVESTOR_COLUMNS if col in recent.columns
+            ]
+            # 거래량은 수급보다 먼저 확정된다. _ohlcv는 위 병렬 배치에서 이미 받아둔 값이다.
+            _vol_src = _ohlcv if not _ohlcv.empty else investor_df
+            if "거래량" in _vol_src.columns and _vol_src["거래량"].notna().any():
+                vols = _vol_src["거래량"].astype(float)
+                lines.append(
+                    f"- 절대 거래량: 최근 {vols.iloc[-1]:,.0f}주, "
+                    f"기간 평균 {vols.mean():,.0f}주 대비 {vols.iloc[-1] / vols.mean() - 1:+.0%} "
+                    f"(기간 최대 {vols.max():,.0f}주)"
                 )
-
-                snap = snapshot or {}
-                snapshot_lines = [
-                    f"- 컨센서스 목표주가: {snap.get('목표주가') or 'N/A'}원 "
-                    f"(투자의견 평균 {snap.get('투자의견') or 'N/A'}/5, 기준일 {snap.get('컨센서스일자') or '-'})",
-                    f"- PER {snap.get('PER') or 'N/A'} · EPS {snap.get('EPS') or 'N/A'}",
-                    f"- 52주 최고 {snap.get('52주최고') or 'N/A'} / 최저 {snap.get('52주최저') or 'N/A'}",
-                    f"- 시가총액 {snap.get('시가총액') or 'N/A'} · 외국인소진율 {snap.get('외국인소진율') or 'N/A'}",
-                ]
-                if snap.get("동일업종"):
-                    snapshot_lines.append("- 동일업종 오늘 등락률: " + ", ".join(
-                        f"{p['종목']} {p['등락률']}%" for p in snap["동일업종"][:6] if p.get("등락률")
-                    ))
-                if snap.get("수급추이"):
-                    snapshot_lines.append("- 최근 투자자별 순매수(주) / 외국인 보유율:")
-                    for f in snap["수급추이"][:5]:
-                        snapshot_lines.append(
-                            f"    {f['날짜']} 종가 {f['종가']} | 개인 {f['개인']} · 외국인 {f['외국인']} · 기관 {f['기관']}"
-                            f" | 외국인보유율 {f['외국인보유율']}"
-                        )
-                snapshot_md = "\n".join(snapshot_lines)
-
-                reports_df = fetch_analyst_reports(TICKER)
-                reports_md = "\n".join(
-                    f"- [{row['증권사']}] {row['제목']} ({row['작성일']})" for _, row in reports_df.iterrows()
-                )
-                trendforce_df = fetch_trendforce_news()
-                trendforce_md = "\n".join(
-                    f"- {row['제목']} ({row['날짜']})" for _, row in trendforce_df.iterrows()
-                )
-
-                # 매크로와 업종 뉴스는 '왜 움직였나'를 짚는 데 필요한 재료라, 실패해도 분석은 계속한다
-                try:
-                    macro_md = fetch_macro_summary()
-                except Exception:
-                    macro_md = ""
-                sector_news_md = fetch_sector_news(STOCK_NAME) if use_search else ""
-
-                # 공시 · 장중 흐름 · 시간외. 종가 한 줄로는 안 보이는 것들이라 개별로 실패를 감싼다.
-                try:
-                    disclosure_md = fetch_disclosures(TICKER)
-                except Exception:
-                    disclosure_md = ""
-                cur_close = _to_number(st.session_state.get("current_price_value"))
-                cur_close = int(cur_close) if cur_close else None
-                try:
-                    intraday_md = build_intraday_summary(TICKER, cur_close)
-                except Exception:
-                    intraday_md = ""
-                try:
-                    over_market_md = build_over_market_summary(TICKER, cur_close)
-                except Exception:
-                    over_market_md = ""
-                try:
-                    market_flow_md = build_market_flow_summary()
-                except Exception:
-                    market_flow_md = ""
-                # 커뮤니티 탭은 기본으로 꺼져 있어서 탭이 채워주는 전역값에 기댈 수 없다.
-                # 여기서 직접 모아 제목 원문까지 넘긴다.
-                try:
-                    community_md = build_community_summary(TICKER, STOCK_NAME)
-                except Exception:
-                    community_md = ""
-
-                adr_md = ""
-                if TICKER == ADR_HOST_TICKER:
-                    try:
-                        adr_q, adr_base = fetch_adr_quote(), fetch_adr_baseline()
-                        cur_price = _to_number(st.session_state.get("current_price_value"))
-                        if adr_q and cur_price:
-                            per_share = adr_q["price"] * adr_q["fx"] / ADR_SHARE_RATIO
-                            gap = (per_share / cur_price - 1) * 100
-                            adr_md = (
-                                f"- 나스닥 SKHY ${adr_q['price']:,.2f} ({adr_q['session']}), "
-                                f"본주 환산 {per_share:,.0f}원 → 괴리율 {gap:+.1f}%"
-                            )
-                            if adr_base:
-                                base_gap = (adr_base / ADR_SHARE_RATIO - 1) * 100
-                                adr_md += (
-                                    f"\n- 최근 20일 평균 괴리율 {base_gap:+.1f}% 대비 {gap - base_gap:+.1f}%p."
-                                    " 이 종목은 평소에도 30–40% 프리미엄이 붙으므로 절대값이 아니라"
-                                    " 평균 대비 벌어진 정도로 읽어야 한다."
-                                )
-                    except Exception:
-                        adr_md = ""
-
-                time_label = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-                analysis, search_note = generate_ai_analysis(
-                    f"{STOCK_NAME}({TICKER})",
-                    time_label, price_summary, supply_summary, headlines, reports_md,
-                    dram_summary, community_md, composite_summary, overheat_summary, futures_summary,
-                    trendforce_md, snapshot_md, news_md, use_search,
-                    macro_md, sector_news_md, adr_md,
-                    disclosure_md, over_market_md, intraday_md, market_flow_md,
-                )
-
-                st.session_state["ai_search_note"] = search_note
-                st.session_state["ai_analysis"] = analysis
-                st.session_state["ai_analysis_time"] = time_label
-                st.session_state["ai_analysis_headlines"] = headlines
-                st.session_state["ai_analysis_reports"] = reports_df
-                st.session_state["ai_analysis_trendforce"] = trendforce_df
-                st.session_state["ai_analysis_macro"] = macro_md
-                st.session_state["ai_analysis_sector_news"] = sector_news_md
-                st.session_state["ai_analysis_adr"] = adr_md
-                st.session_state["ai_analysis_disclosure"] = disclosure_md
-                st.session_state["ai_analysis_over_market"] = over_market_md
-                st.session_state["ai_analysis_intraday"] = intraday_md
-                st.session_state["ai_analysis_market_flow"] = market_flow_md
-                st.session_state["ai_analysis_community"] = community_md
-            except Exception as e:
-                st.error(f"AI 분석 생성에 실패했습니다: {e}")
-
-        if "ai_analysis" in st.session_state:
-            st.caption(f"기준 시각: {st.session_state['ai_analysis_time']}")
-            note = st.session_state.get("ai_search_note")
-            if note == "search_ok":
-                st.success("구글 검색으로 최신 정보를 보강해 분석했습니다.")
-            elif note:
-                st.warning(note)
-            st.markdown(st.session_state["ai_analysis"])
-
-            with st.expander("분석에 사용된 원본 데이터 보기"):
-                for label, key in (("오늘 장중 흐름", "ai_analysis_intraday"),
-                                   ("정규장 밖 움직임 (프리장·애프터장)", "ai_analysis_over_market"),
-                                   ("코스피 시장 전체 수급", "ai_analysis_market_flow"),
-                                   ("커뮤니티 게시글", "ai_analysis_community"),
-                                   ("전자공시", "ai_analysis_disclosure")):
-                    value = st.session_state.get(key)
-                    if value:
-                        st.write(f"**{label}**")
-                        st.text(value)
-                st.write("**뉴스 헤드라인**")
-                st.write(st.session_state["ai_analysis_headlines"])
-                sector_news = st.session_state.get("ai_analysis_sector_news")
-                if sector_news:
-                    st.write("**업종 · 전방수요 · 매크로 뉴스**")
-                    st.text(sector_news)
-                st.write("**거시경제 지표**")
-                st.text(st.session_state.get("ai_analysis_macro") or "수집 실패")
-                adr_used = st.session_state.get("ai_analysis_adr")
-                if adr_used:
-                    st.write("**해외 상장분(ADR) 괴리율**")
-                    st.text(adr_used)
-                st.write("**애널리스트 리포트**")
-                st.table(st.session_state["ai_analysis_reports"], width="stretch", hide_index=True)
-                st.write("**해외 반도체 산업 리서치 뉴스 (TrendForce)**")
-                trendforce_hist_df = st.session_state.get("ai_analysis_trendforce", pd.DataFrame())
-                if trendforce_hist_df.empty:
-                    st.caption("수집된 자료 없음")
-                else:
-                    st.dataframe(
-                        trendforce_hist_df, width="stretch", hide_index=True,
-                        column_config={"url": st.column_config.LinkColumn("링크")},
-                    )
+            supply_summary = "\n".join(lines)
         else:
-            st.info("버튼을 눌러 AI 분석을 생성해주세요.")
+            supply_summary = "수급 데이터를 가져오지 못함"
+
+        headlines = [n["제목"] for n in news_items]
+        news_md = "\n".join(
+            f"- {n['제목']}" + (f" [{n['시점']}]" if n.get("시점") else " [게재 시점 미확인]")
+            + (f"\n  요약: {n['요약']}" if n["요약"] else "") for n in news_items
+        )
+        reports_md = "\n".join(
+            f"- [{row['증권사']}] {row['제목']} ({row['작성일']})" for _, row in reports_df.iterrows()
+        )
+        trendforce_md = "\n".join(
+            f"- {row['제목']} ({row['날짜']})" for _, row in trendforce_df.iterrows()
+        )
+
+        snap = snapshot or {}
+        snapshot_lines = [
+            f"- 컨센서스 목표주가(FnGuide): {snap.get('목표주가') or 'N/A'}원 "
+            f"(투자의견 평균 {snap.get('투자의견') or 'N/A'}/5, 기준일 {snap.get('컨센서스일자') or '-'})",
+            # 후행 PER이다. 재무 탭의 예상 PER(2026E)과 값이 다른 게 정상이라 밝혀 둔다.
+            f"- PER {snap.get('PER') or 'N/A'} · EPS {snap.get('EPS') or 'N/A'} "
+            "(최근 실적 기준 후행값. 재무 탭의 추정 PER과는 다른 지표다)",
+            # 네이버가 주는 52주 고저는 장중 고가·저가 기준이라 종가 기록과 다를 수 있다.
+            f"- 52주 최고 {snap.get('52주최고') or 'N/A'} / 최저 {snap.get('52주최저') or 'N/A'} (장중가 기준)",
+            # 소진율(취득한도 대비)과 아래 수급표의 보유율(상장주식 대비)은 다른 값이다.
+            # 둘 다 프롬프트에 들어가는데 이름이 비슷해서, 안 밝히면 같은 지표가 어긋난 걸로 읽힌다.
+            f"- 시가총액 {snap.get('시가총액') or 'N/A'} · 외국인소진율 "
+            f"{snap.get('외국인소진율') or 'N/A'} (취득한도 대비. 아래 수급표의 '외국인보유율'은 "
+            "상장주식 대비라 값이 조금 다른 게 정상이다)",
+        ]
+        if snap.get("동일업종"):
+            snapshot_lines.append("- 동일업종 오늘 등락률: " + ", ".join(
+                f"{p['종목']} {p['등락률']}%" for p in snap["동일업종"][:6] if p.get("등락률")
+            ))
+        if snap.get("수급추이"):
+            snapshot_lines.append("- 최근 투자자별 순매수(주) / 외국인 보유율:")
+            for f in snap["수급추이"][:5]:
+                snapshot_lines.append(
+                    f"    {f['날짜']} 종가 {f['종가']} | 개인 {f['개인']} · 외국인 {f['외국인']} · 기관 {f['기관']}"
+                    f" | 외국인보유율 {f['외국인보유율']}"
+                )
+        snapshot_md = "\n".join(snapshot_lines)
+
+
+        adr_md = ""
+        if TICKER == ADR_HOST_TICKER:
+            try:
+                adr_q, adr_base = fetch_adr_quote(), fetch_adr_baseline()
+                cur_price = _to_number(st.session_state.get("current_price_value"))
+                if adr_q and cur_price:
+                    per_share = adr_q["price"] * adr_q["fx"] / ADR_SHARE_RATIO
+                    gap = (per_share / cur_price - 1) * 100
+                    adr_md = (
+                        f"- 나스닥 SKHY ${adr_q['price']:,.2f} ({adr_q['session']}), "
+                        f"본주 환산 {per_share:,.0f}원 → 괴리율 {gap:+.1f}%"
+                    )
+                    if adr_base:
+                        base_gap = (adr_base / ADR_SHARE_RATIO - 1) * 100
+                        adr_md += (
+                            f"\n- 최근 20일 평균 괴리율 {base_gap:+.1f}% 대비 {gap - base_gap:+.1f}%p."
+                            " 이 종목은 평소에도 30–40% 프리미엄이 붙으므로 절대값이 아니라"
+                            " 평균 대비 벌어진 정도로 읽어야 한다."
+                        )
+            except Exception:
+                adr_md = ""
+
+        time_label = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        analysis, search_note = generate_ai_analysis(
+            f"{STOCK_NAME}({TICKER})",
+            time_label, price_summary, supply_summary, headlines, reports_md,
+            dram_summary, community_md, overheat_summary,
+            trendforce_md, snapshot_md, news_md, use_search,
+            macro_md, sector_news_md, adr_md,
+            disclosure_md, over_market_md, intraday_md, market_flow_md,
+            capex_md, early_signal_md, recent_price_md, earnings_md, consensus_md,
+            market_state_md, short_sale_md, foreign_desk_md, analyst_view_md,
+            broker_targets_md, disclosure_view_md, financial_view_md,
+            _stream_to=stream_to,
+        )
+
+        ai_analysis.save({
+            "ticker": TICKER,
+            "stock_name": STOCK_NAME,
+            "text": analysis,
+            "time": time_label,
+            "search_note": search_note,
+            "headlines": headlines,
+            "market_state": market_state_md,
+            # 프롬프트에는 들어가는데 저장을 안 해서 '원본 데이터 보기'에서만 빠져 있었다.
+            "overheat": overheat_summary,
+            "dram": dram_summary,
+            "recent_price": recent_price_md,
+            "intraday": intraday_md,
+            "over_market": over_market_md,
+            "market_flow": market_flow_md,
+            "early_signal": early_signal_md,
+            "capex": capex_md,
+            "earnings": earnings_md,
+            "consensus": consensus_md,
+            "short_sale": short_sale_md,
+            "foreign_desk": foreign_desk_md,
+            "analyst_view": analyst_view_md,
+            "disclosure_view": disclosure_view_md,
+            "financial_view": financial_view_md,
+            "broker_targets": broker_targets_md,
+            "community": community_md,
+            "disclosure": disclosure_md,
+            "macro": macro_md,
+            "sector_news": sector_news_md,
+            "adr": adr_md,
+        })
+        # 예약 시각에 실제로 돌았는지 나중에 확인할 수 있게 한 줄 남긴다.
+        print(f"[ai_analysis] 생성 완료 {time_label} ({len(analysis):,}자)", flush=True)
+        return True
+    except Exception as exc:
+        _log_ai_analysis_error(exc)
+        return False
+
+
+def _render_saved_ai_analysis() -> None:
+    """저장된 분석을 읽어 보여준다. 여기서 만들지 않는다.
+
+    만드는 건 자동 새로고침 시각과 '지표 새로고침' 버튼이 맡는다. 화면에서 만들면
+    탭을 열 때마다 30~100초를 기다려야 한다(예전에 그랬다).
+    """
+    saved = ai_analysis.load(TICKER)
+    if not saved.get("text"):
+        st.info("아직 만들어 둔 분석이 없습니다. 위 **🔄 지표 새로고침**을 누르거나, "
+                "예약된 자동 새로고침 시각이 되면 만들어집니다.")
+        return
+
+    age = ai_analysis.age_note(saved)
+    st.caption(f"기준 시각: {saved.get('time')} ({age})" if age else f"기준 시각: {saved.get('time')}")
+    # 장중에는 몇십 분만 지나도 이 안의 주가·수급 숫자가 지금과 다르다. 눈에 띄게 알린다.
+    _mins = 0
+    try:
+        _made = dt.datetime.strptime(str(saved.get("time")), "%Y-%m-%d %H:%M")
+        _mins = int((dt.datetime.now() - _made).total_seconds() // 60)
+    except Exception:
+        pass
+    if _mins >= 60:
+        st.warning(f"이 분석은 {age} 것입니다. 안에 적힌 현재가·수급 숫자는 그 시점 기준이라 "
+                   "지금과 다를 수 있습니다. 최신으로 보려면 위 **🔄 지표 새로고침**을 누르세요.")
+
+    note = saved.get("search_note")
+    if note == "search_ok":
+        st.success("구글 검색으로 최신 정보를 보강해 분석했습니다.")
+    elif note:
+        st.warning(note)
+    st.markdown(_md_safe(saved["text"]))
+
+    with st.expander("분석에 사용된 원본 데이터 보기"):
+        for label, key in ai_analysis.SOURCE_FIELDS:
+            value = saved.get(key)
+            if value:
+                st.write(f"**{label}**")
+                st.text(value)
+        st.write("**뉴스 헤드라인**")
+        _heads = saved.get("headlines") or []
+        st.markdown(_md_safe("\n".join(f"- {h}" for h in _heads)) if _heads
+                    else "수집된 헤드라인 없음")
 
 
 _TAB_RENDERERS = {
@@ -5270,6 +6887,9 @@ _TAB_RENDERERS = {
     "상승 조기신호": _render_tab_rally,
     "DRAM 시세": _render_tab_dram,
     "빅테크 Capex": _render_tab_capex,
+    "재무 데이터": _render_tab_financials,
+    "공시": _render_tab_disclosure,
+    "애널리스트": _render_tab_analyst,
     "커뮤니티": _render_tab_community,
     "AI 분석": _render_tab_ai,
 }
@@ -5279,4 +6899,16 @@ _TAB_RENDERERS = {
 for _label in _visible_tab_labels:
     with _tab_map[_label]:
         _TAB_RENDERERS[_label]()
+
+
+# AI 분석 생성은 **여기서** 한다. 탭을 다 그린 뒤라야 과열도·DRAM 요약(그 탭이 그려질 때
+# 전역에 채워지는 값)이 들어간다. 예약 시각이 지났거나 '지표 새로고침'을 누르면
+# _mark_ai_analysis_due()가 표시를 남기고, 그 표시를 여기서 받아 만든다.
+if st.session_state.pop("_ai_refresh_pending", False):
+    if os.environ.get("GEMINI_API_KEY"):
+        with st.spinner("AI 분석을 만드는 중... 30~100초 걸립니다 (다 만들면 화면에 남습니다)"):
+            _made = _build_and_save_ai_analysis(
+                use_search=st.session_state.get("ai_use_search", True))
+        if _made:
+            st.rerun()          # 새로 만든 분석을 화면에 반영한다
 

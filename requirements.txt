@@ -9,3 +9,7 @@ beautifulsoup4>=4.12,<5.0
 google-genai>=2.0,<3.0
 scipy>=1.11,<2.0
 wordcloud>=1.9,<2.0
+pypdf>=4.0,<6.0
+# 다른 제공자로 바꿀 때만 필요(LLM_PROVIDER=anthropic/openai)
+anthropic>=0.40,<1.0
+openai>=1.50,<3.0

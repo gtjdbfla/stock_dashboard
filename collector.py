@@ -5,9 +5,14 @@ Streamlit은 브라우저 세션이 붙어야만 스크립트를 실행한다. �
 이 스크립트를 별도 컨테이너로 띄워 화면 접속과 무관하게 계속 돌린다.
 """
 import datetime as dt
+import os
 import sys
 import time
 
+import analyst_digest
+import analyst_targets
+import disclosure
+import financial_digest
 import flow_probe
 import over_market as om
 
@@ -33,6 +38,10 @@ def log(msg: str) -> None:
 # 구분할 방법이 없다. 0건인 날도 0건이라고 말하게 한다.
 HEARTBEAT_SEC = 1800
 
+# 아침에 리포트 요약을 확인할 종목. 대시보드 기본 종목과 같게 둔다.
+DIGEST_TICKER = os.environ.get("ANALYST_DIGEST_TICKER", "000660")
+DIGEST_STOCK_NAME = os.environ.get("ANALYST_DIGEST_NAME", "SK하이닉스(000660)")
+
 
 def main() -> None:
     log(f"수집기 시작 | 종목={om.COLLECT_TICKERS} | 주기={om.POLL_SEC}s | 저장={om.TICK_FILE}")
@@ -57,6 +66,32 @@ def main() -> None:
             flow_probe.tick(now, log=log)
         except Exception as exc:                # 탐침 때문에 시세 수집이 멈추면 안 된다
             log(f"수급탐침 오류: {type(exc).__name__}: {exc}")
+
+        # 애널리스트 리포트 요약. 아침에 하루 한 번 확인해서 새 리포트가 있을 때만 다시 만든다.
+        # 대시보드에서만 확인하면 화면을 열기 전까지 옛 요약이 그대로 보인다.
+        try:
+            analyst_digest.tick(now, DIGEST_TICKER, DIGEST_STOCK_NAME, log=log)
+        except Exception as exc:
+            log(f"리포트요약 오류: {type(exc).__name__}: {exc}")
+
+        # 증권사별 목표주가 누적. 새 리포트의 상세 페이지만 열어 목표가를 뽑아 쌓는다.
+        # 이걸 모아야 컨센서스를 직접 계산할 수 있다(FnGuide 값은 주 1회만 갱신된다).
+        try:
+            analyst_targets.tick(now, DIGEST_TICKER, log=log)
+        except Exception as exc:
+            log(f"목표주가수집 오류: {type(exc).__name__}: {exc}")
+
+        # 공시 요약. 공시는 뉴스보다 빠르고 숫자가 확정적이라 새로 뜨면 바로 정리해 둔다.
+        try:
+            disclosure.tick(now, DIGEST_TICKER, DIGEST_STOCK_NAME, log=log)
+        except Exception as exc:
+            log(f"공시요약 오류: {type(exc).__name__}: {exc}")
+
+        # 재무 요약도 같은 방식으로. 화면에서 만들면 생성되는 동안 페이지가 통째로 멈춘다.
+        try:
+            financial_digest.tick(now, DIGEST_TICKER, DIGEST_STOCK_NAME, log=log)
+        except Exception as exc:
+            log(f"재무요약 오류: {type(exc).__name__}: {exc}")
 
         if not om.in_collect_window(now):
             if last_state != "idle":
