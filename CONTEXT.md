@@ -68,6 +68,8 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **이름이 비슷한 지표를 혼동하지 말 것**(전부 정상이고 정의가 다를 뿐): 외국인**소진율**(취득한도 대비, `totalInfos.foreignRate`) vs **보유율**(상장주식 대비, `dealTrendInfos.foreignerHoldRatio`) · PER 후행 vs 재무탭 추정 · 52주 고저는 **장중가** 기준이라 종가 최대·최소와 다르다.
 - **`fetch_investor_netbuy`는 오래된 것부터** 온다. 최신순으로 착각해 "값이 안 맞는다"고 오진한 적 있다.
 - **"KRX가 응답이 없다"는 오진 반복 금지.** 원인은 파이썬 stdout 버퍼링이었고 KRX는 멀쩡하다.
+- **헬스체크 200은 "앱이 멀쩡하다"는 뜻이 아니다.** `/_stcore/health`는 Streamlit 서버가 살아 있으면 200을 준다. 탭 렌더 루프(파일 뒤쪽)보다 **앞에서** 예외가 나면 헤더·장중차트까지만 그려지고 탭 8개가 통째로 빈 채 뜨는데, 헬스체크·`docker ps`는 healthy로 나온다. 배포 확인은 md5+헬스체크로 끝내지 말고 **브라우저에서 탭 안에 내용이 있는지**까지 봐라(`document.querySelectorAll('.js-plotly-plot').length` — 정상 13개, 깨졌을 때 1개).
+- **`st.iframe`은 `height=0`을 거부한다**(양의 정수·`"stretch"`·`"content"`만). `st.components.v1.html`은 0을 받아줬다. 화면에 안 보이게 스크립트만 심을 때는 `height=1`.
 
 ## 6. 미해결 / 다음에 할 것
 
