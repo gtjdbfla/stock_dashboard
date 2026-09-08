@@ -9,6 +9,7 @@ import os
 import sys
 import time
 
+import ai_report
 import analyst_digest
 import analyst_targets
 import disclosure
@@ -41,6 +42,9 @@ HEARTBEAT_SEC = 1800
 # 아침에 리포트 요약을 확인할 종목. 대시보드 기본 종목과 같게 둔다.
 DIGEST_TICKER = os.environ.get("ANALYST_DIGEST_TICKER", "000660")
 DIGEST_STOCK_NAME = os.environ.get("ANALYST_DIGEST_NAME", "SK하이닉스(000660)")
+# AI 분석의 이름표는 ai_report가 f"{이름}({코드})"로 만든다. 코드가 붙은 위 문자열을
+# 그대로 넘기면 "SK하이닉스(000660)(000660)"이 되므로 순수 이름을 따로 둔다.
+AI_STOCK_NAME = os.environ.get("AI_ANALYSIS_NAME", "SK하이닉스")
 
 
 def main() -> None:
@@ -92,6 +96,15 @@ def main() -> None:
             financial_digest.tick(now, DIGEST_TICKER, DIGEST_STOCK_NAME, log=log)
         except Exception as exc:
             log(f"재무요약 오류: {type(exc).__name__}: {exc}")
+
+        # AI 분석. 예약 시각(08~20시 정시)마다 한 번씩 만든다.
+        # 예전에는 대시보드가 만들었는데, Streamlit은 브라우저가 붙어야 스크립트를
+        # 돌리므로 아무도 화면을 안 열어 둔 시각은 통째로 건너뛰었다(실측 11시간).
+        # 한 번에 30~100초가 걸리지만 시세 기록은 20초 주기라 그 사이가 비지는 않는다.
+        try:
+            ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log)
+        except Exception as exc:
+            log(f"AI분석 오류: {type(exc).__name__}: {exc}")
 
         if not om.in_collect_window(now):
             if last_state != "idle":
