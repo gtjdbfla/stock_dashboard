@@ -2477,6 +2477,11 @@ composite_summary = "통합 신호 미실행"
 dram_summary = "해당 없음 (메모리 반도체 관련주가 아니라 DRAM 시세를 표시하지 않음)"
 community_summary = "커뮤니티 심리 데이터를 가져오지 못함"
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_supply():
     global investor_df
 
@@ -2587,6 +2592,11 @@ def _render_tab_supply():
     except Exception as e:
         st.error(f"투자자 수급 데이터 조회에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_overheat():
     global overheat_summary
 
@@ -2849,6 +2859,11 @@ def _render_tab_overheat():
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_futures():
     global futures_summary
 
@@ -3025,6 +3040,11 @@ def _render_tab_futures():
     except Exception as e:
         st.error(f"코스피200 선물 하락 신호 백테스트에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_composite():
     global composite_summary
 
@@ -3171,6 +3191,11 @@ def _render_tab_composite():
         st.error(f"통합 신호 백테스트에 실패했습니다: {e}")
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_signal():
     _subheader_with_help(
         "매매 신호 (기관 수급 기반)",
@@ -3352,6 +3377,11 @@ def _render_tab_signal():
         st.error(f"매매 신호 계산에 실패했습니다: {e}")
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_decline():
     _subheader_with_help(
         "큰폭 하락 조기 신호 (SK하이닉스 전용, 참고용)",
@@ -3496,6 +3526,11 @@ def _render_tab_decline():
         except Exception as e:
             st.error(f"조기 신호 조회에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_rally():
     _subheader_with_help(
         "큰폭 상승 조기 신호 (SK하이닉스 전용, 참고용)",
@@ -3655,6 +3690,11 @@ def _render_tab_rally():
         except Exception as e:
             st.error(f"조기 신호 조회에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_dram():
     global dram_summary
 
@@ -3771,6 +3811,11 @@ def _render_tab_dram():
         except Exception as e:
             st.error(f"DRAM 현물가 조회에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_capex():
     _subheader_with_help(
         "빅테크 분기별 Capex",
@@ -3940,6 +3985,11 @@ def _fin_style(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_financials():
     _subheader_with_help(
         "재무 데이터",
@@ -4171,6 +4221,11 @@ def _render_broker_targets():
             + (" 차이가 큰 편이니 위 표의 작성일을 함께 보세요." if abs(gap) >= 0.05 else ""))
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_disclosure():
     _subheader_with_help(
         "공시",
@@ -4243,6 +4298,11 @@ def _render_tab_disclosure():
         st.caption("본문은 요약을 한 번 만든 뒤에 여기 쌓입니다.")
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_analyst():
     _subheader_with_help(
         "애널리스트 리포트",
@@ -4316,6 +4376,11 @@ def _render_tab_analyst():
         st.caption("리포트를 많이 낸 곳 — " + " · ".join(f"{k} {v}건" for k, v in counts.items()))
 
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_community():
     global community_summary
 
@@ -4462,6 +4527,11 @@ def _render_tab_community():
     except Exception as e:
         st.error(f"디시인사이드 주식갤러리 조회에 실패했습니다: {e}")
 
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
+# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
+# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+@st.fragment
 def _render_tab_ai():
     _subheader_with_help(
         "AI 분석: 오늘의 주가 변동 요인",
