@@ -121,9 +121,17 @@ DEFAULT_COMMUNITY_POST_COUNT = 60
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 
+# 모델마다 무료 한도가 따로 잡힌다. 그래서 체인에 온전한 모델을 하나 더 두면 기본
+# 모델이 소진돼도 품질을 지킨 채로 넘어갈 수 있다 — 예전 체인은 3.6이 떨어지는 즉시
+# flash-lite로 내려갔고, 실제로 2026-09-08 13시에 그 일이 일어났다.
+# gemini-3.7-flash는 실제 프롬프트(18,547자)로 재봤다: 첫 글자 13.4초, 완료 23.8초,
+# 2,757자, 10개 섹션·7개 출처 갈래를 모두 채우고 근거 인용 14건.
+# gemini-3.8-flash는 넣지 않는다. 짧은 프롬프트에는 답하지만 실제 프롬프트로는
+# 두 번 다 "currently experiencing high demand"만 돌려줬다.
 GEMINI_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
-        "GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-flash-lite-latest"
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.7-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-lite-latest"
     ).split(",") if m.strip()
 ]
 
@@ -211,9 +219,16 @@ def _stream_gemini(prompt: str, used: dict):
         got: list[str] = []            # 이 모델이 뱉은 것만 따로 모아 품질을 본다
         for cfg in (_gemini_gen_config(), {}):
             try:
+                stream_error = None
                 for event in client.interactions.create(
                         model=model, input=prompt, stream=True,
                         timeout=GEMINI_STALL_SEC, **cfg):
+                    # 스트림은 예외 대신 ErrorEvent 하나를 흘리고 조용히 끝나기도 한다.
+                    # 그 메시지를 안 읽으면 한도 소진과 일시 과부하가 똑같이 '빈 응답'으로
+                    # 기록돼서, 기다리면 되는 건지 모델을 바꿔야 하는 건지 알 수 없다.
+                    err = getattr(event, "error", None)
+                    if err is not None:
+                        stream_error = getattr(err, "message", None) or str(err)
                     delta = getattr(event, "delta", None)
                     text = getattr(delta, "text", None) if delta is not None else None
                     if text:
@@ -235,7 +250,12 @@ def _stream_gemini(prompt: str, used: dict):
                     return
                 # 예외 없이 조각을 하나도 안 준 경우다. 이것도 건너뛴 이유로 남겨야 한다.
                 # 안 남기면 화면에 "(사용 불가)"라고만 떠서 왜 다른 모델을 썼는지 알 수 없다.
-                used.setdefault("skipped", []).append((model, "빈 응답"))
+                if stream_error and "quota" in stream_error.lower():
+                    _mark_exhausted(model)
+                    used.setdefault("skipped", []).append((model, "오늘 무료 한도 소진"))
+                else:
+                    used.setdefault("skipped", []).append(
+                        (model, stream_error[:80] if stream_error else "빈 응답"))
                 break
             except Exception as exc:
                 last_exc = exc

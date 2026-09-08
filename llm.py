@@ -20,7 +20,8 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3.5-flash-lite,gemini-flash-lite-latest"
+        # app 쪽(ai_inputs)과 같은 체인을 쓴다. 이유는 그쪽 주석에 적어 뒀다.
+        "gemini-3.7-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-lite-latest"
     ).split(",") if m.strip()
 ]
 # 폴백으로 내려가기 전에 기본 모델을 이만큼 더 시도한다(한 번 지연했다고 품질을 포기하지 않게).
