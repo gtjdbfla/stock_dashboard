@@ -2245,11 +2245,12 @@ def generate_ai_analysis(
         note = f"{note} {cut}" if note else cut
 
     if used != GEMINI_MODEL:
-        # 기본 모델을 건너뛴 이유를 그대로 알려준다. 예전에는 이유를 묻지 않고 늘
-        # "한도가 소진되어"라고 적었는데, 응답이 느려서 넘어간 경우까지 한도 탓으로 말해버렸다.
-        why = ", ".join(f"{m}: {reason}" for m, reason in skipped) if skipped else "사용 불가"
-        switched = f"{used} 모델로 분석했습니다 ({why})."
-        note = f"{note} {switched}" if note else switched
+        # 어느 모델을 썼는지는 **로그에만** 남긴다. 화면에 띄우면 폴백이 도는 날마다
+        # 경고 띠가 서는데, 읽는 사람이 할 수 있는 일이 없다(한도는 다음 날 풀린다).
+        # 비스트리밍 경로는 skipped를 채우지 않아서 이유가 늘 '사용 불가'로만 찍혔고,
+        # 그래서 띠가 알려주는 것도 사실상 없었다.
+        why = ", ".join(f"{m}: {reason}" for m, reason in skipped) if skipped else "이유 미기록"
+        print(f"[ai_analysis] 기본 모델 대신 {used} 사용 ({why})", flush=True)
     return (text or "AI가 응답을 생성하지 못했습니다.", note)
 
 
