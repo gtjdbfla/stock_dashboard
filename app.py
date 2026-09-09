@@ -1,3 +1,6 @@
+import time as _time
+_IMPORT_T0 = _time.monotonic()   # import 비용을 재려고 제일 먼저 잡는다
+
 import csv
 import datetime as dt
 import json
@@ -143,6 +146,21 @@ _CACHED = {
 for _fn_name, _fn_kwargs in _CACHED.items():
     globals()[_fn_name] = st.cache_data(**_fn_kwargs)(getattr(ai_inputs, _fn_name))
 
+
+# ── 콜드 로드 프로파일 ──────────────────────────────────────────────────────
+# 전체 스크립트가 처음부터 다시 도는 리런(첫 접속·사이드바 변경·자동 새로고침)마다
+# 이 모듈이 위에서부터 재실행되므로, 여기서 잡는 시각이 그 리런의 시작점이다.
+# BOOT_PROFILE=1 일 때만 단계별 경과를 stdout(=docker logs)에 남긴다.
+_BOOT_T0 = _IMPORT_T0
+_BOOT_PROFILE = os.environ.get("BOOT_PROFILE") == "1"
+
+
+def _boot_lap(label: str) -> None:
+    if _BOOT_PROFILE:
+        print(f"[boot] +{time.monotonic() - _BOOT_T0:6.2f}s  {label}", flush=True)
+
+
+_boot_lap(f"import 완료 (import에 {time.monotonic() - _IMPORT_T0:.2f}s)")
 
 
 def _streamlit_pool(max_workers: int) -> ThreadPoolExecutor:
@@ -2130,10 +2148,23 @@ def render_market_flow():
     except Exception as exc:
         _note_optional_failure("코스피 전체 수급", exc)
 
+_boot_lap("상단(사이드바·타이틀·CSS) 완료")
+
 # 셋을 따로 부른다. 각자 자기 주기로 돌고, 하나가 갱신돼도 나머지는 그대로 있는다.
+_lf_t = time.monotonic()
 render_current_price()
+if _BOOT_PROFILE:
+    print(f"[boot]   현재가 지표 {time.monotonic() - _lf_t:.2f}s", flush=True)
+_lf_t = time.monotonic()
 render_intraday_chart()
+if _BOOT_PROFILE:
+    print(f"[boot]   장중 차트 {time.monotonic() - _lf_t:.2f}s", flush=True)
+_lf_t = time.monotonic()
 render_market_flow()
+if _BOOT_PROFILE:
+    print(f"[boot]   코스피 수급 {time.monotonic() - _lf_t:.2f}s", flush=True)
+
+_boot_lap("현재가·장중차트·코스피수급 완료")
 
 st.divider()
 
@@ -2338,6 +2369,7 @@ def _auto_refresh_indicators():
 
 
 _auto_refresh_indicators()
+_boot_lap("자동 새로고침 체크 완료")
 
 _now = dt.datetime.now()
 _stalled_groups = []
@@ -2487,6 +2519,7 @@ DOWNTREND_WINDOW = 20
 _visible_tab_labels = [label for label in ALL_TAB_LABELS if label in visible_tab_labels] or ALL_TAB_LABELS
 tabs = st.tabs(_visible_tab_labels)
 _tab_map = dict(zip(_visible_tab_labels, tabs))
+_boot_lap("탭 컨테이너 생성 완료 (렌더 직전)")
 
 # Plotly는 숨겨진 탭(display:none) 안에서 그려질 때 컨테이너 폭을 못 재고 기본 700px로 그린다.
 # 탭이 보이게 돼도 스스로 다시 재지 않아서, 모바일 375px에서는 차트 오른쪽 절반이 잘려 나갔다
@@ -2674,7 +2707,10 @@ def _render_tab_overheat():
         ) / 100
 
     try:
+        _ov_t = time.monotonic()
         overheat_hist = fetch_backtest_history_live(TICKER, target_days=700)
+        if _BOOT_PROFILE:
+            print(f"[boot]     과열도: 700일 이력 fetch {time.monotonic() - _ov_t:.2f}s", flush=True)
         if len(overheat_hist) < 80:
             st.warning("백테스트에 충분한 과거 데이터가 없습니다.")
         else:
@@ -2692,6 +2728,8 @@ def _render_tab_overheat():
                 )
                 for q in OVERHEAT_QUANTILES
             }
+            if _BOOT_PROFILE:
+                print(f"[boot]     과열도: 백테스트 8회 {time.monotonic() - _ov_t:.2f}s (fetch 포함 누적)", flush=True)
             overheat_result = overheat_results[OVERHEAT_QUANTILES[0]]
 
             if overheat_result["n"] < 30:
@@ -2843,7 +2881,10 @@ def _render_tab_overheat():
                     key="overheat_strategy_months",
                 )
                 period_start = overheat_hist_ma["날짜"].max() - pd.Timedelta(days=strategy_months * 30.44)
+                _strat_t = time.monotonic()
                 strategy_result = run_overheat_threshold_strategy(overheat_hist_ma, period_start)
+                if _BOOT_PROFILE:
+                    print(f"[boot]     과열도: 추세추종 백테스트 {time.monotonic() - _strat_t:.2f}s", flush=True)
 
                 if strategy_result["n_days"] < 10 or strategy_result["buy_hold_return"] is None:
                     st.warning("선택한 기간에 데이터가 부족합니다.")
@@ -4748,9 +4789,15 @@ _TAB_RENDERERS = {
 
 # 사이드바에서 숨기지 않은(선택된) 탭만 실제로 렌더링한다. 숨겨진 탭은 함수 자체가
 # 호출되지 않으므로 데이터 조회도 일어나지 않는다.
+# 콜드 로드에서는 프래그먼트라도 전부 한 번은 돈다(스킵은 그 뒤 위젯 리런에서만).
 for _label in _visible_tab_labels:
+    _tab_t0 = time.monotonic()
     with _tab_map[_label]:
         _TAB_RENDERERS[_label]()
+    if _BOOT_PROFILE:
+        print(f"[boot]   탭 '{_label}' {time.monotonic() - _tab_t0:6.2f}s", flush=True)
+
+_boot_lap("탭 렌더 루프 완료")
 
 
 # AI 분석 생성은 **여기서** 한다. 탭을 다 그린 뒤라야 과열도·DRAM 요약(그 탭이 그려질 때
