@@ -11,6 +11,7 @@
 | `app.py` | 4,608 | 화면. 탭 렌더와 자동 새로고침 |
 | `ai_inputs.py` | 2,508 | AI 분석 재료를 만드는 계층. 수집기와 공용 |
 | `ai_report.py` | 356 | 재료를 모아 프롬프트에 태우고 저장 |
+| `daily_history.py` | 128 | 일별 이력 CSV 저장/로드. 네트워크 코드 없음(순환 방지) |
 
 ---
 
@@ -23,7 +24,7 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 
 **시세·수급** `fetch_current_price` 321 · `fetch_intraday_price` 325 · `fetch_investor_netbuy` 366 **(오래된 것부터 온다 — 최신순 아님)** · `fetch_daily_ohlcv` 391 · `fetch_stock_snapshot` 698 · `fetch_market_flow` 936 · `fetch_foreign_desk` 963 · `fetch_foreign_hold_ratio` 1753
 
-**백테스트** `fetch_backtest_history` 436 · `fetch_backtest_history_live` 484 · `run_overheat_backtest` 528 · `run_boolean_pattern_backtest` 600
+**백테스트** `fetch_backtest_history` 437 **(파일 우선 — daily_history. 없거나 낡을 때만 `_fetch_backtest_history_web`)** · `fetch_backtest_history_live` 484 · `run_overheat_backtest` 528 · `run_boolean_pattern_backtest` 600
 
 **뉴스·공시·리포트** `fetch_news_with_summary` 885 · `fetch_disclosures` 1049 **(목록+오늘 본문만. 그 앞 15건은 `disclosure.py` 정리본 담당)** · `fetch_sector_news` 1212 · `fetch_trendforce_news` 1256 · `fetch_analyst_reports` 1291 · `fetch_community_posts` 1349 · `fetch_dc_gallery_posts` 1378
 
