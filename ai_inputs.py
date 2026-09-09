@@ -2436,7 +2436,7 @@ load_over_market_ticks = om.load_ticks
 
 
 def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
-    """SKHY 1분봉을 여러 거래일치 받아 세션·거래일까지 붙여서 돌려준다.
+    """SKHY 분봉을 여러 거래일치 받아 세션·거래일까지 붙여서 돌려준다.
 
     시세(fetch_adr_quote)와 그래프(fetch_adr_intraday)가 같은 응답을 쓰도록 한 곳에 모았다.
     예전에는 같은 URL을 각자 한 번씩 불러서 왕복이 두 번 났다.
@@ -2448,6 +2448,10 @@ def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
          (실측: 8/19 프리장 $162.02를 8/17 종가 $171.38과 비교해 -5.46%로 표시. 실제는
           8/18 종가 $155.62 대비 +4.11%로, 부호까지 뒤집혔다.)
     그래서 여러 날을 받아 기준값을 데이터에서 직접 고른다.
+
+    2분봉을 쓴다. 5일치 1분봉(~5,000행)은 야후 응답이 5~6초까지 걸려서 화면이 열릴 때
+    이 함수 하나가 상단 지표를 그만큼 붙잡았다. 2분봉이면 행이 절반으로 줄고, 이 지표는
+    '마지막 체결가 + 일별 기준종가'만 쓰므로 2분 해상도로도 값이 달라지지 않는다.
     """
     empty = pd.DataFrame({"시각": pd.Series(dtype="datetime64[ns]"),
                           "가격": pd.Series(dtype="float64"),
@@ -2456,7 +2460,7 @@ def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ADR_SYMBOL}",
                          headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
-                         params={"range": f"{days}d", "interval": "1m", "includePrePost": "true"})
+                         params={"range": f"{days}d", "interval": "2m", "includePrePost": "true"})
         r.raise_for_status()
         res = r.json()["chart"]["result"][0]
         stamps = res.get("timestamp") or []

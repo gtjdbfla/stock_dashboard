@@ -117,8 +117,12 @@ from ai_inputs import (  # noqa: F401
 _CACHED = {
     '_fetch_board_page': dict(ttl=1800, show_spinner="불러오는 중..."),
     '_fetch_dram_soup': dict(ttl=3600, show_spinner="불러오는 중..."),
+    # 시세·그래프 두 곳이 부르는 야후 분봉. 캐시가 없으면 5초 화면 조각이 돌 때마다
+    # 새로 받았다. 90초면 프리/애프터장 움직임을 따라가기에 충분하다.
+    '_fetch_adr_bars': dict(ttl=90, show_spinner=False),
     'fetch_adr_baseline': dict(ttl=3600, show_spinner=False),
-    'fetch_adr_quote': dict(ttl=60, show_spinner=False),
+    # 위 _fetch_adr_bars가 캐시되므로 이건 값 조립만 한다. 120초로 늘려도 체감 차이가 없다.
+    'fetch_adr_quote': dict(ttl=120, show_spinner=False),
     'fetch_analyst_reports': dict(ttl=900, show_spinner="불러오는 중..."),
     'fetch_backtest_history': dict(ttl=24 * 3600, show_spinner="불러오는 중..."),
     'fetch_bigtech_capex': dict(ttl=24 * 3600, show_spinner="불러오는 중..."),
@@ -145,6 +149,11 @@ _CACHED = {
 }
 for _fn_name, _fn_kwargs in _CACHED.items():
     globals()[_fn_name] = st.cache_data(**_fn_kwargs)(getattr(ai_inputs, _fn_name))
+
+# fetch_adr_quote는 ai_inputs 안에서 _fetch_adr_bars를 부른다 — 모듈 내부 참조라
+# 위에서 씌운 캐시본이 아니라 원본을 탄다. 이 하나만 모듈 네임스페이스에 되써서
+# 시세·그래프가 같은 캐시된 응답을 쓰게 한다(이 프로세스에만 적용, 수집기와 무관).
+ai_inputs._fetch_adr_bars = globals()["_fetch_adr_bars"]
 
 
 # ── 콜드 로드 프로파일 ──────────────────────────────────────────────────────
@@ -1523,7 +1532,10 @@ def _live_deviation(live_price: float, ma_window: int) -> tuple[float | None, fl
     """장중 현재가를 시계열의 마지막 값으로 놓고 이동평균 대비 괴리율을 계산한다.
     가격 과열도 탭은 확정된 종가로 계산하므로, 장중에는 이 값이 그쪽보다 앞서 움직인다.
     과거 괴리율 분포에서의 백분위(상위 N%)도 함께 돌려준다."""
-    hist = fetch_backtest_history_live(TICKER, target_days=700)
+    # 250일이면 MA(최대 120)와 백분위 분포에 충분하다. 이 함수는 화면 상단 조각에서
+    # 불리는데, 700일(네이버 ~35페이지, 5~7초)을 받으면 첫 화면이 그만큼 늦게 뜬다.
+    # 700일 전체는 가격 과열도 탭이 따로 받는다(그쪽은 지연 렌더라 첫 화면을 안 막는다).
+    hist = fetch_backtest_history_live(TICKER, target_days=250)
     if hist.empty or len(hist) < ma_window:
         return None, None
     closes = hist["종가"].astype(float).reset_index(drop=True)
@@ -4789,15 +4801,32 @@ _TAB_RENDERERS = {
 
 # 사이드바에서 숨기지 않은(선택된) 탭만 실제로 렌더링한다. 숨겨진 탭은 함수 자체가
 # 호출되지 않으므로 데이터 조회도 일어나지 않는다.
-# 콜드 로드에서는 프래그먼트라도 전부 한 번은 돈다(스킵은 그 뒤 위젯 리런에서만).
-for _label in _visible_tab_labels:
+#
+# 지연 렌더: `st.tabs`는 보이는 탭 8개를 한 번에 다 그리고, 그 루프가 동기라서
+# 처음 열 때 8개 데이터 조회가 순서대로 쌓여 20초가 걸렸다. 사용자는 한 번에 한
+# 탭만 본다. 그래서 **새 세션의 첫 렌더에서는 처음 열려 있는 탭(=첫 탭)만** 그리고,
+# 곧바로 st.rerun()을 한 번 걸어 나머지를 채운다. 그 사이에도 첫 탭은 이미 보이고
+# 눌린다 — 첫 탭까지 걸리는 시간이 ~20초에서 ~6초로 줄고, 나머지는 읽는 동안 채워진다.
+# (탭 전환은 그대로 즉시다. `st.tabs`의 CSS 토글이라 서버로 안 간다.)
+_TABS_WARMED_KEY = "_all_tabs_rendered"
+_tabs_warmed = st.session_state.get(_TABS_WARMED_KEY, False)
+
+for _i, _label in enumerate(_visible_tab_labels):
     _tab_t0 = time.monotonic()
     with _tab_map[_label]:
-        _TAB_RENDERERS[_label]()
+        if _tabs_warmed or _i == 0:
+            _TAB_RENDERERS[_label]()
+        else:
+            st.caption("불러오는 중…")
     if _BOOT_PROFILE:
-        print(f"[boot]   탭 '{_label}' {time.monotonic() - _tab_t0:6.2f}s", flush=True)
+        print(f"[boot]   탭 '{_label}' {time.monotonic() - _tab_t0:6.2f}s"
+              + ("" if (_tabs_warmed or _i == 0) else " (지연)"), flush=True)
 
 _boot_lap("탭 렌더 루프 완료")
+
+if not _tabs_warmed:
+    st.session_state[_TABS_WARMED_KEY] = True
+    st.rerun()
 
 
 # AI 분석 생성은 **여기서** 한다. 탭을 다 그린 뒤라야 과열도·DRAM 요약(그 탭이 그려질 때
