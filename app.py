@@ -393,16 +393,25 @@ st.markdown(
     /* DRAM 추이 차트의 품목 선택 드롭다운(Plotly updatemenu). Streamlit의 plotly
        테마가 배경·글자를 밝게 덮어써서 다크 화면에서 글자가 안 보였다. SVG라 CSS로
        직접 색을 박는다. */
-    .js-plotly-plot .updatemenu-item-rect,
-    .js-plotly-plot .updatemenu-header {
-        fill: #1e1e26 !important;
-        stroke: #555 !important;
+    .js-plotly-plot .updatemenu-header,
+    .js-plotly-plot .updatemenu-item-rect {
+        fill: #262730 !important;
+        stroke: #41444c !important;
+        rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
+    /* SVG 13px 글자는 다크 배경에서 획이 얇아 옆의 HTML 표 글자보다 흐리게 보인다.
+       색은 이미 흰색(#fafafa)이므로 굵기로 무게를 맞춘다. */
     .js-plotly-plot .updatemenu-item-text {
         fill: #fafafa !important;
+        font-weight: 600 !important;
     }
+    .js-plotly-plot .updatemenu-header:hover,
     .js-plotly-plot .updatemenu-item-rect:hover {
-        fill: #34343f !important;
+        fill: #3a3b45 !important;
+        stroke: #5b5f68 !important;
+    }
+    .js-plotly-plot .updatemenu-header-arrow {
+        fill: #a9adb5 !important;
     }
     div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
         font-size: 1.1rem !important;
@@ -2498,23 +2507,35 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         # 각 버튼은 자기 trace만 보이게 한다. Plotly가 가시성 변화에 맞춰 y축을 알아서
         # 다시 잡으므로(품목마다 가격대가 다르다) 여기서 yaxis.autorange를 넘기지 않는다 —
         # fixedrange가 걸린 축에 relayout으로 autorange를 함께 주면 "axis scaling" 오류가 난다.
+        # 고른 품목 이름은 드롭다운 자신이 보여주므로 제목을 따로 바꾸지 않는다.
         buttons = [
             dict(label=item, method="update",
-                 args=[{"visible": [j == i for j in range(n)]},
-                       {"title.text": item}])
+                 args=[{"visible": [j == i for j in range(n)]}])
             for i, item in enumerate(items)
         ]
+        # 플롯 **위쪽 여백**에 오른쪽 정렬로 둔다. 섹션 제목이 왼쪽에 있으므로
+        # 제목-왼쪽 / 선택-오른쪽으로 한 줄처럼 읽힌다.
+        #
+        # 왼쪽 정렬은 쓸 수 없다: updatemenus의 x=0은 그림 왼쪽이 아니라 **플롯 영역**
+        # 왼쪽(= 그림 왼쪽 + margin.l)이라 제목보다 항상 여백만큼 들여쓰기된다.
+        # 이걸 음수 x로 당기려면 보정값이 폭마다 달라진다(458px에서 -0.12, 343px에서
+        # -0.17). 오른쪽 정렬은 margin.r만큼만 떨어지므로 폭과 무관하게 가장자리에 붙는다.
         fig.update_layout(updatemenus=[dict(
             type="dropdown", direction="down", active=0,
             buttons=buttons, showactive=True,
-            x=1.0, xanchor="right", y=1.16, yanchor="top",
-            pad=dict(t=2, r=2),
-            # 다크 테마에 맞춘다. 기본값(흰 배경 + 밝은 글자)은 글자가 안 보였다.
-            bgcolor="#1e1e26", bordercolor="#555", borderwidth=1,
-            font=dict(color="#fafafa", size=12),
+            x=1, xanchor="right", y=1.0, yanchor="bottom",
+            pad=dict(t=0, b=8, l=0, r=0),
+            bgcolor="#262730", bordercolor="#41444c", borderwidth=1,
+            font=dict(color="#fafafa", size=14),
         )])
 
-    _style_chart_mobile(fig, title=items[0] if items else None, show_legend=False)
+    # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
+    _style_chart_mobile(fig, title=None, show_legend=False)
+    # 위 여백은 메뉴가 앉을 자리(기본 50은 모자라 선 위로 겹친다).
+    # 왼쪽 여백을 좁히는 이유: updatemenus의 x=0은 그림 왼쪽이 아니라 **플롯 영역**
+    # 왼쪽이라, 기본 여백(80px)이면 메뉴가 위의 섹션 제목보다 안쪽으로 들여쓰기돼
+    # 혼자 떠 있는 것처럼 보인다. 축 눈금(두세 자리 숫자)에는 48px이면 넉넉하다.
+    fig.update_layout(margin=dict(t=58 if n > 1 else 30, l=48, r=16))
     # _style_chart_mobile은 모든 축에 fixedrange=True를 건다. 그 상태로 품목을 바꾸면
     # (visible 토글) Plotly가 잠긴 y축을 autorange하려다 "axis scaling" 오류를 낸다.
     # y축만 풀어 준다 — 세로 줌이 열리지만, 스크롤 오작동의 원인인 가로 줌은 x축에
@@ -2522,7 +2543,7 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     fig.update_yaxes(fixedrange=False, autorange=True)
     fig.update_xaxes(rangeslider_visible=True)
     st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
-    st.caption("오른쪽 위에서 품목을 고르면 바로 바뀝니다. 차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
+    st.caption("오른쪽 위 상자에서 품목을 고르면 바로 바뀝니다. 차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
 
 
 DOWNTREND_WINDOW = 20
