@@ -77,6 +77,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **`fetch_investor_netbuy`는 오래된 것부터** 온다. 최신순으로 착각해 "값이 안 맞는다"고 오진한 적 있다.
 - **"KRX가 응답이 없다"는 오진 반복 금지.** 원인은 파이썬 stdout 버퍼링이었고 KRX는 멀쩡하다.
 - **탭 안의 위젯은 그 탭이 `@st.fragment`일 때만 그 탭만 다시 그린다.** 프래그먼트가 아니면 위젯 하나를 건드려도 스크립트 전체가 다시 돌아 보이는 탭 8개가 통째로 재렌더된다. 실측: DRAM '표시 품목' 라디오 전환 **13.7초 → 0.84초**. 탭 렌더 함수 14개에 전부 걸어 뒀다. **안쪽에 또 걸지 말 것** — 중첩 프래그먼트는 Streamlit이 막는다(`_render_dram_trend_chart`처럼 탭이 부르는 보조 함수가 그 대상이다).
+- **차트 뷰만 바꾸는 위젯은 서버로 보내지 말고 Plotly `updatemenus`로 브라우저에서 처리한다.** DRAM 품목 전환은 프래그먼트 안이라도 라디오라서 탭이 통째로 다시 돌았다(CSV 재기록·표 2개·차트 2개 → 약 4초). 품목 전부를 trace로 넣고 첫 개만 `visible=True`, 나머지는 드롭다운이 `visible` 배열만 토글 → **9~150ms, 서버 왕복 0**. 함정 둘: (1) `_style_chart_mobile`이 모든 축에 `fixedrange=True`를 거는데 그 y축에서 visible 토글 시 "axis scaling" 오류 → 그 차트만 `fig.update_yaxes(fixedrange=False)`. (2) Streamlit plotly 테마가 updatemenu를 밝게 칠해 다크 화면에서 글자가 안 보임 → `.js-plotly-plot .updatemenu-item-text{fill:#fafafa!important}` 등 CSS로 직접 박음(SVG라 CSS가 닿는다).
 - **헬스체크 200은 "앱이 멀쩡하다"는 뜻이 아니다.** `/_stcore/health`는 Streamlit 서버가 살아 있으면 200을 준다. 탭 렌더 루프(파일 뒤쪽)보다 **앞에서** 예외가 나면 헤더·장중차트까지만 그려지고 탭 8개가 통째로 빈 채 뜨는데, 헬스체크·`docker ps`는 healthy로 나온다. 배포 확인은 md5+헬스체크로 끝내지 말고 **브라우저에서 탭 안에 내용이 있는지**까지 봐라(`document.querySelectorAll('.js-plotly-plot').length` — 정상 13개, 깨졌을 때 1개).
 - **`st.iframe`은 `height=0`을 거부한다**(양의 정수·`"stretch"`·`"content"`만). `st.components.v1.html`은 0을 받아줬다. 화면에 안 보이게 스크립트만 심을 때는 `height=1`.
 
