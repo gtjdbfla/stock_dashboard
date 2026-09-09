@@ -32,6 +32,7 @@ from google import genai
 
 import analyst_digest
 import analyst_targets
+import daily_history
 import disclosure
 import financial_digest
 import fnguide
@@ -434,6 +435,21 @@ def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
 
 
 def fetch_backtest_history(ticker: str, target_days: int = 500) -> pd.DataFrame:
+    """일별 이력. **파일에 있으면 파일에서, 없거나 낡았을 때만 네이버에서 받는다.**
+
+    네이버에서 받는 쪽은 700일이면 35페이지라 5~7초가 걸린다. 화면을 열 때마다 그걸
+    치르지 않도록 수집기가 하루 한 번 받아 daily_history에 쌓아 두고, 화면은 그 파일을
+    읽는다. 파일이 없는 첫 배포에서는 여기서 받아 곧바로 저장하므로 다음부터는 빠르다.
+    """
+    cached = daily_history.load(ticker, target_days)
+    if cached is not None:
+        return cached
+    fresh = _fetch_backtest_history_web(ticker, target_days)
+    daily_history.save(ticker, fresh)
+    return fresh
+
+
+def _fetch_backtest_history_web(ticker: str, target_days: int = 500) -> pd.DataFrame:
     # 페이지끼리 의존이 없으므로(page=N은 그냥 N번째 묶음) 한 장씩 순서대로 기다릴 이유가 없다.
     # 700일치면 35페이지쯤인데, 순차로 받으면 왕복 지연만 5초가 넘는다.
     # 1페이지로 '한 장에 몇 줄인지'만 확인한 뒤 나머지를 한꺼번에 받는다.

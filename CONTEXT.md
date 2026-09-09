@@ -40,6 +40,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 | `fnguide.py` | FnGuide `snpFinancial` 임베디드 JSON 파싱 |
 | `ai_inputs.py` | **AI 분석 재료 계층.** app.py에서 떼어낸 함수 72개. streamlit 미import |
 | `ai_report.py` | **분석 생성·저장 오케스트레이터.** 수집기와 화면 버튼이 같이 쓴다 |
+| `daily_history.py` | 일별 시세·수급 이력 **CSV 저장/로드만**. 수집기가 채우고 화면이 읽는다 |
 | `ai_analysis.py` | AI 분석 결과 **저장/로드만**. app을 import하지 않는다(순환 방지) |
 | `llm.py` | `analyst_digest`·`financial_digest` **전용** LLM 호출 |
 | `data/` | DRAM 이력 등. gitignore |
@@ -81,6 +82,9 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **`st.tabs`는 보이는 탭을 전부 한 번에, 동기로 그린다.** 사용자는 한 탭만 보는데 8개 조회가 순서대로 쌓여 콜드 로드가 20초였다. 지금은 **새 세션의 첫 렌더에서 열려 있는 첫 탭만** 그리고 `st.rerun()`으로 나머지를 채운다(`_all_tabs_rendered` 세션 키). 첫 화면 **20.0초 → 5.5초**(재방문 1.8초), 탭 전환은 그대로 즉시. **느린 걸 상단에 두지 말 것** — `_live_deviation`이 괴리율 백분위 하나 때문에 700일(네이버 ~35페이지, 5~7초)을 받고 있었고, 그게 첫 화면을 통째로 막았다(250일로 줄임. 700일은 지연 렌더되는 과열도 탭이 따로 받는다).
 - **`ai_inputs` 안에서 서로 부르는 함수는 app.py의 `_CACHED` 래핑을 못 탄다.** 모듈 내부 참조라 원본이 불린다. 실제로 `fetch_adr_quote`가 `_fetch_adr_bars`(야후 5일치 분봉)를 캐시 없이 매번 받고 있었다. 공유가 필요하면 `ai_inputs.<이름> = globals()['<이름>']`로 되써야 한다(대시보드 프로세스에만 적용되고 수집기와 무관).
 - **콜드 로드가 느려지면 추측하지 말고 `BOOT_PROFILE=1`.** docker-compose의 dashboard `environment`에 넣고 재배포하면 import·상단·프래그먼트 3개·탭별 소요가 `[boot]` 줄로 docker logs에 찍힌다. 평소엔 꺼져 있다.
+- **콜드 로드가 느리면 `BOOT_PROFILE=1`로 먼저 재라**(docker-compose의 dashboard `environment`에 넣고 재배포). app.py가 import·상단·프래그먼트·탭별 소요를 `[boot]`로 남긴다. 추측으로 뒤지지 말 것.
+- **`st.tabs`는 보이는 탭을 전부 즉시, 순차로 그린다.** 사용자는 한 탭만 보는데 8개 조회 비용을 처음에 다 치른다. 그래서 **새 세션의 첫 렌더는 첫 탭만** 그리고 곧바로 `st.rerun()`으로 나머지를 채운다(app.py 탭 디스패치 루프). 실측 콜드 로드 **~20초 → 첫 화면 4.1초**, 나머지는 그 뒤 1초 안에 채워진다.
+- **화면에서 같은 데이터를 두 번 받고 있지 않은지 보라.** `_live_deviation`(상단)과 가격 과열도 탭이 둘 다 `fetch_backtest_history_live(700)`을 불렀다. 상단은 250일이면 충분해서 그렇게 줄였다.
 - **헬스체크 200은 "앱이 멀쩡하다"는 뜻이 아니다.** `/_stcore/health`는 Streamlit 서버가 살아 있으면 200을 준다. 탭 렌더 루프(파일 뒤쪽)보다 **앞에서** 예외가 나면 헤더·장중차트까지만 그려지고 탭 8개가 통째로 빈 채 뜨는데, 헬스체크·`docker ps`는 healthy로 나온다. 배포 확인은 md5+헬스체크로 끝내지 말고 **브라우저에서 탭 안에 내용이 있는지**까지 봐라(`document.querySelectorAll('.js-plotly-plot').length` — 정상 13개, 깨졌을 때 1개).
 - **`st.iframe`은 `height=0`을 거부한다**(양의 정수·`"stretch"`·`"content"`만). `st.components.v1.html`은 0을 받아줬다. 화면에 안 보이게 스크립트만 심을 때는 `height=1`.
 

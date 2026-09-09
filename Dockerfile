@@ -17,6 +17,7 @@ COPY flow_probe.py .
 COPY ai_analysis.py .
 COPY ai_inputs.py .
 COPY ai_report.py .
+COPY daily_history.py .
 COPY analyst_digest.py .
 COPY analyst_targets.py .
 COPY disclosure.py .

@@ -12,6 +12,7 @@ import time
 import ai_report
 import analyst_digest
 import analyst_targets
+import daily_history
 import disclosure
 import financial_digest
 import flow_probe
@@ -96,6 +97,13 @@ def main() -> None:
             financial_digest.tick(now, DIGEST_TICKER, DIGEST_STOCK_NAME, log=log)
         except Exception as exc:
             log(f"재무요약 오류: {type(exc).__name__}: {exc}")
+
+        # 일별 시세·수급 이력 파일. 화면이 700일 백테스트를 볼 때 네이버 35페이지를
+        # 받지 않고 이 파일을 읽게 한다(콜드 로드에서 5~7초짜리 한 덩어리였다).
+        try:
+            daily_history.tick(now, DIGEST_TICKER, log=log)
+        except Exception as exc:
+            log(f"일별이력 오류: {type(exc).__name__}: {exc}")
 
         # AI 분석. 예약 시각(08~20시 정시)마다 한 번씩 만든다.
         # 예전에는 대시보드가 만들었는데, Streamlit은 브라우저가 붙어야 스크립트를
