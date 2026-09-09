@@ -363,6 +363,20 @@ st.markdown(
         opacity: 1 !important;
         transition: none !important;
     }
+    /* DRAM 추이 차트의 품목 선택 드롭다운(Plotly updatemenu). Streamlit의 plotly
+       테마가 배경·글자를 밝게 덮어써서 다크 화면에서 글자가 안 보였다. SVG라 CSS로
+       직접 색을 박는다. */
+    .js-plotly-plot .updatemenu-item-rect,
+    .js-plotly-plot .updatemenu-header {
+        fill: #1e1e26 !important;
+        stroke: #555 !important;
+    }
+    .js-plotly-plot .updatemenu-item-text {
+        fill: #fafafa !important;
+    }
+    .js-plotly-plot .updatemenu-item-rect:hover {
+        fill: #34343f !important;
+    }
     div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
         font-size: 1.1rem !important;
     }
@@ -2419,20 +2433,52 @@ def _window_decline(price: pd.Series, window: int) -> pd.Series:
 
 
 def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix: str, chart_key: str) -> None:
-    """가격대가 서로 다른 여러 품목을 한 그래프에 함께 그리면 스케일 차이로 잘 안 보이므로,
-    그래프 우측에서 품목을 하나 골라 해당 품목만 그린다."""
-    chart_col, toggle_col = st.columns([5, 1])
-    with toggle_col:
-        st.caption("표시 품목")
-        selected = st.radio("표시 품목", items, key=f"{key_prefix}_select", label_visibility="collapsed")
-    with chart_col:
-        hist = history[history["품목"] == selected]
-        # 기록이 쌓일수록 점이 빽빽해져 선이 안 보이므로 마커 없이 선만 그린다
-        fig = px.line(hist, x="날짜", y="평균가(USD)")
-        _style_chart_mobile(fig, title=selected, show_legend=False)
-        fig.update_xaxes(rangeslider_visible=True)
-        st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
-        st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
+    """가격대가 서로 다른 여러 품목을 한 그래프에 겹쳐 그리면 스케일 차이로 잘 안 보이므로,
+    한 번에 한 품목만 보이게 하고 나머지는 숨긴다.
+
+    품목 전환은 Plotly 드롭다운(updatemenus)으로 처리한다 — 클릭이 브라우저 안에서
+    trace 가시성만 바꾸므로 서버로 왕복하지 않는다. 예전에는 st.radio라서 클릭 한 번에
+    이 탭 프래그먼트가 통째로 다시 돌았고(CSV 재기록·표 2개·차트 2개 재렌더) 4초 가까이
+    걸렸다. 이제는 사실상 즉시다.
+    """
+    n = len(items)
+    fig = go.Figure()
+    for i, item in enumerate(items):
+        hist = history[history["품목"] == item].sort_values("날짜")
+        fig.add_trace(go.Scatter(
+            x=hist["날짜"], y=hist["평균가(USD)"], name=item,
+            mode="lines", visible=(i == 0),
+        ))
+
+    if n > 1:
+        # 각 버튼은 자기 trace만 보이게 한다. Plotly가 가시성 변화에 맞춰 y축을 알아서
+        # 다시 잡으므로(품목마다 가격대가 다르다) 여기서 yaxis.autorange를 넘기지 않는다 —
+        # fixedrange가 걸린 축에 relayout으로 autorange를 함께 주면 "axis scaling" 오류가 난다.
+        buttons = [
+            dict(label=item, method="update",
+                 args=[{"visible": [j == i for j in range(n)]},
+                       {"title.text": item}])
+            for i, item in enumerate(items)
+        ]
+        fig.update_layout(updatemenus=[dict(
+            type="dropdown", direction="down", active=0,
+            buttons=buttons, showactive=True,
+            x=1.0, xanchor="right", y=1.16, yanchor="top",
+            pad=dict(t=2, r=2),
+            # 다크 테마에 맞춘다. 기본값(흰 배경 + 밝은 글자)은 글자가 안 보였다.
+            bgcolor="#1e1e26", bordercolor="#555", borderwidth=1,
+            font=dict(color="#fafafa", size=12),
+        )])
+
+    _style_chart_mobile(fig, title=items[0] if items else None, show_legend=False)
+    # _style_chart_mobile은 모든 축에 fixedrange=True를 건다. 그 상태로 품목을 바꾸면
+    # (visible 토글) Plotly가 잠긴 y축을 autorange하려다 "axis scaling" 오류를 낸다.
+    # y축만 풀어 준다 — 세로 줌이 열리지만, 스크롤 오작동의 원인인 가로 줌은 x축에
+    # 그대로 잠겨 있고 x는 rangeslider로 조정한다.
+    fig.update_yaxes(fixedrange=False, autorange=True)
+    fig.update_xaxes(rangeslider_visible=True)
+    st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
+    st.caption("오른쪽 위에서 품목을 고르면 바로 바뀝니다. 차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
 
 
 DOWNTREND_WINDOW = 20
