@@ -16,7 +16,9 @@ import os
 import pandas as pd
 
 STORE_DIR = os.environ.get("DAILY_HISTORY_DIR", "data")
-COLUMNS = ["날짜", "종가", "거래량", "기관", "외국인"]
+# 개인도 저장한다. 예전 수급 소스(frgn.naver)는 개인을 안 줘서 -(기관+외국인)으로
+# 유도했는데, 기타법인이 빠져 실제와 크게 어긋났다. 새 소스(trend API)는 직접 준다.
+COLUMNS = ["날짜", "종가", "거래량", "기관", "외국인", "개인"]
 
 # 파일이 이보다 오래되면 못 믿는다. 주말·연휴를 건너뛰어야 하므로 달력 기준으로 넉넉히
 # 잡는다. 오늘·어제치는 어차피 fetch_latest_bars(ttl=60)가 위에 덧씌운다.
@@ -47,11 +49,7 @@ def load(ticker: str, min_days: int) -> pd.DataFrame | None:
     newest = df["날짜"].max()
     if (pd.Timestamp(dt.date.today()) - newest).days > FRESH_DAYS:
         return None
-    out = df.sort_values("날짜").tail(min_days).reset_index(drop=True)
-    # '개인'은 파일에 담지 않고 여기서 되살린다. 같은 줄의 기관·외국인에서 바로 나오는
-    # 파생값이라 저장해 둘 이유가 없고, 부르는 쪽(조기신호 등)은 이 컬럼을 기대한다.
-    out["개인"] = -(out["기관"] + out["외국인"])
-    return out
+    return df.sort_values("날짜").tail(min_days).reset_index(drop=True)
 
 
 def save(ticker: str, df: pd.DataFrame) -> None:

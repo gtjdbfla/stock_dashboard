@@ -1,6 +1,6 @@
 """장 마감 후 투자자 수급이 어느 경로에 가장 먼저 올라오는지 기록한다.
 
-대시보드는 지금 네이버 frgn.naver에서 수급을 받는데, 마감(15:30) 후 한참 뒤에야
+대시보드는 지금 네이버 모바일 trend API에서 수급을 받는데, 마감(15:30) 후 한참 뒤에야
 올라온다. 어느 경로가 가장 빠른지 실측하려고 브라우저 쪽에서 감시를 걸었더니
 세션이 끊기면서 첫 샘플만 남고 죽었다. 그래서 24시간 도는 수집기에 붙인다.
 
@@ -10,7 +10,6 @@
 """
 import csv
 import datetime as dt
-import io
 import os
 
 import pandas as pd
@@ -26,21 +25,6 @@ WATCH_TO = dt.time(21, 0)
 PROBE_SEC = 300
 
 _UA = {"User-Agent": "Mozilla/5.0"}
-
-
-def _naver_frgn(ticker: str) -> dt.date | None:
-    r = requests.get("https://finance.naver.com/item/frgn.naver",
-                     params={"code": ticker, "page": 1},
-                     headers={**_UA, "Referer": "https://finance.naver.com/"}, timeout=8)
-    r.raise_for_status()
-    r.encoding = "euc-kr"
-    table = pd.read_html(io.StringIO(r.text))[3]
-    table.columns = ["날짜", "종가", "전일비", "등락률", "거래량",
-                     "기관", "외국인순매매", "외국인보유", "외국인비율"]
-    table = table.dropna(subset=["날짜"])
-    if table.empty:
-        return None
-    return pd.to_datetime(str(table.iloc[0]["날짜"]), format="%Y.%m.%d").date()
 
 
 def _daum(ticker: str) -> dt.date | None:
@@ -82,9 +66,10 @@ def _naver_daily(ticker: str) -> dt.date | None:
 
 
 SOURCES = {
-    "naver_frgn": _naver_frgn,          # 대시보드가 지금 쓰는 경로
+    # naver_frgn(finance.naver.com/item/frgn.naver)은 2026-09-10 저녁 네이버가 PC 종목
+    # 페이지를 새 SPA로 바꾸면서 표가 사라져 못 쓴다. 대시보드도 naver_trend로 옮겼다.
     "daum_investor": _daum,
-    "naver_trend": _naver_mobile("trend"),
+    "naver_trend": _naver_mobile("trend"),   # 대시보드가 지금 쓰는 경로
     "naver_integration": _naver_mobile("integration"),
     "naver_daily_ohlcv": _naver_daily,  # 수급 아님 (거래량·종가 확정 시점 비교용)
 }

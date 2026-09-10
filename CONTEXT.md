@@ -63,12 +63,19 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **프롬프트 길이는 속도와 무관하다 — 다이어트로 시간을 줄이려 하지 말 것.** 18,261자 38.9초 / 17,678자 49.7초 / 15,633자 48.1초. 그날 API가 붐비는 정도가 지배한다. 줄일 이유가 있다면 속도가 아니라 정보 중복 때문이어야 한다.
 - **통합 신호·선물 경보는 프롬프트에서 뺐다**(사용자 판단: "맞지 않는 지표"). 탭은 남아 있지만 프롬프트에는 안 들어간다. **요청 없이 되살리지 말 것.**
 - **공매도 잔고·대차잔고는 넣지 않는다.** 출처를 전부 훑고 무료로는 불가능하다고 결론냈고 사용자도 "포기"에 합의했다. 요청이 다시 오면 이 결론을 먼저 말하고 유일하게 남은 길(KRX OpenAPI 키 발급)만 제시한다. **스크래핑 우회는 제안하지 않는다.** 수급 압력은 외국인·기관 순매수, 보유율 추이, 코스피 전체 수급, 하락 조기신호로 상당 부분 커버된다.
-- **목표주가는 네이버 리서치 상세 페이지가 유일한 길**(`research/company_read.naver?nid=`). 한경 컨센서스·wisereport·PDF 파싱은 전부 실측하고 탈락. 컨센서스는 최근 3개월 **증권사별 최신 1건씩만 평균**(다작 증권사가 평균을 좌우하지 않게). FnGuide와 값이 다른 건 정상(모집단 차이) — 통일하지 말고 라벨에 어느 집계인지 박는다.
+- **목표주가는 네이버 리서치 상세가 유일한 길**(`m.stock.naver.com/api/research/company/{researchId}`의 `goalPrice`). 한경 컨센서스·wisereport·PDF 파싱은 전부 실측하고 탈락. 컨센서스는 최근 3개월 **증권사별 최신 1건씩만 평균**(다작 증권사가 평균을 좌우하지 않게). FnGuide와 값이 다른 건 정상(모집단 차이) — 통일하지 말고 라벨에 어느 집계인지 박는다.
 - **`llm.py`와 app의 `_stream_gemini`는 별개다. 양쪽 설정을 따로 맞춰야 한다.**
 - **수집기가 별도 컨테이너인 이유:** Streamlit은 브라우저가 접속해야 스크립트를 실행한다. 대시보드 안에 넣으면 아무도 안 보는 아침 프리장(08~09시)이 통째로 빈다.
 
 ## 5. 반복해서 걸린 함정
 
+- **네이버 레거시 종목 페이지는 2026-09-10 저녁에 죽었다.** `finance.naver.com/item/frgn.naver`·`/item/board.naver`·`/research/company_list.naver`가 전부 `<table>` 0개짜리 같은 껍데기(116KB)를 200으로 돌려준다. `pd.read_html`이 lxml에서 "No tables found"로 실패하고 bs4로 넘어가다 html5lib가 없어 **`ImportError: Missing optional dependency 'html5lib'`**로 터졌다 — 에러 이름만 보면 의존성 문제 같지만 **html5lib를 깔아도 안 고쳐진다**(표가 없으니까). 같은 증상이 또 나오면 먼저 `resp.text.count("<table")`을 찍어 볼 것.
+  - 옮긴 곳: 일별 수급·종가·거래량 → `m.stock.naver.com/api/stock/{code}/trend`(pageSize 최대 60, `page`는 무시되고 **`bizdate`가 커서** — 그 날짜보다 앞선 구간을 준다). 리서치 목록 → `/api/research/stock/{code}`(pageSize·page 정상), 상세 → `/api/research/company/{researchId}`(`goalPrice`·`opinion`·`attachUrl`을 구조화해서 준다. 정규식 파싱이 통째로 사라졌다).
+  - **살아 있는 것**: `sise/investorDealTrendDay.naver`·`sise/programDealTrendDay.naver`·`item/sise_day.naver`(시장 전체·일봉 쪽 레거시 페이지는 그대로 표를 준다).
+  - **못 살린 것**: 거래원 외국계추정합(`fetch_foreign_desk`, `FOREIGN_DESK_ENABLED=False`)과 종목토론방(`_fetch_board_page`). 모바일 앱에 이 화면 자체가 없다 — 종목 페이지가 부르는 API 212개를 훑어도 경로가 없었다.
+- **`개인` 순매수를 `-(기관+외국인)`으로 유도하지 말 것.** 옛 frgn 표가 개인을 안 줘서 그렇게 썼는데 기타법인이 빠진다. 2026-08-20부터 하루 **약 64만주씩 거의 일정하게** 어긋났다(자사주 매입으로 보인다). 새 trend API는 `individualPureBuyQuant`를 직접 준다. `daily_history`도 개인을 저장한다(파생값이라 빼뒀던 걸 되돌렸다).
+- **다크 화면의 작은 SVG 글자에 흰색을 쓰지 말 것.** Plotly updatemenu 라벨을 `#fafafa`/굵기 600으로 맞춰도 "글자가 깨진 것처럼 보인다"는 지적을 두 번 받았다. 계산된 색·굵기는 정상이었다 — 어두운 면 위 흰 획이 번지는(halation) 문제다. **밝은 면(#e9ebef) + 어두운 글자(#0e1117)**로 뒤집으면 같은 크기에서 또렷하다. 굵기는 `font-weight` 대신 `paint-order: stroke fill` + 0.5px 외곽선으로 준다(가짜 굵기는 작은 글자를 뭉갠다).
+- **드롭다운 라벨은 항목들이 공유하는 토큰을 떼고 보여준다**(`_short_item_labels`). `DDR5 16Gb (2Gx8) 4800/5600` 26자가 들어가면 상자가 차트 폭의 절반(209/458px)을 먹는다. 공통 토큰을 떼면 136px. 전체 이름은 바로 위 표에 있다.
 - **Caddy에 `reverse_proxy 컨테이너명:포트` 직접 지정 금지.** 재빌드로 IP가 바뀌어도 옛 IP를 물고 502를 낸다. 반드시 `dynamic a { name ... refresh 5s }`.
 - **데이터를 프롬프트에 넣는 것만으로는 모델이 안 쓴다 — 출력 형식에 자리를 만들어야 한다.** 재무 요약을 넣었더니 한 글자도 인용하지 않았다(10개 섹션 어디에도 쓸 자리가 없었다). 출처 갈래에 `[재무]`를 추가하고 '지금 위치'에 한 줄을 요구하자 바로 인용했다. **새 재료엔 반드시 출력 형식도 같이 손볼 것.**
 - **탭 렌더에 묶인 요약을 조심할 것.** `overheat_summary`·`dram_summary`는 전역이라 **그 탭이 그려질 때만** 채워진다. 그래서 AI 분석 생성은 반드시 **탭 렌더 루프 다음**에서 한다(MAP.md §13). 새 요약은 탭과 무관한 `build_*`로 만드는 쪽이 안전하다.

@@ -100,7 +100,7 @@ from ai_inputs import (  # noqa: F401
     _consensus_log,
     _fetch_adr_bars,
     _fetch_dram_soup,
-    _fetch_frgn_page,
+    _fetch_trend_page,
     _korea_session_now,
     _rolling_slope,
     _signed_pct,
@@ -393,25 +393,34 @@ st.markdown(
     /* DRAM 추이 차트의 품목 선택 드롭다운(Plotly updatemenu). Streamlit의 plotly
        테마가 배경·글자를 밝게 덮어써서 다크 화면에서 글자가 안 보였다. SVG라 CSS로
        직접 색을 박는다. */
-    .js-plotly-plot .updatemenu-header,
+    /* 밝은 면 + 어두운 글자로 간다. 어두운 면에 흰 글자를 얹으면 작은 SVG 글자에서
+       획이 번져(halation) '글자가 깨진 것처럼' 보인다 — 흰색·굵기 600으로 맞춰도
+       마찬가지였고 두 번 지적받았다. 반대로 두면 같은 크기에서 획이 또렷하다.
+       밝은 상자는 어두운 화면에서 눈에 먼저 들어와서 '여기가 조작하는 곳'이라는
+       신호도 같이 준다. */
+    .js-plotly-plot .updatemenu-header .updatemenu-item-rect,
     .js-plotly-plot .updatemenu-item-rect {
-        fill: #262730 !important;
-        stroke: #41444c !important;
+        fill: #e9ebef !important;
+        stroke: #e9ebef !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
-    /* SVG 13px 글자는 다크 배경에서 획이 얇아 옆의 HTML 표 글자보다 흐리게 보인다.
-       색은 이미 흰색(#fafafa)이므로 굵기로 무게를 맞춘다. */
-    .js-plotly-plot .updatemenu-item-text {
-        fill: #fafafa !important;
+    .js-plotly-plot text.updatemenu-item-text {
+        fill: #0e1117 !important;
         font-weight: 600 !important;
+        /* 브라우저가 지어내는 가짜 굵기(synthetic bold)는 작은 글자에서 뭉갠다.
+           글자 외곽선을 얇게 덧그려 획을 또렷하게 두껍게 한다. */
+        paint-order: stroke fill;
+        stroke: #0e1117 !important;
+        stroke-width: 0.5px !important;
+        stroke-linejoin: round;
     }
-    .js-plotly-plot .updatemenu-header:hover,
+    .js-plotly-plot .updatemenu-header:hover .updatemenu-item-rect,
     .js-plotly-plot .updatemenu-item-rect:hover {
-        fill: #3a3b45 !important;
-        stroke: #5b5f68 !important;
+        fill: #ffffff !important;
+        stroke: #ffffff !important;
     }
-    .js-plotly-plot .updatemenu-header-arrow {
-        fill: #a9adb5 !important;
+    .js-plotly-plot text.updatemenu-header-arrow {
+        fill: #0e1117 !important;
     }
     div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
         font-size: 1.1rem !important;
@@ -2330,9 +2339,9 @@ POST_CLOSE_PROBE_SEC = 300
 
 
 def _today_flow_published(ticker: str) -> bool:
-    """오늘자 투자자 수급이 네이버에 올라왔는지 1페이지만 받아 확인한다."""
+    """오늘자 투자자 수급이 네이버에 올라왔는지 한 묶음만 받아 확인한다."""
     try:
-        page = _fetch_frgn_page(ticker, 1)
+        page = _fetch_trend_page(ticker)
     except Exception:
         return False
     if page.empty:
@@ -2485,6 +2494,33 @@ def _window_decline(price: pd.Series, window: int) -> pd.Series:
     return price / price.shift(window) - 1
 
 
+def _short_item_labels(items: list[str]) -> list[str]:
+    """품목 이름에서 **모든** 항목이 공유하는 토큰을 떼어 낸다.
+
+    드롭다운 상자는 가장 긴 라벨에 맞춰 커진다. 'DDR5 16Gb (2Gx8) 4800/5600'처럼
+    26자가 들어가면 상자가 차트 폭의 절반(209px/458px)을 먹고, 그 안의 SVG 글자가
+    뭉개져 읽기 힘들었다. 네 항목이 전부 '16Gb (2Gx8)'을 달고 있으면 그 부분은
+    구분에 아무 도움이 안 되므로 뗀다.
+
+      DDR5 16Gb (2Gx8) 4800/5600 -> DDR5 4800/5600
+      DDR5 UDIMM 16GB 4800/5600  -> UDIMM 16GB
+
+    전체 이름은 바로 위 표와 차트 hover에 그대로 있으니 뜻이 사라지지 않는다.
+    """
+    if len(items) < 2:
+        return list(items)
+    token_lists = [item.split() for item in items]
+    common = set(token_lists[0])
+    for tokens in token_lists[1:]:
+        common &= set(tokens)
+    short = [" ".join(t for t in tokens if t not in common) for tokens in token_lists]
+    # 다 떼고 나면 빈 이름이 되거나 서로 같아질 수 있다(예: 토큰이 하나뿐인 품목).
+    # 그럴 땐 줄이지 않는다 — 짧은 것보다 구분되는 게 먼저다.
+    if any(not label for label in short) or len(set(short)) != len(items):
+        return list(items)
+    return short
+
+
 def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix: str, chart_key: str) -> None:
     """가격대가 서로 다른 여러 품목을 한 그래프에 겹쳐 그리면 스케일 차이로 잘 안 보이므로,
     한 번에 한 품목만 보이게 하고 나머지는 숨긴다.
@@ -2495,6 +2531,7 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     걸렸다. 이제는 사실상 즉시다.
     """
     n = len(items)
+    labels = _short_item_labels(items)
     fig = go.Figure()
     for i, item in enumerate(items):
         hist = history[history["품목"] == item].sort_values("날짜")
@@ -2509,9 +2546,9 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         # fixedrange가 걸린 축에 relayout으로 autorange를 함께 주면 "axis scaling" 오류가 난다.
         # 고른 품목 이름은 드롭다운 자신이 보여주므로 제목을 따로 바꾸지 않는다.
         buttons = [
-            dict(label=item, method="update",
+            dict(label=label, method="update",
                  args=[{"visible": [j == i for j in range(n)]}])
-            for i, item in enumerate(items)
+            for i, label in enumerate(labels)
         ]
         # 플롯 **위쪽 여백**에 오른쪽 정렬로 둔다. 섹션 제목이 왼쪽에 있으므로
         # 제목-왼쪽 / 선택-오른쪽으로 한 줄처럼 읽힌다.
@@ -2525,8 +2562,8 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
             buttons=buttons, showactive=True,
             x=1, xanchor="right", y=1.0, yanchor="bottom",
             pad=dict(t=0, b=8, l=0, r=0),
-            bgcolor="#262730", bordercolor="#41444c", borderwidth=1,
-            font=dict(color="#fafafa", size=14),
+            bgcolor="#e9ebef", bordercolor="#e9ebef", borderwidth=1,
+            font=dict(color="#0e1117", size=15),
         )])
 
     # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
@@ -2543,7 +2580,8 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     fig.update_yaxes(fixedrange=False, autorange=True)
     fig.update_xaxes(rangeslider_visible=True)
     st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
-    st.caption("오른쪽 위 상자에서 품목을 고르면 바로 바뀝니다. 차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
+    st.caption("오른쪽 위 상자에서 품목을 고르면 바로 바뀝니다(이름은 위 표 기준으로 줄여 적었습니다). "
+               "차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
 
 
 DOWNTREND_WINDOW = 20

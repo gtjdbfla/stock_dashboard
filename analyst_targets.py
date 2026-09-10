@@ -4,10 +4,13 @@ FnGuide가 주는 컨센서스(wcomp의 snpTargetChart)는 주 1회만 갱신된
 2026-08-31에 LS증권이 목표주가를 330만->240만으로 내렸을 때, FnGuide 값은
 2026-08-28자 3,317,917원에 그대로 멈춰 있었다. 그래서 원자료를 직접 모은다.
 
-출처는 네이버 리서치 '리포트 상세' 페이지다. 목록에는 목표가가 없지만 상세에는
-`목표가 2,800,000 | 투자의견 매수` 형태로 구조화돼 있어서, PDF를 열지 않고도 뽑힌다.
-(PDF 본문 파싱도 되지만 표지가 이미지인 리포트에서 64자만 나오는 등 실패가 잦다.
- 상세 페이지는 그런 리포트도 값을 준다.)
+출처는 네이버 리서치 '리포트 상세'다. 목록에는 목표가가 없지만 상세에는 goalPrice가
+정수로 들어 있어서, PDF를 열지 않고도 뽑힌다. (PDF 본문 파싱도 되지만 표지가 이미지인
+리포트에서 64자만 나오는 등 실패가 잦다. 상세는 그런 리포트도 값을 준다.)
+
+2026-09-10 네이버가 PC 리서치 페이지(finance.naver.com/research/*)를 표 없는 새 SPA로
+바꿔서 HTML 스크래핑이 끊겼다. 같은 데이터가 모바일 JSON API에 있고, 예전에 정규식으로
+긁던 목표가·투자의견을 goalPrice·opinion 필드로 그냥 준다.
 
 한계 하나는 분명히 해 둔다: 네이버가 싣는 증권사만 잡힌다. LS증권처럼 미수록
 증권사가 목표주가를 바꾼 건은 여기 안 들어온다(그쪽은 뉴스 질의가 맡는다).
@@ -20,10 +23,12 @@ import statistics
 import time
 
 import requests
-from bs4 import BeautifulSoup
 
 KST = dt.timezone(dt.timedelta(hours=9))
-BASE = "https://finance.naver.com/research/"
+LIST_API = "https://m.stock.naver.com/api/research/stock/{ticker}"
+DETAIL_API = "https://m.stock.naver.com/api/research/company/{nid}"
+# 옛 목록 페이지 한 장과 같은 분량. 100까지 받아주지만 페이지 개념을 맞춰 둔다.
+PAGE_SIZE = 20
 STORE = os.environ.get("ANALYST_TARGET_FILE", "data/analyst_targets.csv")
 _UA = {"User-Agent": "Mozilla/5.0"}
 
@@ -34,61 +39,64 @@ FIELDS = ["nid", "작성일", "증권사", "목표주가", "투자의견", "제�
 # 목표가가 빈 리포트를 며칠까지 다시 열어볼지. 이보다 오래된 건은 확정으로 본다.
 RETRY_EMPTY_DAYS = int(os.environ.get("TARGET_RETRY_EMPTY_DAYS", "7"))
 
-_TP = re.compile(r"목표가\s*([\d,]{5,12})")
-_OP = re.compile(r"투자의견\s*([가-힣A-Za-z.]{1,12})")
-
-
-def _text(html: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
-
-
 def list_reports(ticker: str, pages: int = 2) -> list[dict]:
-    """리포트 목록에서 nid·증권사·작성일을 뽑는다. 목표가는 여기 없다."""
+    """리포트 목록에서 nid·증권사·작성일·제목을 뽑는다. 목표가는 여기 없다."""
     out: list[dict] = []
     for page in range(1, pages + 1):
-        r = requests.get(BASE + "company_list.naver",
-                         params={"searchType": "itemCode", "itemCode": ticker,
-                                 "page": page},
-                         headers=_UA, timeout=15)
-        r.encoding = "euc-kr"
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tr in soup.select("table.type_1 tr"):
-            tds = tr.select("td")
-            if len(tds) < 5:
-                continue
-            a = tds[1].select_one("a[href*='company_read']")
-            date = tds[4].get_text(strip=True)
-            if not a or not re.match(r"\d{2}\.\d{2}\.\d{2}", date):
-                continue
-            m = re.search(r"nid=(\d+)", a["href"])
-            if not m:
+        try:
+            r = requests.get(LIST_API.format(ticker=ticker),
+                             params={"pageSize": PAGE_SIZE, "page": page},
+                             headers={**_UA, "Referer": "https://m.stock.naver.com/"},
+                             timeout=15)
+            r.raise_for_status()
+            rows = r.json()
+        except Exception:
+            break
+        if not isinstance(rows, list) or not rows:
+            break
+        for x in rows:
+            nid = str(x.get("researchId") or "").strip()
+            date = str(x.get("writeDate") or "").strip()
+            # 옛 목록은 '26.09.07'이라 변환이 필요했지만 API는 이미 ISO로 준다.
+            if not nid or not re.match(r"\d{4}-\d{2}-\d{2}$", date):
                 continue
             out.append({
-                "nid": m.group(1),
-                "작성일": "20" + date.replace(".", "-"),
-                "증권사": tds[2].get_text(strip=True),
-                "제목": a.get_text(strip=True),
+                "nid": nid,
+                "작성일": date,
+                "증권사": str(x.get("brokerName") or "").strip(),
+                "제목": str(x.get("title") or "").strip(),
+                "조회수": str(x.get("readCount") or "").strip(),
             })
     return out
 
 
+def fetch_detail(nid: str) -> dict:
+    """리포트 상세. 목표가·투자의견·PDF 주소·요약본문이 구조화돼 들어 있다.
+
+    실패는 빈 dict로 돌려준다 — 한 건이 안 열려도 나머지 수집은 계속돼야 한다.
+    """
+    try:
+        r = requests.get(DETAIL_API.format(nid=nid),
+                         headers={**_UA, "Referer": "https://m.stock.naver.com/"},
+                         timeout=15)
+        r.raise_for_status()
+        return (r.json() or {}).get("researchContent") or {}
+    except Exception:
+        return {}
+
+
 def fetch_target(nid: str) -> tuple[int | None, str | None]:
     """리포트 상세에서 (목표주가, 투자의견). 없으면 (None, None)."""
+    detail = fetch_detail(nid)
     try:
-        r = requests.get(BASE + "company_read.naver",
-                         params={"nid": nid, "page": 1}, headers=_UA, timeout=15)
-        r.encoding = "euc-kr"
-        txt = _text(r.text)
-        tp = _TP.search(txt)
-        op = _OP.search(txt)
-        price = int(tp.group(1).replace(",", "")) if tp else None
-        # '투자의견 없음'은 목표가를 안 준 리포트(산업 코멘트 등)라 의견도 버린다.
-        opinion = op.group(1).strip() if op else None
-        if opinion == "없음":
-            opinion = None
-        return price, opinion
-    except Exception:
-        return None, None
+        price = int(detail.get("goalPrice") or 0) or None
+    except (TypeError, ValueError):
+        price = None
+    opinion = str(detail.get("opinion") or "").strip() or None
+    # '투자의견 없음'은 목표가를 안 준 리포트(산업 코멘트 등)라 의견도 버린다.
+    if opinion == "없음":
+        opinion = None
+    return price, opinion
 
 
 def load() -> list[dict]:

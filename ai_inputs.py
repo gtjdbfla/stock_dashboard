@@ -44,6 +44,19 @@ DEFAULT_TICKER = "000660"
 
 NAVER_FRGN_URL = "https://finance.naver.com/item/frgn.naver"
 
+# 2026-09-10 저녁, 네이버가 PC 종목 페이지(finance.naver.com/item/*)를 표 없는 새 SPA로
+# 바꿨다. frgn.naver는 200을 주지만 <table>이 0개인 껍데기라 pd.read_html이 lxml에서
+# 실패하고 bs4로 넘어가다 html5lib가 없어 ImportError로 터졌다 — 에러 이름만 보면
+# 의존성 문제처럼 보이지만 실제 원인은 '표가 사라진' 쪽이다.
+# 같은 데이터가 모바일 JSON API에 그대로 있고, 개인 순매수까지 준다.
+NAVER_TREND_API = "https://m.stock.naver.com/api/stock/{ticker}/trend"
+# 한 번에 주는 최대치. 61 이상을 요구하면 400을 준다.
+TREND_PAGE_SIZE = 60
+# page 파라미터는 무시되고 bizdate(그 날짜보다 앞선 구간)만 커서로 먹는다. 순차로
+# 거슬러 올라가야 하므로 상한을 둔다 — 40묶음이면 2400거래일(약 10년)이다.
+MAX_TREND_PAGES = 40
+TREND_COLUMNS = ["날짜", "종가", "거래량", "기관", "외국인", "개인"]
+
 
 NAVER_NEWS_URL = "https://search.naver.com/search.naver"
 
@@ -346,42 +359,81 @@ def fetch_intraday_price(ticker: str) -> pd.DataFrame:
     return df[["시각", "현재가"]].sort_values("시각").reset_index(drop=True)
 
 
-def _fetch_frgn_page(ticker: str, page: int) -> pd.DataFrame:
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
+def _parse_trend_number(value) -> float:
+    """'+287,228' · '-956,724' · '1,853,000' 같은 표기를 숫자로. 빈 값은 0."""
+    text = str(value or "").replace(",", "").replace("+", "").replace("%", "").strip()
+    if not text or text == "-":
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _fetch_trend_page(ticker: str, before: "pd.Timestamp | None" = None) -> pd.DataFrame:
+    """투자자별 매매동향 한 묶음(최대 60거래일). before를 주면 그 날짜보다 앞선 구간을 준다.
+
+    옛 frgn.naver 스크래핑을 대체한다. 컬럼 계약은 그대로 두되 '개인'이 하나 늘었다.
+    예전에는 -(기관+외국인)으로 유도했는데 기타법인이 빠져서 실제와 크게 어긋났다 —
+    2026-08-20부터 하루 약 64만주씩 거의 일정하게 벌어졌다(자사주 매입으로 보인다).
+    이 API는 개인 순매수를 직접 주므로 유도하지 않는다.
+    """
+    params: dict = {"pageSize": TREND_PAGE_SIZE}
+    if before is not None:
+        params["bizdate"] = pd.Timestamp(before).strftime("%Y%m%d")
     resp = requests.get(
-        NAVER_FRGN_URL, params={"code": ticker, "page": page}, headers=headers, timeout=10
+        NAVER_TREND_API.format(ticker=ticker), params=params,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"},
+        timeout=10,
     )
     resp.raise_for_status()
-    resp.encoding = "euc-kr"
-    tables = pd.read_html(StringIO(resp.text))
-    df = tables[3]
-    df.columns = ["날짜", "종가", "전일비", "등락률", "거래량", "기관", "외국인_순매매량", "외국인_보유주수", "외국인_보유율"]
-    df = df.dropna(subset=["날짜"]).copy()
-    df["날짜"] = pd.to_datetime(df["날짜"], format="%Y.%m.%d")
-    df["종가"] = df["종가"].astype(float)
-    df["기관"] = df["기관"].astype(float)
-    df["거래량"] = pd.to_numeric(df["거래량"].astype(str).str.replace(",", ""), errors="coerce")
-    return df[["날짜", "종가", "거래량", "기관", "외국인_순매매량"]].rename(columns={"외국인_순매매량": "외국인"})
+    rows = resp.json()
+    if not isinstance(rows, list) or not rows:
+        return pd.DataFrame(columns=TREND_COLUMNS)
+    df = pd.DataFrame([{
+        "날짜": pd.to_datetime(str(r.get("bizdate")), format="%Y%m%d"),
+        "종가": _parse_trend_number(r.get("closePrice")),
+        "거래량": _parse_trend_number(r.get("accumulatedTradingVolume")),
+        "기관": _parse_trend_number(r.get("organPureBuyQuant")),
+        "외국인": _parse_trend_number(r.get("foreignerPureBuyQuant")),
+        "개인": _parse_trend_number(r.get("individualPureBuyQuant")),
+    } for r in rows if r.get("bizdate")])
+    if df.empty:
+        return pd.DataFrame(columns=TREND_COLUMNS)
+    return df.sort_values("날짜").reset_index(drop=True)
+
+
+def _walk_trend(ticker: str, enough) -> "list[pd.DataFrame]":
+    """bizdate 커서로 과거로 거슬러 올라가며 enough(모인 묶음들)가 True가 될 때까지 받는다.
+
+    옛 frgn.naver는 page=N이라 8장을 병렬로 받았지만, 이 API는 page를 무시하고 커서만
+    먹으므로 순차로 받아야 한다. 700거래일이면 12번, 실측 1.6초다.
+    """
+    frames: "list[pd.DataFrame]" = []
+    cursor = None
+    for _ in range(MAX_TREND_PAGES):
+        page = _fetch_trend_page(ticker, before=cursor)
+        if page.empty:
+            break
+        frames.append(page)
+        if enough(frames):
+            break
+        oldest = page["날짜"].min()
+        # 상장 초기까지 닿으면 커서가 더 이상 뒤로 안 간다. 그때 멈춘다.
+        if cursor is not None and oldest >= cursor:
+            break
+        cursor = oldest
+    return frames
 
 
 def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
-    frames = []
-    max_pages = 25
-    for page in range(1, max_pages + 1):
-        page_df = _fetch_frgn_page(ticker, page)
-        if page_df.empty:
-            break
-        frames.append(page_df)
-        if page_df["날짜"].min() <= cutoff:
-            break
-
+    frames = _walk_trend(ticker, lambda fs: fs[-1]["날짜"].min() <= cutoff)
     if not frames:
         return pd.DataFrame(columns=["개인", "외국인", "기관"])
 
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜")
     df = df[df["날짜"] >= cutoff].sort_values("날짜")
-    df["개인"] = -(df["기관"] + df["외국인"])
     # 순매수 세 열 뒤에 거래량·종가를 덧붙인다. 순매수는 '누가 샀나'만 알려줄 뿐,
     # 그 날 거래가 얼마나 활발했는지는 알 수 없어서 절대 거래량을 같이 본다.
     # 순매수 열만 골라 쓰는 곳이 있으므로 순서를 지켜 INVESTOR_COLUMNS를 앞에 둔다.
@@ -450,51 +502,27 @@ def fetch_backtest_history(ticker: str, target_days: int = 500) -> pd.DataFrame:
 
 
 def _fetch_backtest_history_web(ticker: str, target_days: int = 500) -> pd.DataFrame:
-    # 페이지끼리 의존이 없으므로(page=N은 그냥 N번째 묶음) 한 장씩 순서대로 기다릴 이유가 없다.
-    # 700일치면 35페이지쯤인데, 순차로 받으면 왕복 지연만 5초가 넘는다.
-    # 1페이지로 '한 장에 몇 줄인지'만 확인한 뒤 나머지를 한꺼번에 받는다.
-    first = _fetch_frgn_page(ticker, 1)
-    if first.empty:
-        return pd.DataFrame(columns=["날짜", "종가", "기관", "외국인", "개인"])
+    """네이버에서 일별 종가·거래량·수급을 target_days 거래일만큼 받아온다.
 
-    frames = [first]
-    per_page = max(len(first), 1)
-    max_pages = 60
-    # 휴장일·중복으로 한두 장 모자랄 수 있어 여유분을 둔다
-    need_pages = min(max_pages, -(-target_days // per_page) + 1)
-    if need_pages > 1:
-        def _safe_page(p: int) -> pd.DataFrame:
-            # 상장 기간이 짧은 종목은 요청한 페이지가 아예 없을 수 있다. 순차 루프일 때는
-            # 빈 페이지에서 멈추면 그만이었지만, 한꺼번에 받는 지금은 한 장이 실패해도
-            # 나머지는 살려야 한다.
-            try:
-                return _fetch_frgn_page(ticker, p)
-            except Exception:
-                return pd.DataFrame()
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for page_df in pool.map(_safe_page, range(2, need_pages + 1)):
-                if not page_df.empty:
-                    frames.append(page_df)
-
+    캐시(파일·st.cache_data)를 거치지 않는 순수 조회다. 저장은 부르는 쪽이 한다.
+    """
+    frames = _walk_trend(ticker, lambda fs: sum(len(f) for f in fs) >= target_days)
     if not frames:
-        return pd.DataFrame(columns=["날짜", "종가", "기관", "외국인", "개인"])
-
-    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜").sort_values("날짜")
-    df["개인"] = -(df["기관"] + df["외국인"])
-    # 여유분으로 한 장 더 받으므로 순차 시절보다 며칠 더 딸려온다. 백테스트 구간이 조회
-    # 시점에 따라 들쭉날쭉해지지 않게 최근 target_days개로 잘라 맞춘다.
+        return pd.DataFrame(columns=TREND_COLUMNS)
+    df = (pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset="날짜")
+            .sort_values("날짜"))
+    # 묶음 단위로 받으므로 요청량보다 며칠 더 딸려온다. 백테스트 구간이 조회 시점에
+    # 따라 들쭉날쭉해지지 않게 최근 target_days개로 잘라 맞춘다.
     return df.tail(target_days).reset_index(drop=True)
 
 
 def fetch_latest_bars(ticker: str) -> pd.DataFrame:
-    """장중 계속 바뀌는 최근 1페이지(며칠치)만 짧은 캐시로 빠르게 가져온다."""
-    page_df = _fetch_frgn_page(ticker, 1)
-    if page_df.empty:
-        return pd.DataFrame(columns=["날짜", "종가", "거래량", "기관", "외국인", "개인"])
-    page_df = page_df.copy()
-    page_df["개인"] = -(page_df["기관"] + page_df["외국인"])
-    return page_df.reset_index(drop=True)
+    """장중 계속 바뀌는 최근 한 묶음(60거래일)만 짧은 캐시로 빠르게 가져온다.
+
+    요청 한 번(약 20KB)이라 옛 frgn 1페이지와 비용이 같다.
+    """
+    return _fetch_trend_page(ticker)
 
 
 def fetch_backtest_history_live(ticker: str, target_days: int = 700) -> pd.DataFrame:
@@ -976,8 +1004,20 @@ def fetch_market_flow() -> dict | None:
     }
 
 
+# 거래원(외국계추정합)은 2026-09-10 현재 되살릴 방법이 없다. 네이버가 PC 종목 페이지를
+# 새 SPA로 바꾸면서 표가 사라졌고, 모바일 앱에는 이 화면 자체가 없다 — 종목 페이지가
+# 부르는 API 212개를 훑어도 거래원 경로가 없었다. 아래 코드는 옛 표 구조를 기억해 두려고
+# 남긴다. 다시 켜려면 FOREIGN_DESK_ENABLED를 True로 하고 새 출처를 물려주면 된다.
+#
+# 이 함수는 화면 상단 5초 프래그먼트에서 ttl=20으로 불린다. 껍데기 페이지를 20초마다
+# 계속 받아 봐야 소용이 없으므로 요청 자체를 하지 않는다.
+FOREIGN_DESK_ENABLED = False
+
+
 def fetch_foreign_desk(ticker: str) -> dict:
     """거래원 표에서 외국계추정합과 매도·매수 상위 증권사를 뽑는다."""
+    if not FOREIGN_DESK_ENABLED:
+        return {}
     r = requests.get(NAVER_FRGN_URL, params={"code": ticker},
                      headers={"User-Agent": "Mozilla/5.0",
                               "Referer": "https://finance.naver.com/"}, timeout=10)
@@ -1305,37 +1345,18 @@ def fetch_trendforce_news(count: int = 5) -> pd.DataFrame:
 
 
 def fetch_analyst_reports(ticker: str, count: int = 5) -> pd.DataFrame:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(
-        NAVER_RESEARCH_URL, params={"searchType": "itemCode", "itemCode": ticker}, headers=headers, timeout=10
-    )
-    resp.encoding = "euc-kr"
-    tables = pd.read_html(StringIO(resp.text))
-    df = tables[0].dropna(subset=["제목"]).copy()
-    df["작성일"] = pd.to_datetime(df["작성일"], format="%y.%m.%d").dt.strftime("%Y-%m-%d")
-    cols = ["제목", "증권사", "작성일"]
-    # 원문 PDF 링크. 표에는 없어서 같은 페이지의 행을 직접 훑어 제목과 짝지어 붙인다.
-    # 링크 개수만 세어 순서대로 붙이면 첨부가 없는 리포트에서 한 칸씩 밀린다(실제로 30행 28링크였다).
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        link_by_title = {}
-        for tr in soup.select("tr"):
-            title_el = tr.select_one("td.file + td, td a[href*='company_read']") or tr.select_one("a")
-            pdf = tr.select_one("a[href$='.pdf']")
-            title = (title_el.get_text(strip=True) if title_el else "")
-            if title and pdf:
-                link_by_title[title] = pdf["href"]
-        if link_by_title:
-            df["url"] = df["제목"].map(lambda t: link_by_title.get(str(t).strip()))
-            cols.append("url")
-    except Exception:
-        pass
-    if "조회수" in df.columns:
-        cols.append("조회수")
-    return df[cols].head(count)
+    """증권사 리포트 목록(제목·증권사·작성일·PDF 주소).
+
+    수집기(analyst_digest)와 같은 함수를 쓴다. 예전에는 양쪽에 거의 같은 스크래핑
+    코드가 따로 있어서, 네이버가 페이지를 바꿨을 때 두 군데를 똑같이 고쳐야 했다.
+    """
+    return analyst_digest.fetch_reports(ticker, count=count)
 
 
 def _fetch_board_page(ticker: str, page: int) -> list[dict]:
+    # 종목토론방도 2026-09-10 네이버 개편으로 표가 사라졌다. 새 페이지에는 type2 표가
+    # 없어 여기서 빈 목록이 나오고, fetch_community_posts가 첫 장에서 바로 멈춘다
+    # (헛도는 요청은 한 번뿐이다). 모바일 API에서 대체 경로를 못 찾았다.
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
     resp = requests.get(
         NAVER_BOARD_URL, params={"code": ticker, "page": page}, headers=headers, timeout=10

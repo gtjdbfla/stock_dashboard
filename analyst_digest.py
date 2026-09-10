@@ -7,15 +7,15 @@
 24시간 도는 수집기가 아침에 한 번 확인하도록 이쪽으로 옮겼다.
 """
 import datetime as dt
-import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
+import analyst_targets
 import llm
 
 KST = dt.timezone(dt.timedelta(hours=9))
@@ -31,34 +31,38 @@ CHECK_FROM = dt.time(8, 0)
 CHECK_TO = dt.time(19, 0)
 CHECK_EVERY_MIN = 120
 
+# 목록에는 PDF 주소가 없어 건별로 상세를 열어야 한다. 40건을 순차로 열면 4초쯤이라
+# 병렬로 받는다(실측 0.6초). 네이버에 부담을 주지 않는 선에서 8개면 충분하다.
+DETAIL_WORKERS = 8
+
+
 def fetch_reports(ticker: str, count: int = 40) -> pd.DataFrame:
-    """네이버가 모아주는 증권사 리포트 목록. PDF 링크는 제목과 짝지어 붙인다."""
-    resp = requests.get(NAVER_RESEARCH_URL,
-                        params={"searchType": "itemCode", "itemCode": ticker},
-                        headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    resp.encoding = "euc-kr"
-    df = pd.read_html(io.StringIO(resp.text))[0].dropna(subset=["제목"]).copy()
-    df["작성일"] = pd.to_datetime(df["작성일"], format="%y.%m.%d").dt.strftime("%Y-%m-%d")
-    cols = ["제목", "증권사", "작성일"]
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        link_by_title = {}
-        for tr in soup.select("tr"):
-            # 행의 첫 <a>는 PDF 아이콘이라 글자가 비어 있다. 제목 칸을 먼저 집어야
-            # 제목↔PDF가 짝이 맞는다(그냥 첫 <a>를 쓰면 url이 전부 None이 된다).
-            title_el = tr.select_one("td.file + td, td a[href*='company_read']") or tr.select_one("a")
-            pdf = tr.select_one("a[href$='.pdf']")
-            title = title_el.get_text(strip=True) if title_el else ""
-            if title and pdf:
-                link_by_title[title] = pdf["href"]
-        if link_by_title:
-            df["url"] = df["제목"].map(lambda t: link_by_title.get(str(t).strip()))
-            cols.append("url")
-    except Exception:
-        pass
-    if "조회수" in df.columns:
-        cols.append("조회수")
-    return df[cols].head(count)
+    """네이버가 모아주는 증권사 리포트 목록. PDF 주소는 상세에서 붙인다.
+
+    2026-09-10 네이버가 PC 리서치 페이지를 표 없는 새 SPA로 바꿔서 표 스크래핑이
+    끊겼다. 모바일 JSON API로 옮겼고, 예전에 '제목↔PDF 짝 맞추기'로 애먹던 부분은
+    상세가 attachUrl을 직접 주므로 사라졌다.
+    """
+    pages = max(1, -(-count // analyst_targets.PAGE_SIZE))
+    items = analyst_targets.list_reports(ticker, pages=pages)[:count]
+    if not items:
+        return pd.DataFrame(columns=["제목", "증권사", "작성일", "url", "조회수"])
+
+    with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+        details = list(pool.map(lambda it: analyst_targets.fetch_detail(it["nid"]), items))
+
+    rows = []
+    for item, detail in zip(items, details):
+        pdf = str(detail.get("attachUrl") or "")
+        rows.append({
+            "제목": item["제목"],
+            "증권사": item["증권사"],
+            "작성일": item["작성일"],
+            # fetch_report_body가 .pdf만 받으므로 여기서 걸러 둔다.
+            "url": pdf if pdf.lower().endswith(".pdf") else None,
+            "조회수": item.get("조회수", ""),
+        })
+    return pd.DataFrame(rows)
 
 
 # ── 리포트 본문(PDF) ──────────────────────────────────────────────────────────
