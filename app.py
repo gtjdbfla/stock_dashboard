@@ -397,34 +397,35 @@ st.markdown(
        Streamlit이 `key=`를 준 요소에 `st-key-<key>` 클래스를 붙여 주므로, DRAM
        차트 두 개(`chart_dram_chip`/`chart_dram_module`)의 감싸는 div로 범위를
        좁힌다. */
-    /* 검정 상자 + 흰 윤곽선 + 흰 글자. 굵기(font-weight)로 무게를 올리면 브라우저가
-       가짜 굵기(synthetic bold)를 지어내 작은 SVG 글자가 뭉개진다 — 대신 글자
-       외곽선을 얇게 덧그려(paint-order) 두께를 준다. */
+    /* 검정+흰색 윤곽선은 화면 전체 톤(#0e1117, 옅은 회색 글자)에 비해 너무 튀고,
+       글자 자체에 얇은 외곽선을 덧그리는 처리(paint-order)가 작은 크기에서 오히려
+       한 겹 더 그린 것처럼 깨져 보인다는 지적을 받았다. 상자를 페이지 배경보다
+       살짝만 밝게 띄우고, 테두리는 이 앱이 실제로 쓰는 링크색(#3d9df3, Streamlit
+       기본 다크 테마 링크 색과 같다)을 옅게 둘러 "여기 누를 수 있다"는 신호만
+       준다. 글자는 순백 대신 옅은 회색으로 낮추고 굵기·외곽선 없이 그대로
+       둔다 — 대비를 확 낮추면 애초에 번짐(halation)이 생길 여지가 없다. */
     div[class*="st-key-chart_dram_"] .updatemenu-header .updatemenu-item-rect,
     div[class*="st-key-chart_dram_"] .updatemenu-item-rect {
-        fill: #000000 !important;
+        fill: #1c1f26 !important;
         fill-opacity: 1 !important;
-        stroke: #ffffff !important;
-        stroke-opacity: 1 !important;
-        stroke-width: 1.4px !important;
+        stroke: #3d9df3 !important;
+        stroke-opacity: 0.45 !important;
+        stroke-width: 1px !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
     div[class*="st-key-chart_dram_"] text.updatemenu-item-text {
-        fill: #ffffff !important;
+        fill: #e3e6ea !important;
         fill-opacity: 1 !important;
         font-weight: 400 !important;
-        paint-order: stroke fill;
-        stroke: #ffffff !important;
-        stroke-width: 0.5px !important;
-        stroke-linejoin: round;
     }
     div[class*="st-key-chart_dram_"] .updatemenu-header:hover .updatemenu-item-rect,
     div[class*="st-key-chart_dram_"] .updatemenu-item-rect:hover {
-        fill: #1c1e24 !important;
-        stroke: #ffffff !important;
+        fill: #262a33 !important;
+        stroke: #3d9df3 !important;
+        stroke-opacity: 0.8 !important;
     }
     div[class*="st-key-chart_dram_"] text.updatemenu-header-arrow {
-        fill: #ffffff !important;
+        fill: #8a939c !important;
     }
     div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
         font-size: 1.1rem !important;
@@ -2572,8 +2573,8 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
             buttons=buttons, showactive=True,
             x=1, xanchor="right", y=1.0, yanchor="bottom",
             pad=dict(t=0, b=8, l=0, r=0),
-            bgcolor="#000000", bordercolor="#ffffff", borderwidth=1,
-            font=dict(color="#ffffff", size=15),
+            bgcolor="#1c1f26", bordercolor="#3d9df3", borderwidth=1,
+            font=dict(color="#e3e6ea", size=15),
         )])
 
     # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
