@@ -390,37 +390,41 @@ st.markdown(
         opacity: 1 !important;
         transition: none !important;
     }
-    /* DRAM 추이 차트의 품목 선택 드롭다운(Plotly updatemenu). Streamlit의 plotly
-       테마가 배경·글자를 밝게 덮어써서 다크 화면에서 글자가 안 보였다. SVG라 CSS로
-       직접 색을 박는다. */
-    /* 밝은 면 + 어두운 글자로 간다. 어두운 면에 흰 글자를 얹으면 작은 SVG 글자에서
-       획이 번져(halation) '글자가 깨진 것처럼' 보인다 — 흰색·굵기 600으로 맞춰도
-       마찬가지였고 두 번 지적받았다. 반대로 두면 같은 크기에서 획이 또렷하다.
-       밝은 상자는 어두운 화면에서 눈에 먼저 들어와서 '여기가 조작하는 곳'이라는
-       신호도 같이 준다. */
-    .js-plotly-plot .updatemenu-header .updatemenu-item-rect,
-    .js-plotly-plot .updatemenu-item-rect {
-        fill: #e9ebef !important;
-        stroke: #e9ebef !important;
+    /* DRAM 추이 차트의 품목 선택 드롭다운(Plotly updatemenu)만 겨냥한다. 처음엔
+       `.js-plotly-plot`으로 걸었는데, 이 클래스는 페이지의 모든 Plotly 차트가
+       공유한다 — 그래서 본주/ADR(SKHY) 전환 버튼(장중 주가 추이 차트)까지 이 규칙을
+       맞고, 원래 파란 글자(#4a8ec2)가 검게 덮어써져 다크 배경에서 안 보이게 됐다.
+       Streamlit이 `key=`를 준 요소에 `st-key-<key>` 클래스를 붙여 주므로, DRAM
+       차트 두 개(`chart_dram_chip`/`chart_dram_module`)의 감싸는 div로 범위를
+       좁힌다. */
+    /* 검정 상자 + 흰 윤곽선 + 흰 글자. 굵기(font-weight)로 무게를 올리면 브라우저가
+       가짜 굵기(synthetic bold)를 지어내 작은 SVG 글자가 뭉개진다 — 대신 글자
+       외곽선을 얇게 덧그려(paint-order) 두께를 준다. */
+    div[class*="st-key-chart_dram_"] .updatemenu-header .updatemenu-item-rect,
+    div[class*="st-key-chart_dram_"] .updatemenu-item-rect {
+        fill: #000000 !important;
+        fill-opacity: 1 !important;
+        stroke: #ffffff !important;
+        stroke-opacity: 1 !important;
+        stroke-width: 1.4px !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
-    .js-plotly-plot text.updatemenu-item-text {
-        fill: #0e1117 !important;
-        font-weight: 600 !important;
-        /* 브라우저가 지어내는 가짜 굵기(synthetic bold)는 작은 글자에서 뭉갠다.
-           글자 외곽선을 얇게 덧그려 획을 또렷하게 두껍게 한다. */
+    div[class*="st-key-chart_dram_"] text.updatemenu-item-text {
+        fill: #ffffff !important;
+        fill-opacity: 1 !important;
+        font-weight: 400 !important;
         paint-order: stroke fill;
-        stroke: #0e1117 !important;
+        stroke: #ffffff !important;
         stroke-width: 0.5px !important;
         stroke-linejoin: round;
     }
-    .js-plotly-plot .updatemenu-header:hover .updatemenu-item-rect,
-    .js-plotly-plot .updatemenu-item-rect:hover {
-        fill: #ffffff !important;
+    div[class*="st-key-chart_dram_"] .updatemenu-header:hover .updatemenu-item-rect,
+    div[class*="st-key-chart_dram_"] .updatemenu-item-rect:hover {
+        fill: #1c1e24 !important;
         stroke: #ffffff !important;
     }
-    .js-plotly-plot text.updatemenu-header-arrow {
-        fill: #0e1117 !important;
+    div[class*="st-key-chart_dram_"] text.updatemenu-header-arrow {
+        fill: #ffffff !important;
     }
     div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
         font-size: 1.1rem !important;
@@ -1142,6 +1146,12 @@ FOREIGN_DESK_NOTE = (
 
 def _render_foreign_desk_line() -> None:
     """이 종목의 장중 외국계 추정 순매수를 한 줄로. 현재가 fragment 안이라 자동 갱신된다."""
+    if not ai_inputs.FOREIGN_DESK_ENABLED:
+        # 네이버가 이 값을 주던 종목 페이지를 2026-09-10 저녁에 표 없는 새 SPA로 바꿔서
+        # 대체 출처가 없다(모바일 API 212개를 훑어도 없었다 — CONTEXT.md §5). 줄이 그냥
+        # 사라지면 고장으로 보이므로 사유를 짧게 남긴다.
+        st.caption("외국계 창구 추정 순매수: 네이버 개편으로 당분간 볼 수 없습니다.")
+        return
     try:
         d = fetch_foreign_desk(TICKER)
     except Exception:
@@ -2562,8 +2572,8 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
             buttons=buttons, showactive=True,
             x=1, xanchor="right", y=1.0, yanchor="bottom",
             pad=dict(t=0, b=8, l=0, r=0),
-            bgcolor="#e9ebef", bordercolor="#e9ebef", borderwidth=1,
-            font=dict(color="#0e1117", size=15),
+            bgcolor="#000000", bordercolor="#ffffff", borderwidth=1,
+            font=dict(color="#ffffff", size=15),
         )])
 
     # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
