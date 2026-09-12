@@ -554,11 +554,21 @@ st.markdown(
             width: 100% !important;
             min-width: 100% !important;
         }
-        /* SKHY 본장·마감을 한 칸에 나란히 넣은 adr_host_session_split은 그 자체가 위
-           4칸 grid의 한 칸이라, 안의 두 지표가 그 47% 칸을 다시 반씩 나눠 갖는다
-           (47%의 47%라 형제 지표 폭의 절반도 안 됐다). 이 칸만 한 줄을 통째로 쓰게
-           넓혀서, 두 지표가 형제 지표들과 비슷한 폭을 갖게 한다. */
-        div[class*="st-key-price_row_"] div[data-testid="stColumn"]:has(div[class*="st-key-adr_host_session_split"]) {
+        /* 80일선 괴리율 + SKHY 본장·마감·본주환산·ADR괴리율이 5칸으로 평평하게 나열되는 줄
+           (SKHY가 프리장·애프터장이라 본장을 나란히 보여줄 때만 5칸이 된다. 정규장 중이거나
+           다른 종목이면 4칸 그대로라 이 규칙이 걸리지 않는다 — :has(:nth-child(5))로 '5칸일
+           때만' 확인한다). 첫 칸(80일선 괴리율)만 한 줄을 다 쓰게 해서, 남는 SKHY 본장·마감
+           두 칸이 그 아래 줄에서 둘이 짝지어 47%씩 나눠 갖는다 — 안 그러면 5칸이 2-2-1로
+           접히면서 본장과 마감이 서로 다른 줄로 갈라진다.
+           선택자는 stLayoutWrapper까지 `>`로 꽉 채워 정확한 경로만 잡는다 — 후손
+           선택자(공백)를 쓰면 각 지표 안쪽의 라벨+물음표 줄(그 자체도 stHorizontalBlock이다)
+           까지 잡혀서, 그쪽의 '한 줄 유지' 규칙을 이 규칙이 덮어써 물음표가 라벨 아래로
+           떨어지는 사고가 났었다. */
+        div[class*="st-key-price_row_deviation"]:has(
+            > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+                > div[data-testid="stColumn"]:nth-child(5)
+        ) > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+            > div[data-testid="stColumn"]:first-child {
             flex: 1 1 100% !important;
             width: 100% !important;
             min-width: 100% !important;
@@ -1741,114 +1751,126 @@ def render_current_price():
                 # 이 영역은 5초마다 다시 그려져서 팝오버를 열어둬도 곧 닫히므로, 설명은
                 # 가격 과열도 탭의 ❓ 버튼에 모아두고 여기서는 라벨만으로 뜻이 통하게 둔다.
                 with st.container(key="price_row_deviation"):
-                    dev_col, adr_col, adr_krw_col, adr_gap_col = st.columns(4)
+                    # SKHY 본장·마감을 나란히 보여줘야 하는지(프리장·애프터장 + 기준값 있음)를
+                    # 칸을 나누기 전에 먼저 정한다. 4칸을 만들어 놓고 그 중 한 칸 안에서
+                    # 다시 2칸으로 쪼개면, 그 두 지표만 나머지 형제 지표 폭의 절반이 돼서
+                    # 간격이 제각각으로 보인다. 처음부터 5칸으로 평평하게 만들면 다섯 지표가
+                    # 다 같은 폭·같은 간격을 갖는다.
+                    adr = None
+                    baseline = None
+                    is_split = False
+                    if TICKER == ADR_HOST_TICKER:
+                        adr = fetch_adr_quote()
+                        baseline = fetch_adr_baseline()
+                        if adr:
+                            is_split = adr["session"] != "정규장" and adr.get("prev_close") is not None
+
+                    if is_split:
+                        dev_col, adr_host_col, adr_session_col, adr_krw_col, adr_gap_col = st.columns(5)
+                    else:
+                        dev_col, adr_col, adr_krw_col, adr_gap_col = st.columns(4)
                     with dev_col.container(key="metric_small_deviation"):
                         st.metric(
                             f"{ma_window}일선 괴리율 (현재가 기준)",
                             f"{deviation:+.1%} (상위 {percentile:.0%})",
                         )
                     # 나스닥 상장 SK하이닉스(SKHY). 프리장·애프터장 체결까지 반영한다.
-                    if TICKER == ADR_HOST_TICKER:
-                        adr = fetch_adr_quote()
-                        baseline = fetch_adr_baseline()
-                        if adr:
-                            adr_krw = adr["price"] * adr["fx"]
-                            prev = adr.get("prev_close")
-                            adr_delta = (
-                                f"{(adr['price'] / prev - 1) * 100:+.2f}%" if prev else None
+                    if TICKER == ADR_HOST_TICKER and adr:
+                        adr_krw = adr["price"] * adr["fx"]
+                        prev = adr.get("prev_close")
+                        adr_delta = (
+                            f"{(adr['price'] / prev - 1) * 100:+.2f}%" if prev else None
+                        )
+                        # 등락률이 무엇 대비인지 헷갈리지 않게 기준값을 그대로 적어준다
+                        basis = (
+                            "당일 정규장 종가" if adr["session"] == "애프터장" else "직전 거래일 종가"
+                        )
+                        basis_help = (
+                            f"등락률은 {basis} ${prev:,.2f} 대비입니다."
+                            if prev else "등락률 기준값을 구하지 못했습니다."
+                        )
+                        # 장이 닫혀 있으면 값이 안 움직이는 게 정상이라는 걸 라벨에서 바로 알 수 있게 한다
+                        if adr.get("is_open"):
+                            adr_label = f"SKHY ({adr['session']})"
+                            # 본장과 나란히 좁은 칸에 넣을 때는 괄호가 있으면 한 줄에 안 들어가
+                            # 줄바꿈되면서 값 위치가 옆 지표보다 아래로 밀린다. 괄호를 뺀 짧은 버전.
+                            adr_label_compact = f"SKHY {adr['session']}"
+                            adr_help = (
+                                f"나스닥 상장 SK하이닉스. 마지막 체결 {adr['time'] or '-'} KST "
+                                f"(환율 {adr['fx']:,.1f}원). 미국 프리장·애프터장 체결도 반영합니다.\n\n"
+                                f"{basis_help}"
                             )
-                            # 등락률이 무엇 대비인지 헷갈리지 않게 기준값을 그대로 적어준다
-                            basis = (
-                                "당일 정규장 종가" if adr["session"] == "애프터장" else "직전 거래일 종가"
+                        else:
+                            adr_label = "SKHY (미국장 마감)"
+                            adr_label_compact = "SKHY 마감"
+                            adr_help = (
+                                f"미국장이 닫혀 있어 값이 멈춰 있는 게 정상입니다.\n\n"
+                                f"마지막 체결: {adr['time'] or '-'} KST ({adr['session']})\n\n"
+                                f"다음 프리장 개장: {adr['next_open'] or '-'} KST\n\n"
+                                f"미국 거래시간(KST): 프리장 17:00–22:30, 정규장 22:30–익일 05:00, "
+                                f"애프터장 –익일 09:00 (서머타임 기준)\n\n"
+                                f"{ADR_DAY_SESSION_NOTE}\n\n"
+                                f"{basis_help}"
                             )
-                            basis_help = (
-                                f"등락률은 {basis} ${prev:,.2f} 대비입니다."
-                                if prev else "등락률 기준값을 구하지 못했습니다."
+                        if is_split:
+                            # 프리장·애프터장 체결가만 보이면 오늘 본장 종가가 얼마였는지
+                            # 화면에서 사라진다. 등락률 기준값(prev)이 곧 그 본장 종가이므로
+                            # 나란히 같이 보여준다.
+                            host_prev = adr.get("host_prev_close")
+                            host_delta = (
+                                f"{(prev / host_prev - 1) * 100:+.2f}%" if host_prev else None
                             )
+                            with adr_host_col.container(key="metric_small_adr_host"):
+                                _metric_with_help(
+                                    "SKHY 본장", f"${prev:,.2f}",
+                                    "SKHY의 직전 정규장(본장) 종가입니다. "
+                                    "프리장·애프터장 등락률은 이 값을 기준으로 계산합니다.\n\n"
+                                    + (
+                                        f"등락률은 그 전 정규장 종가 ${host_prev:,.2f} 대비입니다."
+                                        if host_prev else "등락률 기준값을 구하지 못했습니다."
+                                    ),
+                                    key="adr_host",
+                                    delta=host_delta, delta_color="normal",
+                                )
+                            with adr_session_col.container(key="metric_small_adr_session"):
+                                _metric_with_help(
+                                    adr_label_compact, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                    delta=adr_delta, delta_color="normal",
+                                )
+                        else:
                             with adr_col.container(key="metric_small_adr"):
-                                # 장이 닫혀 있으면 값이 안 움직이는 게 정상이라는 걸 라벨에서 바로 알 수 있게 한다
-                                if adr.get("is_open"):
-                                    adr_label = f"SKHY ({adr['session']})"
-                                    # 본장과 나란히 좁은 칸에 넣을 때는 괄호가 있으면 한 줄에 안 들어가
-                                    # 줄바꿈되면서 값 위치가 옆 지표보다 아래로 밀린다. 괄호를 뺀 짧은 버전.
-                                    adr_label_compact = f"SKHY {adr['session']}"
-                                    adr_help = (
-                                        f"나스닥 상장 SK하이닉스. 마지막 체결 {adr['time'] or '-'} KST "
-                                        f"(환율 {adr['fx']:,.1f}원). 미국 프리장·애프터장 체결도 반영합니다.\n\n"
-                                        f"{basis_help}"
-                                    )
-                                else:
-                                    adr_label = "SKHY (미국장 마감)"
-                                    adr_label_compact = "SKHY 마감"
-                                    adr_help = (
-                                        f"미국장이 닫혀 있어 값이 멈춰 있는 게 정상입니다.\n\n"
-                                        f"마지막 체결: {adr['time'] or '-'} KST ({adr['session']})\n\n"
-                                        f"다음 프리장 개장: {adr['next_open'] or '-'} KST\n\n"
-                                        f"미국 거래시간(KST): 프리장 17:00–22:30, 정규장 22:30–익일 05:00, "
-                                        f"애프터장 –익일 09:00 (서머타임 기준)\n\n"
-                                        f"{ADR_DAY_SESSION_NOTE}\n\n"
-                                        f"{basis_help}"
-                                    )
-                                if adr["session"] != "정규장" and prev is not None:
-                                    # 프리장·애프터장 체결가만 보이면 오늘 본장 종가가 얼마였는지
-                                    # 화면에서 사라진다. 등락률 기준값(prev)이 곧 그 본장 종가이므로
-                                    # 나란히 같이 보여준다.
-                                    host_prev = adr.get("host_prev_close")
-                                    host_delta = (
-                                        f"{(prev / host_prev - 1) * 100:+.2f}%" if host_prev else None
-                                    )
-                                    with st.container(key="adr_host_session_split"):
-                                        host_sub_col, session_sub_col = st.columns(2)
-                                        with host_sub_col.container(key="metric_small_adr_host"):
-                                            _metric_with_help(
-                                                "SKHY 본장", f"${prev:,.2f}",
-                                                "SKHY의 직전 정규장(본장) 종가입니다. "
-                                                "프리장·애프터장 등락률은 이 값을 기준으로 계산합니다.\n\n"
-                                                + (
-                                                    f"등락률은 그 전 정규장 종가 ${host_prev:,.2f} 대비입니다."
-                                                    if host_prev else "등락률 기준값을 구하지 못했습니다."
-                                                ),
-                                                key="adr_host",
-                                                delta=host_delta, delta_color="normal",
-                                            )
-                                        with session_sub_col.container(key="metric_small_adr_session"):
-                                            _metric_with_help(
-                                                adr_label_compact, f"${adr['price']:,.2f}", adr_help, key="adr",
-                                                delta=adr_delta, delta_color="normal",
-                                            )
-                                else:
-                                    _metric_with_help(
-                                        adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
-                                        delta=adr_delta, delta_color="normal",
-                                    )
-                            # ADR 1주는 본주 0.1주에 해당하므로, 본주 환산가로 되돌려 비교한다
-                            adr_per_share = adr_krw / ADR_SHARE_RATIO
-                            with adr_krw_col.container(key="metric_small_adr_krw"):
                                 _metric_with_help(
-                                    "SKHY 본주환산", f"{adr_per_share:,.0f}원",
-                                    f"ADR ${adr['price']:,.2f} × 환율 {adr['fx']:,.1f} = {adr_krw:,.0f}원 "
-                                    f"(ADR 1주). 공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주로 나눠 "
-                                    "본주 1주 기준으로 환산한 금액입니다.",
-                                    key="adr_krw",
+                                    adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                    delta=adr_delta, delta_color="normal",
                                 )
-                            with adr_gap_col.container(key="metric_small_adr_gap"):
-                                gap = (adr_per_share / close_price - 1) * 100
-                                delta = None
-                                if baseline:
-                                    base_gap = (baseline / ADR_SHARE_RATIO - 1) * 100
-                                    delta = f"{gap - base_gap:+.1f}%p vs 최근평균"
-                                _metric_with_help(
-                                    "ADR 괴리율", f"{gap:+.1f}%",
-                                    f"공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주 기준으로, ADR이 본주보다 "
-                                    "얼마나 비싸게 거래되는지입니다.\n\n"
-                                    "이 종목은 평소에도 30–40%대 프리미엄이 붙어 있어서, 절대값보다 "
-                                    "'최근 평균 대비 얼마나 벌어졌나'(아래 숫자)가 더 의미 있습니다.\n\n"
-                                    "한국 종가와 미국 시세는 최대 13시간 차이가 나므로, 이 값에는 "
-                                    "그 사이의 시장 변화가 섞여 있습니다. 차익거래 기회가 아니라 "
-                                    "미국 쪽 평가를 보는 선행 지표로 읽으세요.",
-                                    key="adr_gap",
-                                    delta=delta, delta_color="off",
-                                )
+                        # ADR 1주는 본주 0.1주에 해당하므로, 본주 환산가로 되돌려 비교한다
+                        adr_per_share = adr_krw / ADR_SHARE_RATIO
+                        with adr_krw_col.container(key="metric_small_adr_krw"):
+                            _metric_with_help(
+                                "SKHY 본주환산", f"{adr_per_share:,.0f}원",
+                                f"ADR ${adr['price']:,.2f} × 환율 {adr['fx']:,.1f} = {adr_krw:,.0f}원 "
+                                f"(ADR 1주). 공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주로 나눠 "
+                                "본주 1주 기준으로 환산한 금액입니다.",
+                                key="adr_krw",
+                            )
+                        with adr_gap_col.container(key="metric_small_adr_gap"):
+                            gap = (adr_per_share / close_price - 1) * 100
+                            delta = None
+                            if baseline:
+                                base_gap = (baseline / ADR_SHARE_RATIO - 1) * 100
+                                delta = f"{gap - base_gap:+.1f}%p vs 최근평균"
+                            _metric_with_help(
+                                "ADR 괴리율", f"{gap:+.1f}%",
+                                f"공식 비율 1 ADR = 본주 {ADR_SHARE_RATIO}주 기준으로, ADR이 본주보다 "
+                                "얼마나 비싸게 거래되는지입니다.\n\n"
+                                "이 종목은 평소에도 30–40%대 프리미엄이 붙어 있어서, 절대값보다 "
+                                "'최근 평균 대비 얼마나 벌어졌나'(아래 숫자)가 더 의미 있습니다.\n\n"
+                                "한국 종가와 미국 시세는 최대 13시간 차이가 나므로, 이 값에는 "
+                                "그 사이의 시장 변화가 섞여 있습니다. 차익거래 기회가 아니라 "
+                                "미국 쪽 평가를 보는 선행 지표로 읽으세요.",
+                                key="adr_gap",
+                                delta=delta, delta_color="off",
+                            )
         except Exception as exc:
             # 괴리율·ADR은 부가 정보라 현재가 표시는 그대로 두되, 사라진 이유는 남긴다.
             _note_optional_failure("괴리율·ADR", exc)
