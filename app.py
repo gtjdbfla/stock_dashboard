@@ -1681,16 +1681,24 @@ def render_current_price():
                 save_over_market_tick(TICKER, over_price, over.get("localTradedAt"), session_label)
         else:
             # 시간외 장이 막 끝났을 수 있다. overMarketStatus가 OPEN이 아니게 되는 순간
-            # 값이 통째로 사라져서 애프터장이 없었던 것처럼 보였다. 수집기가 20초 간격으로
-            # 남긴 오늘자 마지막 기록을 대신 보여준다(장 열리기 전이라 기록이 없으면 자연히 비운다).
+            # 값이 통째로 사라져서 애프터장이 없었던 것처럼 보였다. 정규장도 안 돌고 있을 때만
+            # (정규장이 열려 있으면 굳이 지난 시간외 기록을 보여줄 필요가 없다) 수집기가 20초
+            # 간격으로 남긴 가장 최근 기록을 대신 보여준다. 애프터장은 자정을 넘겨서까지 이어질
+            # 수 있으므로 '오늘'로만 좁히지 않고 최근 7일 중 가장 최근 것을 찾는다.
             over_price = session_label = over_at = None
-            today_over = load_over_market_ticks(TICKER, dt.datetime.now(om.KST).date())
-            if not today_over.empty:
-                last_tick = today_over.iloc[-1]
-                session_label = last_tick["세션"]
-                over_price = float(last_tick["가격"])
-                over_at = last_tick["시각"].strftime("%H:%M:%S")
-                status_label = "마감"
+            if str(market_status).upper() != "OPEN":
+                today_kst = dt.datetime.now(om.KST).date()
+                recent_over = load_over_market_ticks(TICKER, today_kst - dt.timedelta(days=7))
+                if not recent_over.empty:
+                    last_tick = recent_over.iloc[-1]
+                    session_label = last_tick["세션"]
+                    over_price = float(last_tick["가격"])
+                    over_at = (
+                        last_tick["시각"].strftime("%H:%M:%S")
+                        if last_tick["시각"].date() == today_kst
+                        else last_tick["시각"].strftime("%m-%d %H:%M:%S")
+                    )
+                    status_label = "마감"
 
         if over_price is not None and session_label:
             over_diff = over_price - close_price
