@@ -795,22 +795,31 @@ ADR_SHARE_RATIO = float(os.environ.get("ADR_SHARE_RATIO", "0.1"))
 ADR_BASELINE_DAYS = 20
 
 
-def _adr_baselines(bars: pd.DataFrame, last_day, last_session) -> tuple[float | None, float | None]:
-    """(등락률 기준값, 전 거래일 종가)를 봉 데이터에서 직접 고른다.
+def _adr_baselines(
+    bars: pd.DataFrame, last_day, last_session
+) -> tuple[float | None, float | None, float | None]:
+    """(등락률 기준값, 전 거래일 종가, 본장 자체의 전일 종가)를 봉 데이터에서 직접 고른다.
 
     등락률 기준은 세션마다 다르다. 프리장·정규장은 '직전 거래일 정규장 종가'와 비교하고,
     애프터장은 '당일 정규장 종가'와 비교하는 게 통상 표기다. 본주(NXT) 쪽도 같은 규칙이다.
     전 거래일 종가는 하루치 그래프의 기준선용이라 세션과 무관하게 늘 직전 거래일 값이다.
+
+    화면이 '본장' 종가를 따로 보여줄 때, 그 자체의 등락률(하루 전 본장 종가 대비)도 같이
+    보여주려면 그 '하루 전'을 한 번 더 찾아야 한다 — 첫 번째 반환값(등락률 기준값)이 가리키는
+    거래일의 바로 전날 종가다.
     """
     reg = bars[bars["세션"] == "정규장"]
     if reg.empty:
-        return None, None
+        return None, None, None
     closes = reg.groupby("거래일")["가격"].last()          # 거래일별 정규장 종가
     earlier = [d for d in closes.index if d < last_day]
     prev_day_close = float(closes[max(earlier)]) if earlier else None
-    if last_session == "애프터장" and last_day in closes.index:
-        return float(closes[last_day]), prev_day_close
-    return prev_day_close, prev_day_close
+    host_day = last_day if (last_session == "애프터장" and last_day in closes.index) \
+        else (max(earlier) if earlier else None)
+    prev_close = float(closes[host_day]) if host_day is not None else None
+    before_host = [d for d in closes.index if d < host_day] if host_day is not None else []
+    host_prev_close = float(closes[max(before_host)]) if before_host else None
+    return prev_close, prev_day_close, host_prev_close
 
 
 def fetch_adr_quote() -> dict | None:
@@ -837,7 +846,7 @@ def fetch_adr_quote() -> dict | None:
         # 세션은 '체결 시각' 기준으로 이미 갈라져 있다. meta의 currentTradingPeriod는 '지금'
         # 기준이라, 장 마감 후에 조회하면 애프터장 체결을 프리장으로 잘못 표시한다.
         session = str(last["세션"])
-        prev_close, prev_day_close = _adr_baselines(bars, last["거래일"], session)
+        prev_close, prev_day_close, host_prev_close = _adr_baselines(bars, last["거래일"], session)
         last_ts = last["시각"].to_pydatetime()
 
         # 지금 미국이 거래 중인지(프리장 04:00 – 애프터 20:00 ET, 평일)를 따로 본다.
@@ -864,6 +873,8 @@ def fetch_adr_quote() -> dict | None:
             "prev_close": prev_close,
             # 하루치 그래프의 점선 기준선용. 세션과 무관하게 늘 직전 거래일 종가다.
             "prev_day_close": prev_day_close,
+            # '본장' 종가(prev_close) 자체의 전일 종가 — 본장 등락률 계산용.
+            "host_prev_close": host_prev_close,
             "session": session,
             "is_open": is_open,
             "next_open": next_open,

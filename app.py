@@ -1754,6 +1754,9 @@ def render_current_price():
                                 # 장이 닫혀 있으면 값이 안 움직이는 게 정상이라는 걸 라벨에서 바로 알 수 있게 한다
                                 if adr.get("is_open"):
                                     adr_label = f"SKHY ({adr['session']})"
+                                    # 본장과 나란히 좁은 칸에 넣을 때는 괄호가 있으면 한 줄에 안 들어가
+                                    # 줄바꿈되면서 값 위치가 옆 지표보다 아래로 밀린다. 괄호를 뺀 짧은 버전.
+                                    adr_label_compact = f"SKHY {adr['session']}"
                                     adr_help = (
                                         f"나스닥 상장 SK하이닉스. 마지막 체결 {adr['time'] or '-'} KST "
                                         f"(환율 {adr['fx']:,.1f}원). 미국 프리장·애프터장 체결도 반영합니다.\n\n"
@@ -1761,6 +1764,7 @@ def render_current_price():
                                     )
                                 else:
                                     adr_label = "SKHY (미국장 마감)"
+                                    adr_label_compact = "SKHY 마감"
                                     adr_help = (
                                         f"미국장이 닫혀 있어 값이 멈춰 있는 게 정상입니다.\n\n"
                                         f"마지막 체결: {adr['time'] or '-'} KST ({adr['session']})\n\n"
@@ -1774,19 +1778,29 @@ def render_current_price():
                                     # 프리장·애프터장 체결가만 보이면 오늘 본장 종가가 얼마였는지
                                     # 화면에서 사라진다. 등락률 기준값(prev)이 곧 그 본장 종가이므로
                                     # 나란히 같이 보여준다.
-                                    host_sub_col, session_sub_col = st.columns(2)
-                                    with host_sub_col.container(key="metric_small_adr_host"):
-                                        _metric_with_help(
-                                            "SKHY 본장", f"${prev:,.2f}",
-                                            "SKHY의 직전 정규장(본장) 종가입니다. "
-                                            "프리장·애프터장 등락률은 이 값을 기준으로 계산합니다.",
-                                            key="adr_host",
-                                        )
-                                    with session_sub_col.container(key="metric_small_adr_session"):
-                                        _metric_with_help(
-                                            adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
-                                            delta=adr_delta, delta_color="normal",
-                                        )
+                                    host_prev = adr.get("host_prev_close")
+                                    host_delta = (
+                                        f"{(prev / host_prev - 1) * 100:+.2f}%" if host_prev else None
+                                    )
+                                    with st.container(key="adr_host_session_split"):
+                                        host_sub_col, session_sub_col = st.columns(2)
+                                        with host_sub_col.container(key="metric_small_adr_host"):
+                                            _metric_with_help(
+                                                "SKHY 본장", f"${prev:,.2f}",
+                                                "SKHY의 직전 정규장(본장) 종가입니다. "
+                                                "프리장·애프터장 등락률은 이 값을 기준으로 계산합니다.\n\n"
+                                                + (
+                                                    f"등락률은 그 전 정규장 종가 ${host_prev:,.2f} 대비입니다."
+                                                    if host_prev else "등락률 기준값을 구하지 못했습니다."
+                                                ),
+                                                key="adr_host",
+                                                delta=host_delta, delta_color="normal",
+                                            )
+                                        with session_sub_col.container(key="metric_small_adr_session"):
+                                            _metric_with_help(
+                                                adr_label_compact, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                                delta=adr_delta, delta_color="normal",
+                                            )
                                 else:
                                     _metric_with_help(
                                         adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
