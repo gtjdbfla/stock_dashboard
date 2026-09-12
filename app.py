@@ -502,15 +502,44 @@ st.markdown(
         font-weight: 400 !important;
         opacity: 0.7;
         margin-bottom: 0 !important;
+        /* 일반 지표 라벨(<p>)은 line-height가 normal이다. 여기만 1.6배(22.4px)로 커서
+           같은 줄에서 라벨 글자 윗선이 혼자 아래로 내려가 있었다. */
+        line-height: normal !important;
     }
-    /* 라벨 줄과 값 사이가 벌어지지 않게. 물음표 없는 일반 지표는 이 간격이 0이라
-       거기에 맞춘다 (팝오버 버튼이 라벨보다 키가 커서 줄 높이가 늘어난 만큼 당겨준다). */
+    /* 물음표형 지표는 라벨 줄을 직접 그리고 st.metric의 라벨은 접는다. 그래서 이 줄의
+       상자를 일반 지표의 라벨 상자와 똑같이 만들어야 같은 줄에서 값·등락률이 맞는다.
+       일반 지표는 '라벨 상자 24px → 곧바로 값'이다. 여기서는 컨테이너가 flex(gap 16px)라
+       라벨 줄과 값 사이가 벌어지므로, gap을 없애고 라벨 줄 높이를 24px로 못박는다.
+       예전엔 margin-bottom 음수값(-0.85rem)으로 당겼는데, 값이 4px씩 어긋난 채로 남아
+       고칠 때마다 다시 재야 했다. 높이를 직접 정하면 계산이 한 번에 끝난다. */
+    div[class*="st-key-metric_help_"] {
+        gap: 0 !important;
+    }
+    /* 라벨 줄 상자는 일반 라벨과 같은 24px가 최소값이고, 라벨이 두 줄로 넘치면 같이
+       자란다(높이를 못박으면 넘친 글자가 값 위에 겹친다). 그 상태에서 이 블록이
+       기본 줄높이(25.6px) 때문에 글자(20px)보다 5.6px 큰데, 그만큼만 당겨서
+       '라벨 24px → 곧바로 값'이 되게 한다. */
     div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] {
-        margin-bottom: -0.85rem !important;
+        margin-bottom: -0.35rem !important;
     }
     div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
         div[data-testid="stHorizontalBlock"] {
-        min-height: 0 !important;
+        min-height: 24px !important;
+    }
+    /* st.columns(vertical_alignment="center")는 칸을 가운데로 내리려고 margin-top을
+       직접 계산해 박는데, 그 기준이 되는 칸 상자가 4px로 접혀 있어서 라벨 글자가
+       옆 칸의 일반 지표 라벨보다 9px쯤 아래에서 시작했다. 그 값을 직접 잡아
+       글자 윗선을 일반 라벨과 같게 둔다(일반 라벨은 24px 상자 안에서 가운데 정렬이라
+       글자 크기에 따라 위 여백이 달라진다 — 모바일 값은 미디어쿼리에서 따로 준다).
+       칸을 flex로 바꿔 가운데 정렬시키는 방법도 해봤는데, 물음표 버튼이 라벨 위로
+       10px 튀어 올라가서 안 된다. */
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
+        margin-top: 2px !important;
+    }
+    div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {
+        margin-top: 4px !important;
     }
     div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] button {
         opacity: 0.45;
@@ -548,8 +577,17 @@ st.markdown(
             width: 47% !important;
             min-width: 47% !important;
         }
-        /* 현재가 줄만 예외: 첫 칸(현재가 본체)은 한 줄을 다 쓴다. */
-        div[class*="st-key-price_row_columns"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
+        /* 현재가 줄이 5칸(현재가·애프터장·시가·고가·저가)일 때만 첫 칸(현재가)이 한 줄을
+           다 쓴다. 그래야 남는 넷이 2+2로 딱 떨어진다. 애프터장이 없어 네 칸일 때는 이
+           규칙을 걸지 않아야 현재가+시가 / 고가+저가로 역시 2+2가 된다 — 어느 쪽이든
+           혼자 남는 칸이 없다.
+           선택자는 아래 괴리율 줄과 같은 이유로 stLayoutWrapper까지 `>`로 꽉 채운다
+           (공백 후손 선택자를 쓰면 각 지표 안쪽 라벨+물음표 줄까지 잡힌다). */
+        div[class*="st-key-price_row_columns"]:has(
+            > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+                > div[data-testid="stColumn"]:nth-child(5)
+        ) > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+            > div[data-testid="stColumn"]:first-child {
             flex: 1 1 100% !important;
             width: 100% !important;
             min-width: 100% !important;
@@ -585,15 +623,38 @@ st.markdown(
             width: auto !important;
             min-width: 0 !important;
         }
-        /* 라벨이 길어(예: "80일선 괴리율 (현재가 기준)") 두 줄로 넘어가도 값이 밀리지 않게 */
-        div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"] {
+        /* 라벨이 길어(예: "80일선 괴리율 (현재가 기준)") 두 줄로 넘어가도 값이 밀리지 않게.
+           안쪽 <p>까지 같이 줄여야 한다 — 바깥 상자에만 걸면 Streamlit이 <p>에 직접 준
+           14px가 이겨서, 물음표형 라벨(0.68rem)과 일반 라벨(14px)이 한 줄에서 서로
+           다른 크기로 보였다. 상자 높이는 물음표형 라벨 줄과 같은 24px로 맞춰 둔다. */
+        div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"],
+        div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"] p {
             font-size: 0.68rem !important;
             line-height: 1.25 !important;
+        }
+        div[class*="st-key-metric_small_"] [data-testid="stMetricLabel"] {
+            min-height: 24px !important;
         }
         /* 물음표가 붙은 지표는 라벨을 직접 그리므로 그쪽도 같은 크기로 줄인다 */
         div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] p {
             font-size: 0.68rem !important;
             line-height: 1.25 !important;
+        }
+        /* 라벨 글자가 작아진 만큼(20px -> 13.6px) 24px 상자 안에서 가운데가 내려간다.
+           일반 라벨과 글자 윗선을 맞추려면 데스크톱(2px)보다 더 내려야 한다. */
+        div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
+            div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
+            margin-top: 4px !important;
+        }
+        div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"]
+            div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {
+            margin-top: 3px !important;
+        }
+        /* 라벨 줄 상자가 데스크톱(29.6px)보다 낮은 28.6px이라, 일반 라벨 상자(24px)에
+           맞추려면 당기는 양도 그만큼 줄어야 한다(-5.6px -> -4.6px). 안 줄이면 값이
+           옆 칸보다 1px 올라앉는다. */
+        div[class*="st-key-metric_help_"] div[class*="st-key-help_row_metric_"] {
+            margin-bottom: -4.6px !important;
         }
         div[class*="st-key-metric_small_"] [data-testid="stMetricValue"] {
             font-size: 0.95rem !important;
@@ -1649,7 +1710,6 @@ def render_current_price():
         open_p = price_info.get("openPrice", "-")
         high_p = price_info.get("highPrice", "-")
         low_p = price_info.get("lowPrice", "-")
-        volume = price_info.get("accumulatedTradingVolume", "-")
 
         # 프리장/애프터장(NXT) 실시간 시세. 정규장이 닫혀 있어도 이 구간에는 값이 움직인다.
         # 기준가는 '직전 정규장 종가'로 잡는다 — 프리장이면 전 거래일 종가, 애프터장이면 당일 종가라
@@ -1694,16 +1754,21 @@ def render_current_price():
         with st.container(key="price_row_columns"):
             # 시가총액 대신 애프터장(있을 때만) 가격을 현재가 바로 옆에 둔다 — 정규장이
             # 끝난 시간엔 애프터장 움직임이 시가총액보다 훨씬 자주 확인하는 값이다.
+            # 거래량은 뺐다. 다섯 칸(애프터장 없으면 네 칸)이라야 모바일 2열에서
+            # 혼자 남는 칸 없이 딱 떨어진다 — 거래량 추이는 아래 차트에 따로 있다.
             if show_over:
-                price_col, over_col, open_col, high_col, low_col, volume_col = st.columns(6)
+                price_col, over_col, open_col, high_col, low_col = st.columns(5)
             else:
-                price_col, open_col, high_col, low_col, volume_col = st.columns(5)
-            price_col.metric(
-                label="현재가 (시세 지연)",
-                value=f"{close_price:,}원",
-                delta=f"{change:+,}원 ({change_pct:+.2f}%)",
-                delta_color="normal",
-            )
+                price_col, open_col, high_col, low_col = st.columns(4)
+            # 현재가도 다른 지표와 같은 크기로 둔다(metric_small_). 예전엔 이 지표만
+            # 기본 크기라 혼자 두 배쯤 커서, 같은 줄의 글자 기준선이 서로 안 맞았다.
+            with price_col.container(key="metric_small_price"):
+                st.metric(
+                    label="현재가 (시세 지연)",
+                    value=f"{close_price:,}원",
+                    delta=f"{change:+,}원 ({change_pct:+.2f}%)",
+                    delta_color="normal",
+                )
             if show_over:
                 over_diff = over_price - close_price
                 over_pct = (over_diff / close_price * 100) if close_price else 0.0
@@ -1720,7 +1785,6 @@ def render_current_price():
                 (open_col, "시가", open_p, "open"),
                 (high_col, "고가", high_p, "high"),
                 (low_col, "저가", low_p, "low"),
-                (volume_col, "거래량", volume, "volume"),
             ]:
                 with col.container(key=f"metric_small_{key}"):
                     st.metric(label, value)
