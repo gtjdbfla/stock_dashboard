@@ -554,6 +554,15 @@ st.markdown(
             width: 100% !important;
             min-width: 100% !important;
         }
+        /* SKHY 본장·마감을 한 칸에 나란히 넣은 adr_host_session_split은 그 자체가 위
+           4칸 grid의 한 칸이라, 안의 두 지표가 그 47% 칸을 다시 반씩 나눠 갖는다
+           (47%의 47%라 형제 지표 폭의 절반도 안 됐다). 이 칸만 한 줄을 통째로 쓰게
+           넓혀서, 두 지표가 형제 지표들과 비슷한 폭을 갖게 한다. */
+        div[class*="st-key-price_row_"] div[data-testid="stColumn"]:has(div[class*="st-key-adr_host_session_split"]) {
+            flex: 1 1 100% !important;
+            width: 100% !important;
+            min-width: 100% !important;
+        }
         /* 위 47% 규칙은 price_row_ 안에 '중첩된' 칸까지 잡는다. 라벨+물음표 줄이 그 안에 있어서
            라벨 칸이 47%로 늘어나면 물음표가 멀리 밀린다. 라벨 줄은 글자 너비에 맞춰 되돌린다. */
         div[class*="st-key-help_row_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child {
@@ -1704,7 +1713,13 @@ def render_current_price():
             over_diff = over_price - close_price
             over_pct = (over_diff / close_price * 100) if close_price else 0.0
             with st.container(key="price_row_over"):
-                over_col, over_vol_col = st.columns([2, 3])
+                if over_volume is not None:
+                    over_col, over_vol_col = st.columns([2, 3])
+                else:
+                    # 실시간 시간외가 아니라 장 마감 후 남은 마지막 기록이면 거래량이 없다.
+                    # 옆 칸을 비워두는 대신 지표가 한 줄을 다 쓰게 한다 — 안 그러면
+                    # 모바일에서 폭 절반이 그냥 빈 채로 남는다.
+                    over_col = st.container()
                 with over_col.container(key="metric_small_over_price"):
                     _metric_with_help(
                         f"{session_label} (NXT) {status_label}",
