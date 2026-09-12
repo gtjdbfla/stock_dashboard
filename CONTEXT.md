@@ -95,6 +95,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **헬스체크 200은 "앱이 멀쩡하다"는 뜻이 아니다.** `/_stcore/health`는 Streamlit 서버가 살아 있으면 200을 준다. 탭 렌더 루프(파일 뒤쪽)보다 **앞에서** 예외가 나면 헤더·장중차트까지만 그려지고 탭 8개가 통째로 빈 채 뜨는데, 헬스체크·`docker ps`는 healthy로 나온다. 배포 확인은 md5+헬스체크로 끝내지 말고 **브라우저에서 탭 안에 내용이 있는지**까지 봐라(`document.querySelectorAll('.js-plotly-plot').length` — 정상 13개, 깨졌을 때 1개).
 - **`st.iframe`은 `height=0`을 거부한다**(양의 정수·`"stretch"`·`"content"`만). `st.components.v1.html`은 0을 받아줬다. 화면에 안 보이게 스크립트만 심을 때는 `height=1`.
 - **`overMarketPriceInfo`는 세션이 `OPEN`일 때만 값을 준다.** 프리장·애프터장이 끝나는 순간 필드가 사라져서, 화면도 그 값에 기대 그리면 지표가 통째로 안 보이게 된다. 정규장도 안 돌고 있을 때는 수집기가 20초 간격으로 남긴 tick(`load_over_market_ticks`, 최근 7일치를 통째로 봄)의 마지막 값을 `상태 라벨: 마감`으로 대신 보여준다. **'오늘'로만 좁히면 안 된다** — 애프터장이 자정 근처까지 이어지는 날엔 그 tick이 어제 날짜로 찍혀서 자정을 넘기자마자 다시 사라진다. SKHY(ADR)도 같은 증상이 있었는데, `fetch_adr_quote()`의 `prev_close`가 세션과 무관하게 이미 '본장(정규장) 종가' 그 자체라서 별도 조회 없이 그 값을 나란히 보여주면 된다.
+- **본장(`prev_close`) 자체의 등락률이 필요하면 `_adr_baselines`가 세 번째 값으로 주는 `host_prev_close`를 쓴다** — `prev_close`가 가리키는 거래일의 바로 전날 종가라, 이미 있는 5일치 봉에서 한 번 더 골라내는 것뿐이고 추가 네트워크 호출이 없다. **좁은 중첩 컬럼(`st.columns` 안에 또 `st.columns`)에 괄호 붙은 라벨("SKHY (미국장 마감)")을 넣으면 줄바꿈돼서 그 지표의 값만 옆 칸보다 몇 px 아래로 밀린다** — `getBoundingClientRect()`로 직접 재보기 전엔 눈으로 잘 안 잡힌다. 나란히 보여줄 지표는 괄호 없는 짧은 라벨("SKHY 마감")을 따로 만들 것.
 
 ## 6. 미해결 / 다음에 할 것
 
