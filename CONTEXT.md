@@ -94,6 +94,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **화면에서 같은 데이터를 두 번 받고 있지 않은지 보라.** `_live_deviation`(상단)과 가격 과열도 탭이 둘 다 `fetch_backtest_history_live(700)`을 불렀다. 상단은 250일이면 충분해서 그렇게 줄였다.
 - **헬스체크 200은 "앱이 멀쩡하다"는 뜻이 아니다.** `/_stcore/health`는 Streamlit 서버가 살아 있으면 200을 준다. 탭 렌더 루프(파일 뒤쪽)보다 **앞에서** 예외가 나면 헤더·장중차트까지만 그려지고 탭 8개가 통째로 빈 채 뜨는데, 헬스체크·`docker ps`는 healthy로 나온다. 배포 확인은 md5+헬스체크로 끝내지 말고 **브라우저에서 탭 안에 내용이 있는지**까지 봐라(`document.querySelectorAll('.js-plotly-plot').length` — 정상 13개, 깨졌을 때 1개).
 - **`st.iframe`은 `height=0`을 거부한다**(양의 정수·`"stretch"`·`"content"`만). `st.components.v1.html`은 0을 받아줬다. 화면에 안 보이게 스크립트만 심을 때는 `height=1`.
+- **`overMarketPriceInfo`는 세션이 `OPEN`일 때만 값을 준다.** 프리장·애프터장이 끝나는 순간 필드가 사라져서, 화면도 그 값에 기대 그리면 지표가 통째로 안 보이게 된다. 정규장도 안 돌고 있을 때는 수집기가 20초 간격으로 남긴 tick(`load_over_market_ticks`, 최근 7일치를 통째로 봄)의 마지막 값을 `상태 라벨: 마감`으로 대신 보여준다. **'오늘'로만 좁히면 안 된다** — 애프터장이 자정 근처까지 이어지는 날엔 그 tick이 어제 날짜로 찍혀서 자정을 넘기자마자 다시 사라진다. SKHY(ADR)도 같은 증상이 있었는데, `fetch_adr_quote()`의 `prev_close`가 세션과 무관하게 이미 '본장(정규장) 종가' 그 자체라서 별도 조회 없이 그 값을 나란히 보여주면 된다.
 
 ## 6. 미해결 / 다음에 할 것
 
