@@ -1667,10 +1667,10 @@ def render_current_price():
         # 어느 쪽이든 '정규장 대비 지금 얼마나 움직였나'가 된다.
         over = data.get("overMarketPriceInfo") or {}
         over_price = _parse_price_number(over.get("overPrice"))
+        over_volume = None
+        status_label = "실시간"
         if over.get("overMarketStatus") == "OPEN" and over_price is not None:
             session_label = _OVER_SESSION_LABELS.get(over.get("tradingSessionType"), "시간외")
-            over_diff = over_price - close_price
-            over_pct = (over_diff / close_price * 100) if close_price else 0.0
             over_volume = over.get("accumulatedTradingVolume", "-")
             try:
                 over_at = pd.to_datetime(over.get("localTradedAt")).strftime("%H:%M:%S")
@@ -1679,22 +1679,38 @@ def render_current_price():
             # 백그라운드 수집기가 기본 종목만 담당하므로, 다른 종목을 보고 있을 때는 화면에서도 기록한다
             if TICKER not in OVER_MARKET_COLLECT_TICKERS:
                 save_over_market_tick(TICKER, over_price, over.get("localTradedAt"), session_label)
+        else:
+            # 시간외 장이 막 끝났을 수 있다. overMarketStatus가 OPEN이 아니게 되는 순간
+            # 값이 통째로 사라져서 애프터장이 없었던 것처럼 보였다. 수집기가 20초 간격으로
+            # 남긴 오늘자 마지막 기록을 대신 보여준다(장 열리기 전이라 기록이 없으면 자연히 비운다).
+            over_price = session_label = over_at = None
+            today_over = load_over_market_ticks(TICKER, dt.datetime.now(om.KST).date())
+            if not today_over.empty:
+                last_tick = today_over.iloc[-1]
+                session_label = last_tick["세션"]
+                over_price = float(last_tick["가격"])
+                over_at = last_tick["시각"].strftime("%H:%M:%S")
+                status_label = "마감"
 
+        if over_price is not None and session_label:
+            over_diff = over_price - close_price
+            over_pct = (over_diff / close_price * 100) if close_price else 0.0
             with st.container(key="price_row_over"):
                 over_col, over_vol_col = st.columns([2, 3])
                 with over_col.container(key="metric_small_over_price"):
                     _metric_with_help(
-                        f"{session_label} (NXT) 실시간",
+                        f"{session_label} (NXT) {status_label}",
                         f"{over_price:,.0f}원",
                         "정규장 종가 대비 변동입니다. 프리장은 전 거래일 종가, 애프터장은 당일 종가가 기준입니다.",
                         key="over_price",
                         delta=f"{over_diff:+,.0f}원 ({over_pct:+.2f}%)",
                         delta_color="normal",
                     )
-                with over_vol_col.container(key="metric_small_over_volume"):
-                    st.metric(f"{session_label} 거래량", over_volume)
+                if over_volume is not None:
+                    with over_vol_col.container(key="metric_small_over_volume"):
+                        st.metric(f"{session_label} 거래량", over_volume)
             if over_at:
-                st.caption(f"{session_label} 갱신시각: {over_at}")
+                st.caption(f"{session_label} {status_label} 시각: {over_at}")
         try:
             ma_window = int(st.session_state.get("overheat_ma_window", OVERHEAT_DEFAULT_MA_WINDOW))
             deviation, percentile = _live_deviation(close_price, ma_window)
@@ -1746,10 +1762,28 @@ def render_current_price():
                                         f"{ADR_DAY_SESSION_NOTE}\n\n"
                                         f"{basis_help}"
                                     )
-                                _metric_with_help(
-                                    adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
-                                    delta=adr_delta, delta_color="normal",
-                                )
+                                if adr["session"] != "정규장" and prev is not None:
+                                    # 프리장·애프터장 체결가만 보이면 오늘 본장 종가가 얼마였는지
+                                    # 화면에서 사라진다. 등락률 기준값(prev)이 곧 그 본장 종가이므로
+                                    # 나란히 같이 보여준다.
+                                    host_sub_col, session_sub_col = st.columns(2)
+                                    with host_sub_col.container(key="metric_small_adr_host"):
+                                        _metric_with_help(
+                                            "SKHY 본장", f"${prev:,.2f}",
+                                            "SKHY의 직전 정규장(본장) 종가입니다. "
+                                            "프리장·애프터장 등락률은 이 값을 기준으로 계산합니다.",
+                                            key="adr_host",
+                                        )
+                                    with session_sub_col.container(key="metric_small_adr_session"):
+                                        _metric_with_help(
+                                            adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                            delta=adr_delta, delta_color="normal",
+                                        )
+                                else:
+                                    _metric_with_help(
+                                        adr_label, f"${adr['price']:,.2f}", adr_help, key="adr",
+                                        delta=adr_delta, delta_color="normal",
+                                    )
                             # ADR 1주는 본주 0.1주에 해당하므로, 본주 환산가로 되돌려 비교한다
                             adr_per_share = adr_krw / ADR_SHARE_RATIO
                             with adr_krw_col.container(key="metric_small_adr_krw"):
