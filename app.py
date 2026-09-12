@@ -1651,39 +1651,10 @@ def render_current_price():
         low_p = price_info.get("lowPrice", "-")
         volume = price_info.get("accumulatedTradingVolume", "-")
 
-        with st.container(key="price_row_columns"):
-            # 시가총액은 폴링 응답에 marketValueFull(원 단위)로 이미 들어 있다.
-            # 주가와 같은 주기로 갱신되므로 다른 지표와 같은 줄에 둔다.
-            cap_raw = _to_number(data.get("marketValueFullRaw")) or _to_number(data.get("marketValueFull"))
-            cap_txt = f"{cap_raw / 1e12:,.1f}조" if cap_raw else "-"
-
-            (price_col, open_col, high_col,
-             low_col, volume_col, cap_col) = st.columns(6)
-            price_col.metric(
-                label="현재가 (시세 지연)",
-                value=f"{close_price:,}원",
-                delta=f"{change:+,}원 ({change_pct:+.2f}%)",
-                delta_color="normal",
-            )
-            for col, label, value, key in [
-                (open_col, "시가", open_p, "open"),
-                (high_col, "고가", high_p, "high"),
-                (low_col, "저가", low_p, "low"),
-                (volume_col, "거래량", volume, "volume"),
-            ]:
-                with col.container(key=f"metric_small_{key}"):
-                    st.metric(label, value)
-            with cap_col.container(key="metric_small_marketcap"):
-                _metric_with_help(
-                    "시가총액", cap_txt,
-                    "상장예정주식수까지 포함한 시가총액입니다(보통주+우선주). "
-                    "주가와 같은 주기로 갱신되므로 장중에는 계속 바뀝니다.",
-                    key="marketcap",
-                )
-
         # 프리장/애프터장(NXT) 실시간 시세. 정규장이 닫혀 있어도 이 구간에는 값이 움직인다.
         # 기준가는 '직전 정규장 종가'로 잡는다 — 프리장이면 전 거래일 종가, 애프터장이면 당일 종가라
         # 어느 쪽이든 '정규장 대비 지금 얼마나 움직였나'가 된다.
+        # 현재가 줄에 나란히 넣을지부터 먼저 정해야 하므로, 시가·고가 등을 그리기 전에 계산한다.
         over = data.get("overMarketPriceInfo") or {}
         over_price = _parse_price_number(over.get("overPrice"))
         over_volume = None
@@ -1718,18 +1689,24 @@ def render_current_price():
                         else last_tick["시각"].strftime("%m-%d %H:%M:%S")
                     )
                     status_label = "마감"
+        show_over = over_price is not None and bool(session_label)
 
-        if over_price is not None and session_label:
-            over_diff = over_price - close_price
-            over_pct = (over_diff / close_price * 100) if close_price else 0.0
-            with st.container(key="price_row_over"):
-                if over_volume is not None:
-                    over_col, over_vol_col = st.columns([2, 3])
-                else:
-                    # 실시간 시간외가 아니라 장 마감 후 남은 마지막 기록이면 거래량이 없다.
-                    # 옆 칸을 비워두는 대신 지표가 한 줄을 다 쓰게 한다 — 안 그러면
-                    # 모바일에서 폭 절반이 그냥 빈 채로 남는다.
-                    over_col = st.container()
+        with st.container(key="price_row_columns"):
+            # 시가총액 대신 애프터장(있을 때만) 가격을 현재가 바로 옆에 둔다 — 정규장이
+            # 끝난 시간엔 애프터장 움직임이 시가총액보다 훨씬 자주 확인하는 값이다.
+            if show_over:
+                price_col, over_col, open_col, high_col, low_col, volume_col = st.columns(6)
+            else:
+                price_col, open_col, high_col, low_col, volume_col = st.columns(5)
+            price_col.metric(
+                label="현재가 (시세 지연)",
+                value=f"{close_price:,}원",
+                delta=f"{change:+,}원 ({change_pct:+.2f}%)",
+                delta_color="normal",
+            )
+            if show_over:
+                over_diff = over_price - close_price
+                over_pct = (over_diff / close_price * 100) if close_price else 0.0
                 with over_col.container(key="metric_small_over_price"):
                     _metric_with_help(
                         f"{session_label} (NXT) {status_label}",
@@ -1739,11 +1716,19 @@ def render_current_price():
                         delta=f"{over_diff:+,.0f}원 ({over_pct:+.2f}%)",
                         delta_color="normal",
                     )
-                if over_volume is not None:
-                    with over_vol_col.container(key="metric_small_over_volume"):
-                        st.metric(f"{session_label} 거래량", over_volume)
-            if over_at:
-                st.caption(f"{session_label} {status_label} 시각: {over_at}")
+            for col, label, value, key in [
+                (open_col, "시가", open_p, "open"),
+                (high_col, "고가", high_p, "high"),
+                (low_col, "저가", low_p, "low"),
+                (volume_col, "거래량", volume, "volume"),
+            ]:
+                with col.container(key=f"metric_small_{key}"):
+                    st.metric(label, value)
+        if show_over and over_at:
+            # 실시간 시간외 거래량이 있으면(장 마감 후 남은 기록엔 없다) 시각 옆에 같이 적는다 —
+            # 칸을 하나 더 쓰는 대신 캡션 한 줄로 충분하다.
+            vol_txt = f" · 거래량 {over_volume}" if over_volume is not None else ""
+            st.caption(f"{session_label} {status_label} 시각: {over_at}{vol_txt}")
         try:
             ma_window = int(st.session_state.get("overheat_ma_window", OVERHEAT_DEFAULT_MA_WINDOW))
             deviation, percentile = _live_deviation(close_price, ma_window)
