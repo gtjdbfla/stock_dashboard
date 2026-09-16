@@ -2818,8 +2818,7 @@ def _render_tab_supply():
     _subheader_with_help(
         f"최근 {lookback_days}일 투자자별 순매수 거래량",
         "개인·기관·외국인의 일별 순매수와 그 누적 추세입니다. 표의 기울기는 하루 평균이고 "
-        "양수면 매수 우위입니다.\n\n"
-        "개인 순매수는 네이버가 안 줘서 기관·외국인 합산의 잔차로 추정한 값이라 오차가 섞일 수 있습니다.",
+        "양수면 매수 우위입니다.",
         key="supply",
     )
     lookback_days = st.slider(

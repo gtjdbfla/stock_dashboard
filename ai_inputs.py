@@ -425,13 +425,23 @@ def _walk_trend(ticker: str, enough) -> "list[pd.DataFrame]":
 
 
 def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
-    cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
-    frames = _walk_trend(ticker, lambda fs: fs[-1]["날짜"].min() <= cutoff)
-    if not frames:
-        return pd.DataFrame(columns=["개인", "외국인", "기관"])
+    """일별 투자자별 순매수.
 
-    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜")
-    df = df[df["날짜"] >= cutoff].sort_values("날짜")
+    예전엔 매번 네이버 trend API를 700일 규모로 직접 훑었다(`_walk_trend`). 그 캐시
+    갱신이 app.py의 `st.fragment(run_every=...)` 예약 새로고침에 물려 있는데, 이건
+    **브라우저 세션이 붙어 있어야만** 도는 코드다 — 아무도 대시보드를 열어 두지
+    않으면 예약 시각(16·17·18·19시)이 지나도 캐시가 그대로 멈춰 있었다. AI 분석이
+    예전에 "브라우저가 붙어야 스크립트가 돈다"로 겪은 것과 같은 문제다.
+    `fetch_backtest_history_live`는 24시간 도는 수집기(`daily_history.tick`)가
+    상시로 채워 둔 파일을 우선 읽고, 오늘자만 가벼운 최근 60거래일 조회
+    (`fetch_latest_bars`, 1분 캐시)로 덧씌운다 — 파일 쪽은 브라우저 세션과 무관하게
+    매일 밤 갱신되므로, 최소 전날까지는 항상 최신이 보장된다.
+    """
+    hist = fetch_backtest_history_live(ticker, target_days=700)
+    if hist.empty:
+        return pd.DataFrame(columns=["개인", "외국인", "기관"])
+    cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
+    df = hist[hist["날짜"] >= cutoff].sort_values("날짜")
     # 순매수 세 열 뒤에 거래량·종가를 덧붙인다. 순매수는 '누가 샀나'만 알려줄 뿐,
     # 그 날 거래가 얼마나 활발했는지는 알 수 없어서 절대 거래량을 같이 본다.
     # 순매수 열만 골라 쓰는 곳이 있으므로 순서를 지켜 INVESTOR_COLUMNS를 앞에 둔다.
