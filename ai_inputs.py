@@ -42,8 +42,6 @@ import over_market as om
 DEFAULT_TICKER = "000660"
 
 
-NAVER_FRGN_URL = "https://finance.naver.com/item/frgn.naver"
-
 # 2026-09-10 저녁, 네이버가 PC 종목 페이지(finance.naver.com/item/*)를 표 없는 새 SPA로
 # 바꿨다. frgn.naver는 200을 주지만 <table>이 0개인 껍데기라 pd.read_html이 lxml에서
 # 실패하고 bs4로 넘어가다 html5lib가 없어 ImportError로 터졌다 — 에러 이름만 보면
@@ -1015,53 +1013,97 @@ def fetch_market_flow() -> dict | None:
     }
 
 
-# 거래원(외국계추정합)은 2026-09-10 현재 되살릴 방법이 없다. 네이버가 PC 종목 페이지를
-# 새 SPA로 바꾸면서 표가 사라졌고, 모바일 앱에는 이 화면 자체가 없다 — 종목 페이지가
-# 부르는 API 212개를 훑어도 거래원 경로가 없었다. 아래 코드는 옛 표 구조를 기억해 두려고
-# 남긴다. 다시 켜려면 FOREIGN_DESK_ENABLED를 True로 하고 새 출처를 물려주면 된다.
-#
-# 이 함수는 화면 상단 5초 프래그먼트에서 ttl=20으로 불린다. 껍데기 페이지를 20초마다
-# 계속 받아 봐야 소용이 없으므로 요청 자체를 하지 않는다.
-FOREIGN_DESK_ENABLED = False
+# 네이버 거래원(외국계추정합)은 2026-09-10에 막혔다(PC 종목 페이지가 표 없는 새 SPA로
+# 바뀌었고, 모바일 앱에는 이 화면 자체가 없다 — API 212개를 훑어도 대체 경로가 없었다).
+# 대신 한국투자증권 Open API의 '종목별 외국계 순매수추이'(frgnmem-pchs-trend,
+# [국내주식-164])가 같은 개념의 값을 준다. 응답의 glob_ntby_qty(외국계순매수수량)가
+# frgn_shnu_vol(매수) - frgn_seln_vol(매도)과 정확히 일치함을 실측으로 확인했다.
+# 무료지만 계좌 개설 + KIS Developers 포털에서 앱키·앱시크리트 발급이 필요하다
+# (KIS_APP_KEY / KIS_APP_SECRET 환경변수).
+FOREIGN_DESK_ENABLED = True
+
+KIS_APP_KEY = os.environ.get("KIS_APP_KEY", "")
+KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
+# 실전투자 도메인. 모의투자 앱키를 쓰게 되면 openapivts...:29443으로 바꿔야 한다.
+KIS_BASE_URL = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
+# 대시보드·수집기 컨테이너가 ./data를 공유 볼륨으로 마운트하므로, 토큰을 여기 캐시해
+# 두 프로세스가 같은 토큰을 재사용한다. 토큰 유효기간은 24시간이고, 발급 때마다
+# 카카오 알림톡이 온다 — 매번 새로 받으면 알림톡 스팸이 된다.
+KIS_TOKEN_FILE = os.environ.get("KIS_TOKEN_FILE", "data/kis_token.json")
+
+
+def _kis_get_token() -> str | None:
+    """캐시된 토큰이 유효하면 그걸 쓰고, 아니면 새로 발급받아 캐시한다."""
+    if not (KIS_APP_KEY and KIS_APP_SECRET):
+        return None
+    try:
+        with open(KIS_TOKEN_FILE, encoding="utf-8") as f:
+            cached = json.load(f)
+        expires_at = dt.datetime.fromisoformat(cached["expires_at"])
+        # 만료 10분 전부터는 미리 새로 받는다(요청 도중 만료되는 걸 피한다).
+        if dt.datetime.now(dt.timezone.utc) < expires_at - dt.timedelta(minutes=10):
+            return cached["access_token"]
+    except (OSError, ValueError, KeyError):
+        pass
+
+    resp = requests.post(
+        f"{KIS_BASE_URL}/oauth2/tokenP",
+        json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET},
+        headers={"Content-Type": "application/json"}, timeout=10,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    token = body.get("access_token")
+    if not token:
+        return None
+    expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=int(body.get("expires_in", 86400)))
+    try:
+        os.makedirs(os.path.dirname(KIS_TOKEN_FILE) or ".", exist_ok=True)
+        with open(KIS_TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"access_token": token, "expires_at": expires_at.isoformat()}, f)
+    except OSError:
+        pass  # 캐시 실패해도 이번 토큰은 그대로 쓴다
+    return token
 
 
 def fetch_foreign_desk(ticker: str) -> dict:
-    """거래원 표에서 외국계추정합과 매도·매수 상위 증권사를 뽑는다."""
+    """KIS '종목별 외국계 순매수추이'에서 가장 최근 집계 한 줄을 뽑는다."""
     if not FOREIGN_DESK_ENABLED:
         return {}
-    r = requests.get(NAVER_FRGN_URL, params={"code": ticker},
-                     headers={"User-Agent": "Mozilla/5.0",
-                              "Referer": "https://finance.naver.com/"}, timeout=10)
+    token = _kis_get_token()
+    if not token:
+        return {}
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "FHKST644400C0",
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": ticker,
+        "FID_INPUT_ISCD_2": "99999",
+    }
+    r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/frgnmem-pchs-trend",
+                      headers=headers, params=params, timeout=10)
     r.raise_for_status()
-    r.encoding = "euc-kr"
-    table = None
-    for tb in pd.read_html(StringIO(r.text)):
-        if list(tb.columns)[:2] == ["매도상위", "거래량"]:
-            table = tb
-            break
-    if table is None:
+    body = r.json()
+    if body.get("rt_cd") != "0":
+        return {}
+    output = body.get("output") or []
+    if not output:
+        return {}
+    row = output[0]  # 가장 최근 집계 시각이 첫 행이다
+    sell, buy, net = _to_number(row.get("frgn_seln_vol")), _to_number(row.get("frgn_shnu_vol")), _to_number(row.get("glob_ntby_qty"))
+    if sell is None or buy is None or net is None:
         return {}
 
-    hit = table[table["매도상위"].astype(str).str.contains("외국계추정합", na=False)]
-    if hit.empty:
-        return {}
-    row = hit.iloc[0]
-    sell, buy = _to_number(row["거래량"]), _to_number(row["거래량.1"])
-    if sell is None or buy is None:
-        return {}
-
-    # 상위 증권사 목록. '외국계추정합' 줄과 빈 줄을 걷어낸다.
-    brokers = table[~table["매도상위"].astype(str).str.contains("외국계추정합", na=False)]
-    brokers = brokers.dropna(subset=["매도상위", "매수상위"])
-
-    # 페이지에 찍힌 시각. 다만 이건 '시세' 블록의 시각이고, 거래원 표에는 자체 시각 표기가 없다.
-    # 거래원 값이 정확히 언제 것인지는 네이버가 밝히지 않으므로 '조회 시각'으로만 쓴다.
     stamp = None
-    m = re.search(r"(\d{2})시\s*(\d{2})분\s*기준", re.sub(r"<[^>]+>", " ", r.text))
-    if m:
-        stamp = f"{m.group(1)}:{m.group(2)}"
-    return {"매도": sell, "매수": buy, "순매수": buy - sell,
-            "기준": stamp, "상위": brokers[["매도상위", "거래량", "매수상위", "거래량.1"]]}
+    hhmmss = str(row.get("bsop_hour") or "")
+    if len(hhmmss) == 6:
+        stamp = f"{hhmmss[:2]}:{hhmmss[2:4]}"
+    return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
 
 
 def build_foreign_desk_summary(ticker: str) -> str:
