@@ -48,8 +48,8 @@ from ai_inputs import (
     fetch_earnings_calendar,
     fetch_investor_netbuy,
     fetch_macro_summary,
-    fetch_news_with_summary,
     fetch_sector_news,
+    fetch_stock_news_with_summary,
     fetch_stock_snapshot,
     fetch_trendforce_news,
     generate_ai_analysis,
@@ -111,7 +111,7 @@ def build_and_save(ticker: str, stock_name: str, use_search: bool = True,
         cur_close = int(cur_close) if cur_close else None
         _snap = snapshot or {}
         _fetch_jobs = (
-            lambda: fetch_news_with_summary(stock_name),
+            lambda: fetch_stock_news_with_summary(stock_name),
             lambda: fetch_analyst_reports(ticker),
             lambda: fetch_trendforce_news(),
             lambda: fetch_macro_summary(),

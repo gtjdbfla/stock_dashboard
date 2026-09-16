@@ -990,6 +990,23 @@ def fetch_news_with_summary(query: str, count: int = 6) -> list[dict]:
     return items
 
 
+def fetch_stock_news_with_summary(stock_name: str, count: int = 6) -> list[dict]:
+    """종목 자체 뉴스. '{종목명}' 단독 검색에 '{종목명} 특징주' 검색을 더해 합친다.
+
+    '{종목명}' 단독 최신순 검색은 그날 화제성이 큰 재료(예: 특정 기업과의 협력설)라면
+    상위 count건에 잘 걸리지만, 몇 % 안팎으로 애매하게 움직인 날은 시황·타사 언급
+    기사에 밀려 정작 '오늘 왜 움직였는지'를 다루는 기사가 상위 밖으로 나간다.
+    '특징주'가 붙은 기사는 정확히 그 질문("OO 소식에 강세/약세")을 다루는 장르라
+    이 구멍을 메운다. 실측: 특징주 검색만으로 겹치지 않는 기사가 추가로 잡혔다.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        general_f = pool.submit(fetch_news_with_summary, stock_name, count)
+        feature_f = pool.submit(fetch_news_with_summary, f"{stock_name} 특징주", 4)
+    general, feature = general_f.result(), feature_f.result()
+    seen = {it["제목"] for it in general}
+    return general + [it for it in feature if it["제목"] not in seen]
+
+
 NAVER_INVESTOR_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
 
 
@@ -1301,15 +1318,26 @@ def build_intraday_summary(ticker: str, close_price: int | None) -> str:
         f"시가 {open_p:,.0f} / 고가 {high_p:,.0f} / 저가 {low_p:,.0f} / 마지막 {last_p:,.0f}원",
         f"- 고점 대비 낙폭 {(low_p / high_p - 1) * 100:+.2f}%, 저점 대비 회복 {(last_p / low_p - 1) * 100:+.2f}%",
     ]
-    # 30분 단위로 가장 크게 움직인 구간을 짚어준다
+    # 약 30분 폭의 슬라이딩 윈도우로 가장 급등·급락한 구간을 각각 짚어준다.
+    # 예전엔 겹치지 않는 30분 그리드로 나눠 딱 하나만 골랐다 — 실제 급변이 그리드
+    # 경계에 걸치면 두 칸으로 쪼개져 폭이 실제보다 작게 잡히고, 상승·하락이 하루에
+    # 둘 다 있었던 날(예: 오전 급락 후 오후 급등)은 절댓값이 큰 쪽 하나만 보고돼서
+    # 다른 한쪽의 재료(뉴스·공시)를 AI가 아예 못 짚었다.
     step = max(len(px) // 13, 1)
-    moves = []
-    for i in range(0, len(px) - step, step):
+    best_up = best_down = None  # (변화율, 시작시각, 끝시각)
+    for i in range(len(px) - step):
         chg = px.iloc[i + step] / px.iloc[i] - 1
-        moves.append((abs(chg), chg, bars["시각"].iloc[i], bars["시각"].iloc[i + step]))
-    if moves:
-        _, chg, t0, t1 = max(moves)
-        lines.append(f"- 가장 급했던 구간: {t0:%H:%M}~{t1:%H:%M} {chg * 100:+.2f}%")
+        t0, t1 = bars["시각"].iloc[i], bars["시각"].iloc[i + step]
+        if chg > 0 and (best_up is None or chg > best_up[0]):
+            best_up = (chg, t0, t1)
+        elif chg < 0 and (best_down is None or chg < best_down[0]):
+            best_down = (chg, t0, t1)
+    if best_up:
+        chg, t0, t1 = best_up
+        lines.append(f"- 가장 급등한 구간: {t0:%H:%M}~{t1:%H:%M} {chg * 100:+.2f}%")
+    if best_down:
+        chg, t0, t1 = best_down
+        lines.append(f"- 가장 급락한 구간: {t0:%H:%M}~{t1:%H:%M} {chg * 100:+.2f}%")
     return "\n".join(lines)
 
 
@@ -2239,7 +2267,7 @@ def generate_ai_analysis(
 
 ## 오늘 이렇게 움직인 이유
 먼저 '최근 일별 주가 흐름'으로 오늘을 앞 며칠과 이어서 한 문장(연속 하락 끝 반등인지, 상승 며칠째인지).
-그다음 장중에서 급했던 구간을 짚고 그 시각의 공시·뉴스와 연결해라. 없으면 "직접 연결되는 재료는 데이터에 없음".
+그다음 장중 급등·급락 구간이 있으면(둘 다 있을 수 있다) 각각 그 시각의 공시·뉴스와 연결해라. 없으면 "직접 연결되는 재료는 데이터에 없음".
 시간외에서 방향이 바뀌었으면 별도 문단으로. 시간외 등락률은 정규장 종가 대비다.
 
 ## 종목 이슈인가, 업종 전체인가
