@@ -1133,6 +1133,92 @@ def fetch_foreign_desk(ticker: str) -> dict:
     return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
 
 
+def fetch_short_sale_daily(ticker: str) -> pd.DataFrame:
+    """KIS '국내주식 공매도 일별추이'. 최근 100거래일 정도가 최신순으로 온다.
+
+    화면(애널리스트 탭)의 fetch_short_balance(FnGuide, 주간·1년치, 장기 추이용)와는
+    다른 소스다. 이건 일별이라 "오늘 공매도 비중이 평소 대비 급증했다"를 AI 분석이
+    그날 하락의 직접 근거로 쓸 수 있다 — FnGuide 주간치로는 "특정 날짜 원인으로
+    쓰지 마라"고 못박을 수밖에 없었다.
+    """
+    token = _kis_get_token()
+    if not token:
+        return pd.DataFrame()
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "FHPST04830000",
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": ticker,
+        "FID_INPUT_DATE_1": "",
+        "FID_INPUT_DATE_2": "",
+    }
+    r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/daily-short-sale",
+                      headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("rt_cd") != "0":
+        return pd.DataFrame()
+    rows = body.get("output2") or []
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["일자"] = pd.to_datetime(df["stck_bsop_date"], format="%Y%m%d")
+    df["종가"] = df["stck_clpr"].astype(float)
+    df["거래량"] = df["acml_vol"].astype(float)
+    df["공매도비중"] = df["ssts_vol_rlim"].astype(float)
+    df["공매도거래대금비중"] = df["ssts_tr_pbmn_rlim"].astype(float)
+    df = df.sort_values("일자")[["일자", "종가", "거래량", "공매도비중", "공매도거래대금비중"]]
+    # 오늘 날짜는 장 시작 전이라도 API가 거래량 0짜리 행을 미리 끼워 준다. 이걸 그대로
+    # 두면 "당일 확정 0.00%"처럼 아직 일어나지 않은 하루를 실제 값인 양 보고하게 된다.
+    return df[df["거래량"] > 0].reset_index(drop=True)
+
+
+def fetch_credit_balance_daily(ticker: str) -> pd.DataFrame:
+    """KIS '국내주식 신용잔고 일별추이'. 개인 투자자의 레버리지(빚투) 잔고 수준.
+
+    대시보드에 전혀 없던 지표다. 한 번 호출에 최근 30건(약 한 달)이 온다 — 페이지네이션
+    (tr_cont)을 더 밟으면 늘릴 수 있지만, 이 지표는 장기 이력보다 최근 추세 판단이
+    목적이라 한 번으로 그친다. FID_INPUT_DATE_1은 '결제일자' 기준이라, 실제 매매일보다
+    2영업일 늦게 반영된다(매매 T일 -> 결제 T+2일).
+    """
+    token = _kis_get_token()
+    if not token:
+        return pd.DataFrame()
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "FHPST04760000",
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_SCR_DIV_CODE": "20476",
+        "FID_INPUT_ISCD": ticker,
+        "FID_INPUT_DATE_1": dt.datetime.now(om.KST).strftime("%Y%m%d"),
+    }
+    r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/daily-credit-balance",
+                      headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("rt_cd") != "0":
+        return pd.DataFrame()
+    rows = body.get("output") or []
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["일자"] = pd.to_datetime(df["deal_date"], format="%Y%m%d")
+    df["종가"] = df["stck_prpr"].astype(float)
+    df["신용잔고수량"] = df["whol_loan_rmnd_stcn"].astype(float)
+    df["신용잔고율"] = df["whol_loan_rmnd_rate"].astype(float)
+    return df.sort_values("일자")[["일자", "종가", "신용잔고수량", "신용잔고율"]].reset_index(drop=True)
+
+
 def build_foreign_desk_summary(ticker: str) -> str:
     """AI 분석에 넘길 한 덩어리. 추정치라는 점을 반드시 함께 넘긴다."""
     try:
@@ -2071,29 +2157,83 @@ def build_consensus_trend_summary(ticker: str, snapshot: dict) -> str:
 
 
 def build_short_sale_summary(ticker: str) -> str:
-    """차입공매도 비중 추이.
+    """일별 공매도 거래비중 추이. KIS Open API를 우선 쓰고, 실패하면 FnGuide 주간치로 돌아간다.
 
     "숏커버링이었나"를 판단할 재료가 대시보드에 통째로 없었다. KRX·KOFIA·세이브로가 다 막혀
-    포기했었는데 FnGuide 페이지 안에 주간 1년치가 있었다. 주간이라 일별 급등락은 못 짚는다.
+    포기했었는데 FnGuide 페이지 안에 주간 1년치가 있어 우선 그걸로 메웠다("주간이라 특정
+    날짜는 못 짚는다"는 단서를 달아야 했다). 이제 KIS Open API가 일별로 준다 — 오늘 값을
+    그날 등락의 직접 근거로 쓸 수 있다. KIS 키가 없거나 호출에 실패하면 기존 FnGuide
+    주간치로 조용히 폴백한다(운영에 없어서는 안 되는 값이 아니라서 실패를 화면에 안 남긴다).
     """
     try:
-        df = fetch_short_balance(ticker)
+        df = fetch_short_sale_daily(ticker)
+    except Exception:
+        df = pd.DataFrame()
+    if not df.empty:
+        last = df.iloc[-1]
+        recent = df.tail(20)  # 최근 약 한 달
+        avg = float(recent["공매도비중"].mean())
+        cur = float(last["공매도비중"])
+        lines = [
+            f"- {last['일자']:%Y-%m-%d}(당일 확정) 공매도 거래비중 {cur:.2f}%"
+            f" (최근 20거래일 평균 {avg:.2f}%, 최고 {recent['공매도비중'].max():.2f}%,"
+            f" 최저 {recent['공매도비중'].min():.2f}%)",
+        ]
+        if len(df) >= 2:
+            prev = float(df.iloc[-2]["공매도비중"])
+            lines.append(f"- 전일 {prev:.2f}% 대비 {cur - prev:+.2f}%p"
+                         f" ({'증가' if cur > prev else '감소' if cur < prev else '변화 없음'})")
+        lines.append("- 일별 값이므로 오늘 등락의 직접 근거로 써도 된다. 비중이 높다고 곧"
+                     " 하락은 아니고, 되레 숏커버링(공매도 상환 매수)이 상승 재료가 되기도 한다.")
+        return "\n".join(lines)
+
+    try:
+        fdf = fetch_short_balance(ticker)
+    except Exception:
+        return ""
+    if fdf.empty:
+        return ""
+    last = fdf.iloc[-1]
+    avg = float(fdf["차입공매도비중"].mean())
+    cur = float(last["차입공매도비중"])
+    lines = [f"- 최근 {last['일자']:%Y-%m-%d} 기준 차입공매도 비중 {cur:.2f}%"
+             f" (최근 1년 평균 {avg:.2f}%, 최고 {fdf['차입공매도비중'].max():.2f}%,"
+             f" 최저 {fdf['차입공매도비중'].min():.2f}%)"]
+    if len(fdf) >= 5:
+        prev = float(fdf.iloc[-5]["차입공매도비중"])
+        lines.append(f"- 4주 전 {prev:.2f}% 대비 {cur - prev:+.2f}%p"
+                     f" ({'증가' if cur > prev else '감소' if cur < prev else '변화 없음'})")
+    lines.append("- 주간 단위 값이라 특정 날짜의 급등락은 설명하지 못한다."
+                 " 비중이 높다고 곧 하락이 아니고, 되레 숏커버링이 상승 재료가 되기도 한다.")
+    return "\n".join(lines)
+
+
+def build_credit_balance_summary(ticker: str) -> str:
+    """신용융자 잔고 추이. 개인 투자자의 레버리지(빚투) 매수 심리를 보여준다.
+
+    대시보드에 지금까지 전혀 없던 지표다(KIS Open API). 잔고 급증은 개인 매수 과열
+    (조정 시 반대매매 위험), 급감은 신용 정리(디레버리징) 신호로 읽는다.
+    """
+    try:
+        df = fetch_credit_balance_daily(ticker)
     except Exception:
         return ""
     if df.empty:
         return ""
     last = df.iloc[-1]
-    avg = float(df["차입공매도비중"].mean())
-    cur = float(last["차입공매도비중"])
-    lines = [f"- 최근 {last['일자']:%Y-%m-%d} 기준 차입공매도 비중 {cur:.2f}%"
-             f" (최근 1년 평균 {avg:.2f}%, 최고 {df['차입공매도비중'].max():.2f}%,"
-             f" 최저 {df['차입공매도비중'].min():.2f}%)"]
+    lines = [
+        f"- {last['일자']:%Y-%m-%d} 결제일 기준 신용융자 잔고 {last['신용잔고수량']:,.0f}주"
+        f" (잔고율 {last['신용잔고율']:.2f}%)",
+    ]
     if len(df) >= 5:
-        prev = float(df.iloc[-5]["차입공매도비중"])
-        lines.append(f"- 4주 전 {prev:.2f}% 대비 {cur - prev:+.2f}%p"
-                     f" ({'증가' if cur > prev else '감소' if cur < prev else '변화 없음'})")
-    lines.append("- 주간 단위 값이라 특정 날짜의 급등락은 설명하지 못한다."
-                 " 비중이 높다고 곧 하락이 아니고, 되레 숏커버링이 상승 재료가 되기도 한다.")
+        prev = df.iloc[-5]
+        if prev["신용잔고수량"]:
+            chg = (last["신용잔고수량"] / prev["신용잔고수량"] - 1) * 100
+            lines.append(f"- 5거래일 전({prev['일자']:%m-%d}) 대비 잔고 {chg:+.1f}%"
+                         f" ({'증가' if chg > 0 else '감소' if chg < 0 else '변화 없음'})")
+    lines.append("- 신용잔고 급증은 개인 레버리지 매수 과열(조정 시 반대매매 위험), 급감은"
+                 " 신용 정리(디레버리징) 신호로 읽는다. 결제일 기준이라 실제 매매일보다"
+                 " 2영업일 늦게 반영된다.")
     return "\n".join(lines)
 
 
@@ -2154,6 +2294,7 @@ def generate_ai_analysis(
     consensus_md: str = "",
     market_state_md: str = "",
     short_sale_md: str = "",
+    credit_balance_md: str = "",
     foreign_desk_md: str = "",
     analyst_view_md: str = "",
     broker_targets_md: str = "",
@@ -2254,8 +2395,12 @@ def generate_ai_analysis(
    게재분만 대신 증권사별 내역이 있다. 목표주가를 인용할 때는 **어느 쪽 값인지 반드시
    밝혀라**(예: "컨센서스 3,279,565원(FnGuide)"). 두 값을 평균 내거나 섞지 마라.
 
-[차입공매도 비중 — 주간, 최근 1년]
+[공매도 거래비중 — 일별 확정치면 오늘 근거로 써도 됨. 주간치면 특정 날짜 근거로 쓰지 말 것.
+ 아래 문구 자체가 어느 쪽인지 밝힌다]
 {short_sale_md if short_sale_md else "(수집 실패)"}
+
+[신용융자 잔고 — 개인 레버리지 매수 심리. 결제일 기준이라 매매일보다 2영업일 늦음]
+{credit_balance_md if credit_balance_md else "(수집 실패)"}
 
 [투자자 커뮤니티 — 게시글 원문. 여론이지 사실이 아님]
 {community_summary if community_summary else "(수집 실패)"}
@@ -2281,7 +2426,7 @@ def generate_ai_analysis(
    `[공시]` 전자공시(숫자 인용) · `[뉴스]` 종목+업종·매크로 뉴스 · `[리포트]` 애널리스트(증권가 시각 정리의 목표주가·추정 실적 숫자 인용)
    `[산업]` TrendForce+DRAM 현물가+빅테크 Capex+실적 발표 일정
    `[거시]` SOX·나스닥·달러인덱스·환율·금리+ADR 괴리율
-   `[대시보드]` 수급·과열도·조기신호·컨센서스·동일업종·외국인 보유율·차입공매도
+   `[대시보드]` 수급·과열도·조기신호·컨센서스·동일업종·외국인 보유율·공매도·신용융자잔고
    `[재무]` 재무 정리의 매출·영업이익·이익률 추이와 추정치(숫자 인용)
 2) 형식은 `[갈래] 내용 (근거 숫자)`. 말머리는 위 일곱 개만.
 3) 쓸 근거가 없는 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음` 한 줄.
@@ -2321,8 +2466,11 @@ def generate_ai_analysis(
 - 실적 발표가 3일 이내면 관망세 배경으로 짚되 결과는 예측 금지.
 - 목표주가는 수준보다 방향(상향/하향)이 중요. 기록 없으면 없다고 써라.
 - '외국계 창구 추정 순매수'는 거래원 기반 추정치다. '추정'임을 밝히고, 이 값으로 기관·개인을 추측하지 마라.
-- 차입공매도 비중은 주간 값이다. 특정 날짜의 원인으로 쓰지 말고 평균 대비 수준·방향으로만.
-  높다고 하락을 예상하지 마라(숏커버링이 상승 재료가 되기도 한다).
+- 공매도 거래비중은 [공매도 거래비중] 섹션 본문이 일별인지 주간인지 밝힌다 — 그 표시를 따라라.
+  주간이면 특정 날짜 근거로 쓰지 말고 평균 대비 수준·방향으로만. 높다고 하락을 예상하지
+  마라(숏커버링이 상승 재료가 되기도 한다).
+- 신용융자 잔고는 결제일 기준이라 매매일보다 2영업일 늦다. 오늘 등락의 직접 원인이 아니라
+  최근 며칠간의 레버리지 심리 배경으로만 써라.
 - 커뮤니티는 여론이지 사실이 아니다. 매수/매도 추천·목표가 제시 금지.
 - 장중에는 오늘 값을 '종가'·'마감'으로 쓰지 마. [지금 시장 상태]대로 진행 중임이 드러나게.
 - 수급 숫자는 날짜를 확인해라. 장중이면 오늘 수급은 아직 없다.
