@@ -138,7 +138,11 @@ _CACHED = {
     'fetch_foreign_desk': dict(ttl=20, show_spinner=False),
     'fetch_foreign_hold_ratio': dict(ttl=600, show_spinner=False),
     'fetch_intraday_price': dict(ttl=10, show_spinner="불러오는 중..."),
-    'fetch_investor_netbuy': dict(ttl=3600, show_spinner="불러오는 중..."),
+    # 예전엔 매번 네이버를 700일 규모로 직접 훑어서 무거웠기에 1시간을 줬다. 이제 내부가
+    # daily_history 파일 우선(가벼움) + fetch_latest_bars(ttl=60)로 바뀌었는데, 이 캐시가
+    # 1시간으로 남아 있으면 안쪽이 최신이어도 바깥이 최대 1시간 묵은 결과를 그대로 돌려준다
+    # (오늘자 순매수가 몇 시간째 안 보인다는 신고의 원인이었다). 안쪽 최신성 한도(60초)에 맞춘다.
+    'fetch_investor_netbuy': dict(ttl=60, show_spinner="불러오는 중..."),
     'fetch_latest_bars': dict(ttl=60, show_spinner="불러오는 중..."),
     'fetch_macro_summary': dict(ttl=1800, show_spinner=False),
     'fetch_market_flow': dict(ttl=20, show_spinner=False),
