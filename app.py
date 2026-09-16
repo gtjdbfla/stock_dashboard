@@ -1963,6 +1963,9 @@ def render_intraday_chart():
         # 본주 파트와 ADR 파트를 한 그림에 쌓고, 마지막에 버튼으로 묶는다.
         # 예전에는 분봉이 있을 때만 ADR을 붙여서, 분봉이 아직 없는 아침(프리장)에는
         # ADR 그래프가 통째로 사라졌다. 이제 어느 한쪽만 있어도 그 쪽을 보여준다.
+        # 애프터장 색. 네이버 분봉이 이제 정규장 마감 이후(NXT) 체결까지 함께 주기
+        # 시작해서(2026-09-16 확인), 그 구간을 정규장(빨강)과 구분해서 표시한다.
+        POST_MARKET_COLOR = "#ff7f0e"
         fig_intraday = go.Figure()
         host_traces = 0
         host_shapes: list[dict] = []
@@ -1998,7 +2001,7 @@ def render_intraday_chart():
                     ("프리장", over_only[over_only["시각"] < open_t], "#7f7f7f"),
                     ("정규장", over_only[(over_only["시각"] >= open_t)
                                        & (over_only["시각"] <= close_t)], "#d62728"),
-                    ("애프터장", over_only[over_only["시각"] > close_t], "#7f7f7f"),
+                    ("애프터장", over_only[over_only["시각"] > close_t], POST_MARKET_COLOR),
                 ]
                 for label, seg, color in segments:
                     if seg.empty:
@@ -2055,24 +2058,34 @@ def render_intraday_chart():
             x_end = dt.datetime.combine(trade_date, dt.time(15, 30))
             prev_close = close_price - change
 
-            # 직접 쌓아둔 시간외 체결가를 정규장 앞뒤에 이어붙인다.
-            # 프리장 시간대에는 분봉이 아직 전 거래일 것이므로, 화면 기준일(chart_date)은
-            # '분봉 날짜'와 '시간외 기록의 최신 날짜' 중 더 나중으로 잡는다.
+            # 네이버 분봉이 2026-09-16부터 정규장 마감(15:30) 이후 시간외(NXT) 체결까지
+            # 같은 API로 함께 준다. 그 구간을 정규장과 갈라 애프터장(주황)으로 따로 그린다 —
+            # 안 그러면 정규장 빨간 선이 마감 이후에도 계속 늘어나서, 아래서 덧그리는
+            # 직접 수집 데이터(예전 방식)와 같은 구간에 두 겹으로 겹쳐 보였다.
+            regular_df = intraday_df[intraday_df["시각"] <= x_end]
+            naver_post_df = intraday_df[intraday_df["시각"] > x_end]
+
+            # 직접 쌓아둔 시간외 체결가. 프리장은 네이버 분봉에 여전히 없어서 이걸로 채운다.
+            # 애프터장은 네이버 분봉이 비어 있을 때만(개편 이전으로 되돌아가는 경우 대비)
+            # 폴백으로 쓴다 — naver_post_df와 동시에 그리면 다시 겹친다.
             over_ticks = load_over_market_ticks(TICKER, trade_date)
             chart_date = trade_date
             if not over_ticks.empty:
                 chart_date = max(trade_date, over_ticks["시각"].max().date())
-            # 프리장 = 화면 기준일의 정규장 개장 전 / 애프터장 = 정규장 날짜의 폐장 후
+            # 프리장 = 화면 기준일의 정규장 개장 전
             pre_ticks = over_ticks[
                 (over_ticks["시각"].dt.date == chart_date)
                 & (over_ticks["시각"] < dt.datetime.combine(chart_date, dt.time(9, 0)))
             ]
-            post_ticks = over_ticks[
+            post_ticks = pd.DataFrame() if not naver_post_df.empty else over_ticks[
                 (over_ticks["시각"].dt.date == trade_date) & (over_ticks["시각"] > x_end)
             ]
+            post_from_naver = not naver_post_df.empty
             if not pre_ticks.empty:
                 x_start = min(x_start, pre_ticks["시각"].min().to_pydatetime())
-            if not post_ticks.empty:
+            if post_from_naver:
+                x_end = max(x_end, naver_post_df["시각"].max().to_pydatetime())
+            elif not post_ticks.empty:
                 x_end = max(x_end, post_ticks["시각"].max().to_pydatetime())
             if not pre_ticks.empty and chart_date > trade_date:
                 # 전 거래일 정규장 + 어젯밤 애프터장 + 오늘 아침 프리장을 한 흐름으로 보여준다
@@ -2080,20 +2093,28 @@ def render_intraday_chart():
 
             # --- 본주 트레이스 (기본 표시) ---
             fig_intraday.add_trace(go.Scatter(
-                x=intraday_df["시각"], y=intraday_df["현재가"],
+                x=regular_df["시각"], y=regular_df["현재가"],
                 mode="lines", line=dict(color="#d62728"), name="정규장",
                 hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>정규장</extra>",
             ))
             host_traces = 1
-            for ticks, label in ((pre_ticks, "프리장"), (post_ticks, "애프터장")):
-                if not ticks.empty:
-                    fig_intraday.add_trace(go.Scatter(
-                        x=ticks["시각"], y=ticks["가격"],
-                        mode="lines", line=dict(color="#7f7f7f"), name=label,
-                        hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>" + label + "</extra>",
-                    ))
-                    host_traces += 1
-            has_over = not pre_ticks.empty or not post_ticks.empty
+            if not pre_ticks.empty:
+                fig_intraday.add_trace(go.Scatter(
+                    x=pre_ticks["시각"], y=pre_ticks["가격"],
+                    mode="lines", line=dict(color="#7f7f7f"), name="프리장",
+                    hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>프리장</extra>",
+                ))
+                host_traces += 1
+            post_df = naver_post_df if post_from_naver else post_ticks
+            post_y_col = "현재가" if post_from_naver else "가격"
+            if not post_df.empty:
+                fig_intraday.add_trace(go.Scatter(
+                    x=post_df["시각"], y=post_df[post_y_col],
+                    mode="lines", line=dict(color=POST_MARKET_COLOR), name="애프터장",
+                    hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>애프터장</extra>",
+                ))
+                host_traces += 1
+            has_over = not pre_ticks.empty or not post_df.empty
 
             # 전일 종가 기준선을 도형(shape)이 아니라 트레이스로 그린다.
             # 그래야 아래 버튼으로 본주/ADR을 바꿀 때 같이 숨겨진다.
@@ -2118,10 +2139,13 @@ def render_intraday_chart():
                         line=dict(color="gray", dash="dot", width=1), opacity=0.35,
                     ))
                 help_lines.append(
-                    "회색 선이 프리장(08:00부터)·애프터장(20:00까지) 구간이고, "
-                    "세로 점선은 정규장 시작·종료 시각입니다.\n\n"
-                    "네이버가 시간외 분봉을 제공하지 않아, 서버가 20초마다 직접 기록한 값입니다. "
-                    "서버가 꺼져 있던 시간대는 비어 있습니다."
+                    "회색 선은 프리장(08:00부터, 네이버 분봉에 없어 서버가 20초마다 직접 기록한 "
+                    "값입니다 — 서버가 꺼져 있던 시간대는 비어 있습니다)이고, "
+                    "주황 선은 정규장 마감(15:30) 이후 시간외(NXT) 체결입니다"
+                    + (" — 네이버가 분봉으로 같이 주기 시작해서 정규장(빨강)과 색으로만 구분했습니다."
+                       if post_from_naver else
+                       "(네이버 분봉에 없어 서버가 직접 기록한 값입니다).")
+                    + "\n\n세로 점선은 정규장 시작·종료 시각입니다."
                 )
             else:
                 help_lines.append(
