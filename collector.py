@@ -16,6 +16,7 @@ import daily_history
 import disclosure
 import financial_digest
 import flow_probe
+import futures_history
 import over_market as om
 
 # 로그 한 줄 때문에 수집기가 죽는 일이 없게 한다.
@@ -104,6 +105,14 @@ def main() -> None:
             daily_history.tick(now, DIGEST_TICKER, log=log)
         except Exception as exc:
             log(f"일별이력 오류: {type(exc).__name__}: {exc}")
+
+        # 코스피200 선물 외국인 순매수 이력 파일. 옛 소스가 통째로 없어져서(HTTP 410)
+        # 하루치씩만 주는 새 API로 갈아탔다 - 파일이 없는 최초 1회는 700일을 하루씩
+        # 걸어 받느라 몇 분 걸린다(다음 tick부터는 최근 며칠치만 덧붙여 순식간이다).
+        try:
+            futures_history.tick(now, log=log)
+        except Exception as exc:
+            log(f"선물이력 오류: {type(exc).__name__}: {exc}")
 
         # AI 분석. 예약 시각(08~20시 정시)마다 한 번씩 만든다.
         # 예전에는 대시보드가 만들었는데, Streamlit은 브라우저가 붙어야 스크립트를

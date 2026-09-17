@@ -36,6 +36,7 @@ import daily_history
 import disclosure
 import financial_digest
 import fnguide
+import futures_history
 import over_market as om
 
 
@@ -881,63 +882,29 @@ def compute_composite(df: pd.DataFrame, signal_cols: list[str], results: dict[st
     return composite, weights
 
 
-FUTURES_DEAL_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
-
-
 def fetch_futures_foreign_history(target_days: int = 700) -> pd.DataFrame:
-    """코스피200 선물 외국인 순매수(계약수) 일별 이력. 특정 종목이 아닌 시장 전체 지표라 티커와 무관하게 캐시된다."""
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
-    frames = []
-    seen_dates = set()
-    bizdate = dt.date.today().strftime("%Y%m%d")
-    for _ in range(90):
-        resp = requests.get(FUTURES_DEAL_TREND_URL, params={"bizdate": bizdate, "code": "FUT"}, headers=headers, timeout=10)
-        resp.raise_for_status()
-        resp.encoding = "euc-kr"
-        try:
-            tables = pd.read_html(StringIO(resp.text))
-        except ValueError:
-            break
-        t = tables[0]
-        t.columns = ["날짜", "개인", "외국인", "기관계", "금융투자", "보험", "투신", "은행", "기타금융", "연기금", "기타법인"]
-        t = t.dropna(subset=["날짜"]).copy()
-        if t.empty:
-            break
-        t["날짜"] = pd.to_datetime(t["날짜"], format="%y.%m.%d")
-        t["외국인"] = pd.to_numeric(t["외국인"], errors="coerce")
-        new_rows = t[~t["날짜"].isin(seen_dates)]
-        if new_rows.empty:
-            break
-        seen_dates.update(new_rows["날짜"])
-        frames.append(new_rows[["날짜", "외국인"]])
-        if sum(len(f) for f in frames) >= target_days:
-            break
-        bizdate = (new_rows["날짜"].min() - pd.Timedelta(days=1)).strftime("%Y%m%d")
-    if not frames:
-        return pd.DataFrame(columns=["날짜", "선물외국인"])
-    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜").sort_values("날짜")
-    return out.reset_index(drop=True).rename(columns={"외국인": "선물외국인"})
+    """코스피200 선물 외국인 순매수(계약수) 일별 이력. 특정 종목이 아닌 시장 전체 지표라 티커와 무관하게 캐시된다.
+
+    **파일에 있으면 파일에서, 없거나 낡았을 때만 네이버에서 받는다** (futures_history.py).
+    옛 소스(한 페이지에 여러 날)는 2026-09월 HTTP 410으로 사라졌다. 새 소스는 하루치만
+    주는 API라 700일을 걸어 받는 게 무겁다 — 수집기가 하루 한 번 파일에 쌓아 두고,
+    화면은 그 파일을 읽는다. 파일이 없는 첫 배포에서는 여기서 받아 곧바로 저장한다.
+    """
+    cached = futures_history.load(target_days)
+    if cached is not None:
+        return cached
+    fresh = futures_history.fetch_range(dt.date.today(), target_days)
+    futures_history.save(fresh)
+    return fresh
 
 
 def fetch_latest_futures_bars() -> pd.DataFrame:
-    """장중 계속 바뀌는 코스피200 선물 최근 며칠치만 짧은 캐시로 빠르게 가져온다."""
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
-    bizdate = dt.date.today().strftime("%Y%m%d")
-    resp = requests.get(FUTURES_DEAL_TREND_URL, params={"bizdate": bizdate, "code": "FUT"}, headers=headers, timeout=10)
-    resp.raise_for_status()
-    resp.encoding = "euc-kr"
-    try:
-        tables = pd.read_html(StringIO(resp.text))
-    except ValueError:
+    """장중에도 바뀔 수 있는 코스피200 선물 오늘 값만 짧은 캐시로 가져온다."""
+    today = dt.date.today()
+    value = futures_history.fetch_one_day(today)
+    if value is None:
         return pd.DataFrame(columns=["날짜", "선물외국인"])
-    t = tables[0]
-    t.columns = ["날짜", "개인", "외국인", "기관계", "금융투자", "보험", "투신", "은행", "기타금융", "연기금", "기타법인"]
-    t = t.dropna(subset=["날짜"]).copy()
-    if t.empty:
-        return pd.DataFrame(columns=["날짜", "선물외국인"])
-    t["날짜"] = pd.to_datetime(t["날짜"], format="%y.%m.%d")
-    t["외국인"] = pd.to_numeric(t["외국인"], errors="coerce")
-    return t[["날짜", "외국인"]].reset_index(drop=True).rename(columns={"외국인": "선물외국인"})
+    return pd.DataFrame([{"날짜": pd.Timestamp(today), "선물외국인": value}])
 
 
 def fetch_futures_foreign_history_live(target_days: int = 700) -> pd.DataFrame:
