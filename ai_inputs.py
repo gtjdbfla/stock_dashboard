@@ -751,6 +751,425 @@ def fetch_macro_summary() -> str:
     return "\n".join(lines) if lines else "(수집 실패)"
 
 
+# ── 매매 신호 · 통합 신호 · 선물 경보 ─────────────────────────────────────────
+# 원래 app.py 안에서 화면 전용으로만 쓰던 백테스트 엔진들이다. 하락·상승 조기신호를
+# 프롬프트에 배선할 때와 같은 이유로 여기로 옮긴다 - 화면과 AI가 다른 함수로 각자
+# 계산하면 숫자가 어긋날 수 있다. app.py는 이제 이 이름들을 그대로 import해 쓰고,
+# 네트워크를 타는 세 함수(fetch_yahoo_history·fetch_futures_foreign_history·
+# fetch_latest_futures_bars)만 화면 쪽에서 _CACHED 표로 다시 캐시를 씌운다.
+
+YAHOO_SYMBOLS = {
+    "SOX": "%5ESOX",
+    "DXY": "DX-Y.NYB",
+}
+
+
+def fetch_yahoo_history(label: str) -> pd.DataFrame:
+    symbol = YAHOO_SYMBOLS[label]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(
+        YAHOO_CHART_URL.format(symbol=symbol), params={"range": "2y", "interval": "1d"}, headers=headers, timeout=15
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    result = data["chart"]["result"][0]
+    ts = result["timestamp"]
+    closes = result["indicators"]["quote"][0]["close"]
+    df = pd.DataFrame({"날짜": pd.to_datetime(ts, unit="s").normalize(), label: closes})
+    return df.dropna().reset_index(drop=True)
+
+
+def _level_slope(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).apply(lambda w: calc_slope(pd.Series(w)), raw=False)
+
+
+def build_composite_dataset(ticker: str) -> pd.DataFrame:
+    """무거운 하위 fetch들(기관/외국인 이력, SOX/DXY)은 각자 24시간 캐시되고 최근 며칠치만 1분 캐시로
+    실시간 반영되므로, 이 함수 자체는 캐시하지 않고 매번 가볍게 재조립한다."""
+    stock_hist = fetch_backtest_history_live(ticker)
+
+    df = stock_hist.copy()
+    for label in YAHOO_SYMBOLS:
+        df = df.merge(fetch_yahoo_history(label), on="날짜", how="left")
+    df = df.sort_values("날짜").reset_index(drop=True)
+
+    for label in YAHOO_SYMBOLS:
+        df[label] = df[label].ffill()
+
+    df["기관_기울기"] = _rolling_slope(df["기관"], 20)
+    df["SOX_기울기"] = _level_slope(df["SOX"], 20)
+    df["DXY_기울기"] = _level_slope(df["DXY"], 20)
+    return df
+
+
+def backtest_signal(
+    df: pd.DataFrame, signal_col: str, horizon: int,
+    drawdown_threshold: float = 0.07, gain_threshold: float | None = None,
+) -> dict:
+    gain_threshold = drawdown_threshold if gain_threshold is None else gain_threshold
+    d = df.copy()
+    d["fwd_return"] = d["종가"].shift(-horizon) / d["종가"] - 1
+    d["drawdown"] = forward_max_drawdown(d["종가"], horizon)
+    d["gain"] = forward_max_gain(d["종가"], horizon)
+    valid = d.dropna(subset=[signal_col, "fwd_return", "drawdown", "gain"])
+
+    result = {
+        "signal": signal_col, "horizon": horizon,
+        "n": len(valid), "pos_n": 0, "neg_n": 0,
+        "pos_mean": None, "neg_mean": None, "p_value": None, "corr": None,
+        "pos_down_rate": None, "neg_down_rate": None, "base_down_rate": None, "down_p_value": None,
+        "pos_up_rate": None, "neg_up_rate": None, "base_up_rate": None, "up_p_value": None,
+        "current_value": None, "current_regime": None,
+    }
+    # 현재 상태는 향후 수익률 계산 없이 전체 이력에서 바로 판단한다 (최근 horizon일은
+    # fwd_return이 아직 계산 안 돼 valid에서 빠지므로, valid 기준으로 뽑으면 horizon일 지연된 값이 된다).
+    signal_all = d[signal_col].dropna()
+    if len(signal_all) > 0:
+        current_value = float(signal_all.iloc[-1])
+        result["current_value"] = current_value
+        result["current_regime"] = "양수" if current_value > 0 else "음수"
+
+    if len(valid) < 30:
+        return result
+
+    valid = valid.assign(
+        down=(valid["drawdown"] <= -drawdown_threshold).astype(float),
+        up=(valid["gain"] >= gain_threshold).astype(float),
+    )
+    pos = valid[valid[signal_col] > 0]
+    neg = valid[valid[signal_col] < 0]
+    result["pos_n"], result["neg_n"] = len(pos), len(neg)
+    result["pos_mean"] = pos["fwd_return"].mean() if len(pos) else None
+    result["neg_mean"] = neg["fwd_return"].mean() if len(neg) else None
+    result["corr"] = float(valid[signal_col].corr(valid["fwd_return"]))
+
+    result["pos_down_rate"] = float(pos["down"].mean()) if len(pos) else None
+    result["neg_down_rate"] = float(neg["down"].mean()) if len(neg) else None
+    result["base_down_rate"] = float(valid["down"].mean())
+    result["pos_up_rate"] = float(pos["up"].mean()) if len(pos) else None
+    result["neg_up_rate"] = float(neg["up"].mean()) if len(neg) else None
+    result["base_up_rate"] = float(valid["up"].mean())
+
+    if len(pos) >= 2 and len(neg) >= 2:
+        from scipy import stats as scistats
+        _, pval = scistats.ttest_ind(pos["fwd_return"], neg["fwd_return"], equal_var=False)
+        result["p_value"] = float(pval)
+        result["down_p_value"] = two_proportion_ztest(pos["down"].sum(), len(pos), neg["down"].sum(), len(neg))
+        result["up_p_value"] = two_proportion_ztest(pos["up"].sum(), len(pos), neg["up"].sum(), len(neg))
+
+    return result
+
+
+def compute_composite(df: pd.DataFrame, signal_cols: list[str], results: dict[str, dict]) -> tuple[pd.Series, dict]:
+    raw_weights = {}
+    total_abs = 0.0
+    for col in signal_cols:
+        r = results[col]
+        w = abs(r["corr"]) if (r["p_value"] is not None and r["p_value"] < 0.05 and r["corr"] is not None) else 0.0
+        raw_weights[col] = w
+        total_abs += w
+
+    composite = pd.Series(0.0, index=df.index)
+    if total_abs == 0:
+        return composite, raw_weights
+
+    weights = {col: raw_weights[col] / total_abs for col in signal_cols}
+    for col in signal_cols:
+        r = results[col]
+        sign_flip = -1.0 if (r["corr"] is not None and r["corr"] < 0) else 1.0
+        composite = composite + weights[col] * sign_flip * np.sign(df[col].fillna(0))
+    return composite, weights
+
+
+FUTURES_DEAL_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
+
+
+def fetch_futures_foreign_history(target_days: int = 700) -> pd.DataFrame:
+    """코스피200 선물 외국인 순매수(계약수) 일별 이력. 특정 종목이 아닌 시장 전체 지표라 티커와 무관하게 캐시된다."""
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
+    frames = []
+    seen_dates = set()
+    bizdate = dt.date.today().strftime("%Y%m%d")
+    for _ in range(90):
+        resp = requests.get(FUTURES_DEAL_TREND_URL, params={"bizdate": bizdate, "code": "FUT"}, headers=headers, timeout=10)
+        resp.raise_for_status()
+        resp.encoding = "euc-kr"
+        try:
+            tables = pd.read_html(StringIO(resp.text))
+        except ValueError:
+            break
+        t = tables[0]
+        t.columns = ["날짜", "개인", "외국인", "기관계", "금융투자", "보험", "투신", "은행", "기타금융", "연기금", "기타법인"]
+        t = t.dropna(subset=["날짜"]).copy()
+        if t.empty:
+            break
+        t["날짜"] = pd.to_datetime(t["날짜"], format="%y.%m.%d")
+        t["외국인"] = pd.to_numeric(t["외국인"], errors="coerce")
+        new_rows = t[~t["날짜"].isin(seen_dates)]
+        if new_rows.empty:
+            break
+        seen_dates.update(new_rows["날짜"])
+        frames.append(new_rows[["날짜", "외국인"]])
+        if sum(len(f) for f in frames) >= target_days:
+            break
+        bizdate = (new_rows["날짜"].min() - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    if not frames:
+        return pd.DataFrame(columns=["날짜", "선물외국인"])
+    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset="날짜").sort_values("날짜")
+    return out.reset_index(drop=True).rename(columns={"외국인": "선물외국인"})
+
+
+def fetch_latest_futures_bars() -> pd.DataFrame:
+    """장중 계속 바뀌는 코스피200 선물 최근 며칠치만 짧은 캐시로 빠르게 가져온다."""
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/sise/sise_trans_style.naver?code=FUT"}
+    bizdate = dt.date.today().strftime("%Y%m%d")
+    resp = requests.get(FUTURES_DEAL_TREND_URL, params={"bizdate": bizdate, "code": "FUT"}, headers=headers, timeout=10)
+    resp.raise_for_status()
+    resp.encoding = "euc-kr"
+    try:
+        tables = pd.read_html(StringIO(resp.text))
+    except ValueError:
+        return pd.DataFrame(columns=["날짜", "선물외국인"])
+    t = tables[0]
+    t.columns = ["날짜", "개인", "외국인", "기관계", "금융투자", "보험", "투신", "은행", "기타금융", "연기금", "기타법인"]
+    t = t.dropna(subset=["날짜"]).copy()
+    if t.empty:
+        return pd.DataFrame(columns=["날짜", "선물외국인"])
+    t["날짜"] = pd.to_datetime(t["날짜"], format="%y.%m.%d")
+    t["외국인"] = pd.to_numeric(t["외국인"], errors="coerce")
+    return t[["날짜", "외국인"]].reset_index(drop=True).rename(columns={"외국인": "선물외국인"})
+
+
+def fetch_futures_foreign_history_live(target_days: int = 700) -> pd.DataFrame:
+    """24시간 캐시된 과거 이력에 오늘자를 포함한 최근 며칠치를 실시간(1분 캐시)으로 덧씌워 반환한다."""
+    hist = fetch_futures_foreign_history(target_days=target_days)
+    latest = fetch_latest_futures_bars()
+    if latest.empty:
+        return hist
+    merged = pd.concat([hist, latest], ignore_index=True).drop_duplicates(subset="날짜", keep="last")
+    return merged.sort_values("날짜").reset_index(drop=True)
+
+
+def run_futures_decline_backtest(
+    price: pd.Series, dates: pd.Series, flow: pd.Series, window: int, horizon: int,
+    quantile: float = 0.2, drawdown_threshold: float = 0.07, gain_threshold: float | None = None,
+) -> dict:
+    """코스피200 선물 외국인 누적 순매수 기울기가 하위 quantile(강한 매도)일 때, 현재 종목의 향후 horizon일 내
+    drawdown_threshold 이상 하락할 확률과 gain_threshold 이상 상승할 확률이 나머지 구간과 어떻게 다른지 함께 검증한다.
+    gain_threshold를 안 주면 drawdown_threshold와 같은 크기를 쓴다."""
+    gain_threshold = drawdown_threshold if gain_threshold is None else gain_threshold
+    d = pd.DataFrame({"날짜": dates, "종가": price, "선물외국인": flow}).dropna(subset=["선물외국인"])
+    d["slope"] = _rolling_slope(d["선물외국인"], window)
+    d["drawdown"] = forward_max_drawdown(d["종가"], horizon)
+    d["gain"] = forward_max_gain(d["종가"], horizon)
+    valid = d.dropna(subset=["slope", "drawdown", "gain"])
+
+    result = {
+        "n": len(valid), "lo_n": 0, "rest_n": 0, "lo_rate": None, "rest_rate": None, "base_rate": None,
+        "p_value": None, "lo_up_rate": None, "rest_up_rate": None, "base_up_rate": None, "up_p_value": None,
+        "lo_cutoff": None, "current_slope": None, "current_regime": None,
+    }
+    slope_all = d["slope"].dropna()
+    if len(slope_all) > 0:
+        result["current_slope"] = float(slope_all.iloc[-1])
+
+    if len(valid) < 30:
+        return result
+
+    valid = valid.assign(
+        downtrend=(valid["drawdown"] <= -drawdown_threshold).astype(float),
+        uptrend=(valid["gain"] >= gain_threshold).astype(float),
+    )
+    lo_cutoff = valid["slope"].quantile(quantile)
+    result["lo_cutoff"] = float(lo_cutoff)
+    lo_group = valid[valid["slope"] <= lo_cutoff]
+    rest_group = valid[valid["slope"] > lo_cutoff]
+    result["lo_n"], result["rest_n"] = len(lo_group), len(rest_group)
+    result["lo_rate"] = float(lo_group["downtrend"].mean()) if len(lo_group) else None
+    result["rest_rate"] = float(rest_group["downtrend"].mean()) if len(rest_group) else None
+    result["base_rate"] = float(valid["downtrend"].mean())
+    result["lo_up_rate"] = float(lo_group["uptrend"].mean()) if len(lo_group) else None
+    result["rest_up_rate"] = float(rest_group["uptrend"].mean()) if len(rest_group) else None
+    result["base_up_rate"] = float(valid["uptrend"].mean())
+
+    if len(lo_group) >= 2 and len(rest_group) >= 2:
+        result["p_value"] = two_proportion_ztest(
+            lo_group["downtrend"].sum(), len(lo_group), rest_group["downtrend"].sum(), len(rest_group)
+        )
+        result["up_p_value"] = two_proportion_ztest(
+            lo_group["uptrend"].sum(), len(lo_group), rest_group["uptrend"].sum(), len(rest_group)
+        )
+
+    result["current_regime"] = (
+        f"강한 매도 경고 (하위 {quantile:.0%})"
+        if result["current_slope"] is not None and result["current_slope"] <= lo_cutoff
+        else "평상시"
+    )
+    return result
+
+
+# ── 매매 신호 파라미터 ────────────────────────────────────────────────────────
+# SK하이닉스 2016-01 – 2026-08 (2,599거래일)로 후보 지표 19종 x 예측기간 3종을 검증해 고른 값이다.
+# 기관 순매수만 살아남았다. SOX는 학습구간과 검증구간에서 상관 부호가 뒤집혔고(-0.10 -> +0.25),
+# DXY와 이동평균 괴리율은 중첩 보정(블록 부트스트랩)을 하면 유의성이 사라졌다.
+# 되돌아보기 창은 매년 과거 데이터만 보고 다시 고르게 해도 항상 20일이 선택됐다.
+FLOW_SIGNAL_VOL_WINDOW = 20    # 기관 순매수를 나눠줄 평균 거래량 창 (종목 규모 효과 제거)
+FLOW_SIGNAL_WINDOW = 20        # 정규화된 순매수를 누적할 창
+# 기관 순매수는 장 마감 후에 공시되므로 t일 신호로는 t일 종가에 살 수 없다.
+# t+1일 종가 체결을 가정해 2일 밀어서 성과를 계산한다 (보수적).
+FLOW_SIGNAL_EXEC_LAG = 2
+FLOW_BACKTEST_DAYS = 1200
+
+
+def compute_flow_signal(df: pd.DataFrame) -> pd.Series:
+    """기관 순매수(주)를 최근 평균 거래량으로 나눈 뒤 20일 누적한 값.
+
+    거래량으로 나누는 이유는 절대 주식 수가 종목·시기마다 규모가 달라서다. 나눠주면
+    '최근 하루 거래량의 몇 배만큼을 기관이 순매수했는가'라는 비교 가능한 단위가 된다.
+    양수면 기관 순매수 우위, 음수면 순매도 우위.
+    """
+    if df.empty or "기관" not in df.columns or "거래량" not in df.columns:
+        return pd.Series(dtype=float)
+    volume = pd.to_numeric(df["거래량"], errors="coerce")
+    inst = pd.to_numeric(df["기관"], errors="coerce")
+    normalized = inst / volume.rolling(FLOW_SIGNAL_VOL_WINDOW).mean()
+    return normalized.rolling(FLOW_SIGNAL_WINDOW).sum()
+
+
+def backtest_flow_signal(df: pd.DataFrame, slippage: float = 0.0010) -> dict:
+    """신호가 양수인 구간만 보유하는 전략을 비용까지 반영해 단순보유와 비교한다.
+
+    체결 가정: 신호는 장 마감 후 확정되므로 FLOW_SIGNAL_EXEC_LAG일 뒤부터 수익에 반영한다.
+    """
+    cost_buy = 0.00015 + slippage
+    cost_sell = 0.00015 + 0.0015 + slippage
+
+    d = df.copy()
+    d["신호"] = compute_flow_signal(d)
+    d["수익률"] = pd.to_numeric(d["종가"], errors="coerce").pct_change()
+    d = d.dropna(subset=["신호", "수익률"]).reset_index(drop=True)
+
+    result = {"n": len(d), "ok": False}
+    if len(d) < FLOW_SIGNAL_WINDOW * 3:
+        return result
+
+    position = (d["신호"].shift(FLOW_SIGNAL_EXEC_LAG) > 0).astype(float).fillna(0.0)
+    change = position.diff().fillna(position.iloc[0])
+    cost = change.clip(lower=0) * cost_buy + (-change).clip(lower=0) * cost_sell
+    strategy_ret = position * d["수익률"] - cost
+
+    def metrics(returns: pd.Series) -> dict:
+        equity = (1 + returns).cumprod()
+        years = len(returns) / 252
+        vol = returns.std() * np.sqrt(252)
+        downside = returns[returns < 0].std() * np.sqrt(252)
+        return {
+            "총수익": float(equity.iloc[-1] - 1),
+            "CAGR": float(equity.iloc[-1] ** (1 / years) - 1) if years > 0 else float("nan"),
+            "MDD": float((equity / equity.cummax() - 1).min()),
+            "Sharpe": float(returns.mean() * 252 / vol) if vol > 0 else float("nan"),
+            "Sortino": float(returns.mean() * 252 / downside) if downside and downside > 0 else float("nan"),
+            "equity": equity,
+        }
+
+    result.update({
+        "ok": True,
+        "날짜": d["날짜"],
+        "종가": d["종가"],
+        "신호": d["신호"],
+        "포지션": position,
+        "전략": metrics(strategy_ret),
+        "보유": metrics(d["수익률"]),
+        "거래횟수": int((change != 0).sum()),
+        "노출": float(position.mean()),
+        "현재신호": float(d["신호"].iloc[-1]),
+        "기간": (d["날짜"].iloc[0], d["날짜"].iloc[-1]),
+    })
+    return result
+
+
+FUTURES_QUANTILES = [0.20, 0.15, 0.10, 0.05]
+
+
+def build_quant_signal_summary(ticker: str) -> str:
+    """매매 신호 · 통합 신호 · 선물 경보 — 세 탭 모두 화면에는 있는데 AI 프롬프트에는
+    빠져 있던 값이다. 특히 매매 신호는 화면 도움말이 스스로 '후보 19종 중 10년 검증을
+    통과한 유일한 지표'라 밝히는, 대시보드에서 신뢰도가 가장 높다고 표시한 신호다.
+    세 탭과 같은 함수·같은 상수를 그대로 써서 화면과 다른 숫자가 나오지 않게 한다.
+    """
+    if ticker != DEFAULT_TICKER:      # 세 지표 모두 SK하이닉스에서만 검증됐다
+        return ""
+
+    lines = []
+
+    try:
+        hist = fetch_backtest_history_live(ticker, target_days=FLOW_BACKTEST_DAYS)
+        flow_result = backtest_flow_signal(hist)
+        if flow_result.get("ok"):
+            current = flow_result["현재신호"]
+            strat, hold = flow_result["전략"], flow_result["보유"]
+            lines.append(
+                f"- 매매 신호(기관 순매수/거래량 20일 누적. 후보 19종 중 10년 검증을 통과한 유일 지표): "
+                f"현재 {'매수·보유' if current > 0 else '매도·현금'}(신호값 {current:+.2f}). "
+                f"신호대로 매매 시 CAGR {strat['CAGR']:+.1%} (단순보유 {hold['CAGR']:+.1%})")
+    except Exception:
+        pass
+
+    try:
+        dataset = build_composite_dataset(ticker)
+        signal_cols = ["기관_기울기", "SOX_기울기", "DXY_기울기"]
+        results = {col: backtest_signal(dataset, col, 10) for col in signal_cols}
+        composite_series, _ = compute_composite(dataset, signal_cols, results)
+        dataset["composite"] = composite_series
+        composite_result = backtest_signal(dataset, "composite", 10)
+        current = composite_result.get("current_value")
+        if current is not None:
+            is_buy = current > 0
+            down_rate = composite_result["pos_down_rate"] if is_buy else composite_result["neg_down_rate"]
+            lines.append(
+                f"- 통합 신호(기관수급+SOX+달러인덱스 가중합산. 하락 방향만 통계적 유의성 확인, p<0.01 — "
+                f"상승 예측 근거로는 못 씀): 현재 {'매수 우위' if is_buy else '매도 우위'}(점수 {current:+.2f}). "
+                f"이 방향의 향후 10거래일 내 7% 이상 하락 확률 "
+                + (f"{down_rate:.1%}" if down_rate is not None else "N/A"))
+    except Exception:
+        pass
+
+    try:
+        hynix_hist = fetch_backtest_history_live(ticker, target_days=700)
+        futures_hist = fetch_futures_foreign_history_live(target_days=700)
+        if len(hynix_hist) >= 80 and len(futures_hist) >= 80:
+            flow_aligned = (futures_hist.set_index("날짜")["선물외국인"]
+                            .reindex(hynix_hist["날짜"]).reset_index(drop=True))
+            results_by_q = {
+                q: run_futures_decline_backtest(hynix_hist["종가"], hynix_hist["날짜"], flow_aligned,
+                                                 15, 10, quantile=q, drawdown_threshold=0.07)
+                for q in FUTURES_QUANTILES
+            }
+            base = results_by_q[FUTURES_QUANTILES[0]]
+            current_slope = base["current_slope"]
+            if base["n"] >= 30 and current_slope is not None:
+                matched_q = None
+                for q in sorted(FUTURES_QUANTILES):
+                    cutoff = results_by_q[q]["lo_cutoff"]
+                    if cutoff is not None and current_slope <= cutoff:
+                        matched_q = q
+                        break
+                if matched_q is not None:
+                    label = f"강한 매도 경고(하위 {matched_q:.0%})"
+                    down = results_by_q[matched_q]["lo_rate"]
+                else:
+                    label = "평상시"
+                    down = results_by_q[max(FUTURES_QUANTILES)]["rest_rate"]
+                lines.append(
+                    f"- 선물 경보(코스피200 선물 외국인 15일 순매도 강도): 현재 {label}. "
+                    f"이 상태의 향후 10거래일 내 7% 이상 하락 확률 "
+                    + (f"{down:.1%}" if down is not None else "N/A"))
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
 def fetch_stock_snapshot(ticker: str) -> dict:
     """네이버 모바일 통합 API에서 AI 분석에 쓸 '판단 재료'를 모아온다.
 
@@ -2296,6 +2715,7 @@ def generate_ai_analysis(
     market_flow_md: str = "",
     capex_md: str = "",
     early_signal_md: str = "",
+    quant_signal_md: str = "",
     recent_price_md: str = "",
     earnings_md: str = "",
     consensus_md: str = "",
@@ -2354,6 +2774,9 @@ def generate_ai_analysis(
 
 [하락 · 상승 조기신호 — 과거 통계 참고용, 매매 신호 아님]
 {early_signal_md if early_signal_md else "(해당 없음)"}
+
+[정량 신호 — 매매신호 · 통합신호 · 선물경보. 모두 과거 통계 백테스트 참고용, 매수·매도 지시 아님]
+{quant_signal_md if quant_signal_md else "(해당 없음)"}
 
 [DRAM 현물가 — 현물가만 있고 고정거래가(계약가)는 없음. 실적에 직결되는 건 고정가이므로 현물가만으로 단정하지 마라]
 {dram_summary}
@@ -2433,7 +2856,7 @@ def generate_ai_analysis(
    `[공시]` 전자공시(숫자 인용) · `[뉴스]` 종목+업종·매크로 뉴스 · `[리포트]` 애널리스트(증권가 시각 정리의 목표주가·추정 실적 숫자 인용)
    `[산업]` TrendForce+DRAM 현물가+빅테크 Capex+실적 발표 일정
    `[거시]` SOX·나스닥·달러인덱스·환율·금리+ADR 괴리율
-   `[대시보드]` 수급·과열도·조기신호·컨센서스·동일업종·외국인 보유율·공매도·신용융자잔고
+   `[대시보드]` 수급·과열도·조기신호·정량신호(매매/통합/선물)·컨센서스·동일업종·외국인 보유율·공매도·신용융자잔고
    `[재무]` 재무 정리의 매출·영업이익·이익률 추이와 추정치(숫자 인용)
 2) 형식은 `[갈래] 내용 (근거 숫자)`. 말머리는 위 일곱 개만.
 3) 쓸 근거가 없는 갈래는 `[갈래] 이번엔 뚜렷한 신호 없음` 한 줄.
@@ -2469,7 +2892,8 @@ def generate_ai_analysis(
 - **짧게.** 초당 40자로 나오므로 길어진 만큼 기다린다. 전체 2,000자 안쪽. 항목을 빼지 말고 문장을 눌러 담아라.
 - 각 근거는 한 줄. 서론·맺음말·재요약 금지.
 - 데이터에 없는 사실·날짜·숫자를 지어내지 마. 모르면 "데이터에 없음".
-- 과열도·조기신호는 "백테스트 기반 참고치" 단서를 붙이고 단독 근거로 쓰지 마.
+- 과열도·조기신호·정량 신호(매매/통합/선물)는 "백테스트 기반 참고치" 단서를 붙이고 단독 근거로 쓰지 마.
+  통합 신호는 하락 방향만 유의성이 확인됐다 — 상승 예측 근거로 쓰지 마라.
 - 실적 발표가 3일 이내면 관망세 배경으로 짚되 결과는 예측 금지.
 - 목표주가는 수준보다 방향(상향/하향)이 중요. 기록 없으면 없다고 써라.
 - '외국계 창구 추정 순매수'는 거래원 기반 추정치다. '추정'임을 밝히고, 이 값으로 기관·개인을 추측하지 마라.
