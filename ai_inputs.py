@@ -1397,37 +1397,11 @@ def fetch_stock_news_with_summary(stock_name: str, count: int = 6) -> list[dict]
     return general + [it for it in feature if it["제목"] not in seen]
 
 
-NAVER_INVESTOR_TREND_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
-
-
-NAVER_PROGRAM_TREND_URL = "https://finance.naver.com/sise/programDealTrendDay.naver"
-
-
-def fetch_market_flow() -> dict | None:
-    """코스피 전체 투자자별 순매수 + 프로그램 매매(차익/비차익)를 한 번에.
-
-    반환값의 is_today로 '장중 잠정치'인지 '직전 거래일 확정치'인지 구분한다.
-    """
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            inv_f = pool.submit(_fetch_market_trend_row, NAVER_INVESTOR_TREND_URL)
-            prg_f = pool.submit(_fetch_market_trend_row, NAVER_PROGRAM_TREND_URL)
-        inv, prg = inv_f.result(), prg_f.result()
-    except Exception:
-        return None
-    if not inv:
-        return None
-    today_txt = dt.datetime.now(om.KST).strftime("%y.%m.%d")
-    return {
-        "날짜": inv["날짜"],
-        "is_today": inv["날짜"] == today_txt,
-        "개인": inv.get("개인"),
-        "외국인": inv.get("외국인"),
-        "기관계": inv.get("기관계"),
-        "연기금등": inv.get("기관 연기금등"),
-        "차익": (prg or {}).get("차익거래 순매수"),
-        "비차익": (prg or {}).get("비차익거래 순매수"),
-    }
+# 코스피 전체 수급(fetch_market_flow)과 그 보조 함수는 여기 있었다. 출처였던
+# finance.naver.com/sise/investorDealTrendDay.naver·programDealTrendDay.naver가
+# 410 Gone으로 사라져서 통째로 걷어냈다(§5). 같은 자리는 KIS 종목별 수급
+# (fetch_investor_estimate · fetch_investor_daily_kis)이 대신한다 — 시장 전체보다
+# 이 종목 값이 애초에 더 맞는 재료였다.
 
 
 # 네이버 거래원(외국계추정합)은 2026-09-10에 막혔다(PC 종목 페이지가 표 없는 새 SPA로
@@ -1726,24 +1700,38 @@ def build_foreign_desk_summary(ticker: str) -> str:
     return "\n".join(lines)
 
 
-def build_market_flow_summary() -> str:
-    """AI 분석에 넘길 시장 전체 수급 요약."""
-    flow = fetch_market_flow()
-    if not flow:
-        return ""
-    when = "장중 잠정치" if flow["is_today"] else "직전 거래일 확정치"
-    def fmt(v):
-        return f"{v:+,.0f}억원" if v is not None else "N/A"
-    lines = [
-        f"- 코스피 전체 투자자별 순매수 ({flow['날짜']}, {when}): "
-        f"개인 {fmt(flow['개인'])} / 외국인 {fmt(flow['외국인'])} / 기관계 {fmt(flow['기관계'])}"
-        f" (연기금등 {fmt(flow['연기금등'])})",
-    ]
-    if flow["비차익"] is not None:
-        lines.append(f"- 코스피 프로그램 매매: 차익 {fmt(flow['차익'])} / 비차익 {fmt(flow['비차익'])}"
-                     " (비차익은 외국인·기관 바스켓 매매의 대용 지표)")
-    lines.append("- 주의: 이 수치는 코스피 시장 전체이지 이 종목의 수급이 아니다. "
-                 "종목별 장중 수급은 거래소가 마감 후에만 공개하므로, 방향의 참고로만 써라.")
+def build_market_flow_summary(ticker: str = DEFAULT_TICKER) -> str:
+    """AI 분석에 넘길 **이 종목**의 장중 투자자 수급.
+
+    예전에는 코스피 시장 전체 수급을 넘겼다(네이버 sise/investorDealTrendDay.naver).
+    그 페이지가 410으로 사라졌고(§5), 애초에 "이 종목 얘기가 아니다"라는 단서를 매번
+    붙여야 하던 재료였다. 지금은 KIS에 종목별 경로가 있으므로 그쪽으로 바꾼다.
+    """
+    lines = []
+    try:
+        est = fetch_investor_estimate(ticker)
+    except Exception:
+        est = {}
+    if est:
+        def fmt(v):
+            return f"{v:+,.0f}주" if v is not None else "N/A"
+        lines.append(
+            f"- 이 종목 장중 투자자 추정 순매수({est['차수']}/{est['집계수']}차 누적, 증권사 추정치): "
+            f"외국인 {fmt(est.get('외국인'))} / 기관 {fmt(est.get('기관'))}")
+        lines.append("  ※ 추정치라 마감 후 확정치와 차이가 난다(실측 추정 +483천주 vs 확정 +716천주). "
+                     "방향 근거로만 쓰고, 개인은 값이 없으니 합계에서 빼서 유도하지 마라.")
+
+    try:
+        daily = fetch_investor_daily_kis(ticker)
+    except Exception:
+        daily = pd.DataFrame()
+    if not daily.empty:
+        row = daily.iloc[-1]
+        def fmt2(v):
+            return f"{v:+,.0f}주" if v is not None and pd.notna(v) else "N/A"
+        lines.append(
+            f"- 이 종목 일별 확정 수급({row['날짜']:%Y-%m-%d}): "
+            f"개인 {fmt2(row['개인'])} / 외국인 {fmt2(row['외국인'])} / 기관 {fmt2(row['기관'])}")
     return "\n".join(lines)
 
 
@@ -2366,10 +2354,11 @@ def build_market_state_summary(market_open: bool = False) -> str:
             lines.append("- 주말이다. 마지막 거래일 기준 값이다.")
 
     # 수급은 마감 후 한참 뒤에야 올라온다. 이걸 모르면 '오늘 외국인이 샀다'고 지어낸다.
-    lines.append("- 투자자별 수급(개인·외국인·기관) 확정치는 장 마감 후 18:20~18:30에야 공개된다."
-                 " 그 전에는 아래 수급 숫자의 마지막 날짜가 오늘이 아니라 전 거래일이다."
-                 " 날짜를 확인하고, 오늘 수급인 것처럼 쓰지 마라.")
-    lines.append("- '코스피 시장 전체 수급'은 장중 잠정치라 마감 후 확정치와 달라질 수 있다.")
+    lines.append("- 투자자별 수급(개인·외국인·기관) 확정치는 장 마감 뒤에 나온다(증권사 API는 마감"
+                 " 직후, 네이버 기반 일별 이력은 18:20~18:30). 수급 숫자를 쓸 때는 그 줄에 적힌"
+                 " 날짜를 먼저 확인하고, 전 거래일 값을 오늘 수급인 것처럼 쓰지 마라.")
+    lines.append("- 장중에 나오는 종목별 수급은 전부 '추정치'다(증권사 가집계·거래원 창구 기준)."
+                 " 확정치와 다를 수 있으니 방향 근거로만 써라.")
     return "\n".join(lines)
 
 
@@ -2822,7 +2811,7 @@ def generate_ai_analysis(
 [최근 수급 동향 — 이 종목, 일별 확정치]
 {supply_summary}
 
-[코스피 시장 전체 수급 — 종목별 아님, 장중 잠정치]
+[이 종목의 장중 투자자 수급 — 장중은 증권사 추정치, 확정 줄은 거래소 확정치]
 {market_flow_md if market_flow_md else "(수집 실패)"}
 
 [이 종목의 외국계 창구 추정 순매수 — 장중, 추정치. 확정 수급이 아니다]
@@ -3256,23 +3245,3 @@ def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
         return empty
 
 
-def _fetch_market_trend_row(url: str) -> dict | None:
-    """네이버 시장 전체 매매동향 표에서 가장 최근(=맨 윗줄) 행을 뽑는다. 단위는 억원."""
-    resp = requests.get(url, params={"bizdate": dt.datetime.now(om.KST).strftime("%Y%m%d"), "sosok": "01"},
-                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"},
-                        timeout=10)
-    resp.raise_for_status()
-    resp.encoding = "euc-kr"
-    table = pd.read_html(StringIO(resp.text))[0]
-    # 헤더가 2단이라 MultiIndex로 잡힌다. '기관 금융투자'처럼 이어 붙여 단순한 이름으로 바꾼다.
-    table.columns = [c[1] if c[0] == c[1] else f"{c[0]} {c[1]}" for c in table.columns]
-    table = table.dropna(how="all")
-    date_col = table.columns[0]
-    table = table[table[date_col].astype(str).str.match(r"\d{2}\.\d{2}\.\d{2}")]
-    if table.empty:
-        return None
-    row = table.iloc[0]
-    out = {"날짜": str(row[date_col])}
-    for col in table.columns[1:]:
-        out[col] = float(row[col]) if pd.notna(row[col]) else None
-    return out

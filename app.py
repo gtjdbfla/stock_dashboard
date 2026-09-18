@@ -2013,6 +2013,8 @@ def _flow_metric_row(items: list[tuple[str, float | None]], row_key: str) -> Non
     with st.container(key=row_key):
         cols = st.columns(len(items))
         for col, (label, value) in zip(cols, items):
+            if value is not None and not np.isfinite(value):
+                value = None            # NaN이 f-string에 들어가면 'nan주'로 찍힌다
             side = "none" if not value else ("buy" if value > 0 else "sell")
             with col.container(key=f"metric_small_flow_{side}_{label}"):
                 st.metric(
