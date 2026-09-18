@@ -434,9 +434,17 @@ st.markdown(
         stroke-width: 1px !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
-    div[class*="st-key-chart_dram_"] .updatemenu-button-group .updatemenu-item-rect {
-        stroke-opacity: 0.45 !important;
+    /* 기간 버튼(g.updatemenu-button). Plotly.js는 활성 버튼 배경을 하드코딩된
+       흰빛(#F4FAFF)으로 칠하는데(버전에 activecolor 속성이 없다), 우리 글자색은
+       옅은 회색이라 그대로 두면 활성 버튼 글자가 안 보인다. 인라인 style에 박히는
+       그 색을 속성 선택자로 집어 어두운 파랑으로 바꾼다 — 이러면 비활성(#1c1f26)과
+       활성(#2b5c86)이 같은 옅은 글자색으로 둘 다 읽힌다. */
+    div[class*="st-key-chart_dram_"] g.updatemenu-button .updatemenu-item-rect {
         rx: 6px;
+    }
+    div[class*="st-key-chart_dram_"] g.updatemenu-button rect[style*="244, 250, 255"] {
+        fill: #2b5c86 !important;
+        stroke-opacity: 0.9 !important;
     }
     div[class*="st-key-chart_dram_"] text.updatemenu-item-text {
         fill: #e3e6ea !important;
@@ -2478,21 +2486,33 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     daily = daily.sort_values("날짜").groupby(["품목", "일자"], as_index=False).last()
     cutoff = daily["일자"].max() - pd.Timedelta(days=DRAM_CHART_DEFAULT_DAYS)
 
+    # updatemenus의 args는 plotly의 날짜 변환을 안 타므로 문자열로 넘긴다.
+    def _dates(series) -> list[str]:
+        return [d.strftime("%Y-%m-%d") for d in series]
+
+    per_item = []
+    for item in items:
+        hist = daily[daily["품목"] == item].sort_values("일자")
+        per_item.append((hist, hist[hist["일자"] >= cutoff]))
+
+    # 기간 버튼은 **쪼갤 만큼 점이 있을 때만** 단다. 모듈 현물가는 2~3주에 한 번꼴로만
+    # 올라와서(실측 11건/2.5개월) 최근 30일을 잘라내면 점 두어 개짜리 빈 차트가 된다.
+    # 그럴 땐 버튼 없이 전체만 보여주는 게 맞다. 칩 현물가는 평일마다 들어와서 해당 없음.
+    dense = per_item and min(len(recent) for _, recent in per_item) >= 5
+    split = dense and any(len(hist) > len(recent) for hist, recent in per_item)
+
     fig = go.Figure()
     x_recent, y_recent, x_all, y_all = [], [], [], []
-    for i, item in enumerate(items):
-        hist = daily[daily["품목"] == item].sort_values("일자")
-        recent = hist[hist["일자"] >= cutoff]
-        if len(recent) < 2:          # 한 달 넘게 안 바뀐 품목은 접히면 선이 안 그려진다
-            recent = hist
-        # updatemenus의 args는 plotly의 날짜 변환을 안 타므로 문자열로 넘긴다.
-        to_str = lambda s: [d.strftime("%Y-%m-%d") for d in s]
-        x_all.append(to_str(hist["일자"]))
+    for i, (hist, recent) in enumerate(per_item):
+        shown = recent if split else hist
+        x_all.append(_dates(hist["일자"]))
         y_all.append(list(hist["평균가(USD)"]))
-        x_recent.append(to_str(recent["일자"]))
+        x_recent.append(_dates(recent["일자"]))
         y_recent.append(list(recent["평균가(USD)"]))
         fig.add_trace(go.Scatter(
-            x=x_recent[i], y=y_recent[i], name=item,
+            x=_dates(shown["일자"]), y=list(shown["평균가(USD)"]), name=items[i],
+            # 점이 드문 품목은 선만으로는 값이 언제 찍혔는지 안 보인다(한 건짜리는 아예
+            # 선이 안 그려진다). 마커를 같이 찍어 둔다.
             mode="lines+markers", marker=dict(size=4), visible=(i == 0),
             hovertemplate="%{x|%m-%d} · $%{y:,.3f}<extra></extra>",
         ))
@@ -2525,22 +2545,22 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         ))
 
     # 기간 버튼은 왼쪽 위. 여기는 x=0이 플롯 영역 왼쪽(=y축 눈금 위)이라 축과 세로로
-    # 맞아떨어진다. 지금 어느 기간인지는 Plotly가 활성 버튼에 칠하는 activebgcolor로
-    # 보인다 — 그래서 위 CSS의 `fill !important`는 드롭다운 쪽에만 걸어 둔다.
-    menus.append(dict(
-        type="buttons", direction="right", active=0, showactive=True,
-        buttons=[
-            dict(label=f"최근 {DRAM_CHART_DEFAULT_DAYS}일", method="restyle",
-                 args=[{"x": x_recent, "y": y_recent}]),
-            dict(label="전체", method="restyle",
-                 args=[{"x": x_all, "y": y_all}]),
-        ],
-        x=0, xanchor="left", y=1.0, yanchor="bottom",
-        pad=dict(t=0, b=8, l=0, r=0),
-        bgcolor="#1c1f26", activecolor="#2b5c86",
-        bordercolor="#3d9df3", borderwidth=1,
-        font=dict(color="#e3e6ea", size=13),
-    ))
+    # 맞아떨어진다. 지금 어느 기간인지는 Plotly가 활성 버튼에만 칠하는 색으로 보인다
+    # (그래서 위 CSS의 `fill !important`는 드롭다운 쪽에만 걸어 뒀다).
+    if split:
+        menus.append(dict(
+            type="buttons", direction="right", active=0, showactive=True,
+            buttons=[
+                dict(label=f"최근 {DRAM_CHART_DEFAULT_DAYS}일", method="restyle",
+                     args=[{"x": x_recent, "y": y_recent}]),
+                dict(label="전체", method="restyle",
+                     args=[{"x": x_all, "y": y_all}]),
+            ],
+            x=0, xanchor="left", y=1.0, yanchor="bottom",
+            pad=dict(t=0, b=8, l=0, r=0),
+            bgcolor="#1c1f26", bordercolor="#3d9df3", borderwidth=1,
+            font=dict(color="#e3e6ea", size=13),
+        ))
     fig.update_layout(updatemenus=menus)
 
     # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
@@ -2559,11 +2579,11 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     # 가로가 1.4배로 늘어나고 선이 주마다 끊겨 보인다. 주말을 축에서 아예 뺀다.
     fig.update_xaxes(type="date", rangebreaks=[dict(bounds=["sat", "mon"])])
     st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
-    st.caption(
-        f"왼쪽 위에서 기간(최근 {DRAM_CHART_DEFAULT_DAYS}일 / 전체), 오른쪽 위에서 품목을 고릅니다"
-        "(이름은 위 표 기준으로 줄여 적었습니다). 기간을 바꾸면 세로 축도 그 구간에 맞춰 다시 잡힙니다. "
-        "하루 세 번(11:00·14:40·18:10) 들어오는 값 중 그 날 마지막 값만 찍고, 시세가 없는 주말은 축에서 뺐습니다."
-    )
+    caption = "오른쪽 위에서 품목을 고릅니다(이름은 위 표 기준으로 줄여 적었습니다). " if n > 1 else ""
+    if split:
+        caption += (f"왼쪽 위에서 기간(최근 {DRAM_CHART_DEFAULT_DAYS}일 / 전체)을 바꿀 수 있고, "
+                    "기간을 바꾸면 세로 축도 그 구간에 맞춰 다시 잡힙니다. ")
+    st.caption(caption + "하루에 여러 번 들어오는 값 중 그 날 마지막 값만 찍고, 시세가 없는 주말은 축에서 뺐습니다.")
 
 
 DOWNTREND_WINDOW = 20
