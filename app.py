@@ -427,11 +427,13 @@ st.markdown(
        bgcolor/activecolor로 직접 준다. */
     div[class*="st-key-chart_dram_"] .updatemenu-header .updatemenu-item-rect,
     div[class*="st-key-chart_dram_"] .updatemenu-dropdown-button-group .updatemenu-item-rect {
-        fill: #1c1f26 !important;
+        /* 예전엔 옅은 파랑 1px 테두리를 둘렀는데, 옆의 기간 버튼과 나란히 놓고 보니
+           그 외곽선만 도드라져 "깨져 보인다 / 안 어울린다"는 지적을 받았다. 두 컨트롤
+           모두 테두리 없이 **칠만으로** 존재를 알리는 쪽으로 통일한다(기간 버튼과 같은
+           #232833). 드롭다운은 ▼ 화살표가 따로 있어 테두리 없이도 눌리는 게 읽힌다. */
+        fill: #232833 !important;
         fill-opacity: 1 !important;
-        stroke: #3d9df3 !important;
-        stroke-opacity: 0.45 !important;
-        stroke-width: 1px !important;
+        stroke-width: 0 !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
     /* 기간 버튼(g.updatemenu-button). Plotly.js는 활성 버튼 배경을 하드코딩된
@@ -439,12 +441,16 @@ st.markdown(
        옅은 회색이라 그대로 두면 활성 버튼 글자가 안 보인다. 인라인 style에 박히는
        그 색을 속성 선택자로 집어 어두운 파랑으로 바꾼다 — 이러면 비활성(#1c1f26)과
        활성(#2b5c86)이 같은 옅은 글자색으로 둘 다 읽힌다. */
+    /* 기간 버튼은 **테두리를 아예 안 그린다**(Python 쪽 borderwidth=0).
+       1px 외곽선은 버튼 위치가 반픽셀에 걸리면 변마다 굵기가 달라 보여서
+       "윤곽선이 깨진다"는 지적을 받았다 — 드롭다운처럼 옅게 낮춰도 남는 문제다.
+       칠(채움)만으로 켜짐/꺼짐을 가르면 그 artifact 자체가 사라지고, 세그먼티드
+       컨트롤처럼 읽혀 차트와도 조용히 어울린다. §5의 "대비를 낮춰라"와 같은 결. */
     div[class*="st-key-chart_dram_"] g.updatemenu-button .updatemenu-item-rect {
         rx: 6px;
     }
     div[class*="st-key-chart_dram_"] g.updatemenu-button rect[style*="244, 250, 255"] {
         fill: #2b5c86 !important;
-        stroke-opacity: 0.9 !important;
     }
     div[class*="st-key-chart_dram_"] text.updatemenu-item-text {
         fill: #e3e6ea !important;
@@ -453,9 +459,7 @@ st.markdown(
     }
     div[class*="st-key-chart_dram_"] .updatemenu-header:hover .updatemenu-item-rect,
     div[class*="st-key-chart_dram_"] .updatemenu-dropdown-button-group .updatemenu-item-rect:hover {
-        fill: #262a33 !important;
-        stroke: #3d9df3 !important;
-        stroke-opacity: 0.8 !important;
+        fill: #2f3644 !important;     /* 테두리 대신 한 단계 더 밝혀 눌리는 걸 알린다 */
     }
     div[class*="st-key-chart_dram_"] text.updatemenu-header-arrow {
         fill: #8a939c !important;
@@ -2558,7 +2562,9 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
             ],
             x=0, xanchor="left", y=1.0, yanchor="bottom",
             pad=dict(t=0, b=8, l=0, r=0),
-            bgcolor="#1c1f26", bordercolor="#3d9df3", borderwidth=1,
+            # 테두리 없이 칠로만 구분한다(위 CSS 주석 참고). 꺼진 버튼은 페이지
+            # 배경보다 한 단계만 밝은 회색, 켜진 버튼은 CSS가 파랑으로 덮는다.
+            bgcolor="#232833", borderwidth=0,
             font=dict(color="#e3e6ea", size=13),
         ))
     fig.update_layout(updatemenus=menus)
