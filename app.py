@@ -2465,7 +2465,8 @@ def _short_item_labels(items: list[str]) -> list[str]:
 DRAM_CHART_DEFAULT_DAYS = 30
 
 
-def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix: str, chart_key: str) -> None:
+def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix: str, chart_key: str,
+                              default_days: int = DRAM_CHART_DEFAULT_DAYS) -> None:
     """가격대가 서로 다른 여러 품목을 한 그래프에 겹쳐 그리면 스케일 차이로 잘 안 보이므로,
     한 번에 한 품목만 보이게 하고 나머지는 숨긴다.
 
@@ -2479,6 +2480,10 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     trace당 배열을 하나씩 넘긴다). 데이터가 바뀌면 Plotly가 y축을 다시 잡아 주므로,
     "기간을 좁혀도 y축이 그대로라 선이 납작하게 눌려 보이던" 문제가 같이 풀린다
     (rangeslider로 x만 좁히던 예전 방식은 y를 건드리지 않아 그게 안 됐다).
+
+    `default_days`는 "최근 N일" 버튼의 N이다. 위쪽 "변동률 비교 기간" 슬라이더와
+    같은 값을 넘겨받아, 표의 'N일 전 대비'와 그래프의 기본 구간이 같은 숫자를
+    보게 한다 — 둘이 따로 놀면 표는 7일인데 그래프는 30일을 보여주는 식으로 어긋난다.
     """
     n = len(items)
     labels = _short_item_labels(items)
@@ -2488,7 +2493,7 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     daily = history.copy()
     daily["일자"] = pd.to_datetime(daily["날짜"]).dt.normalize()
     daily = daily.sort_values("날짜").groupby(["품목", "일자"], as_index=False).last()
-    cutoff = daily["일자"].max() - pd.Timedelta(days=DRAM_CHART_DEFAULT_DAYS)
+    cutoff = daily["일자"].max() - pd.Timedelta(days=default_days)
 
     # updatemenus의 args는 plotly의 날짜 변환을 안 타므로 문자열로 넘긴다.
     def _dates(series) -> list[str]:
@@ -2555,7 +2560,7 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         menus.append(dict(
             type="buttons", direction="right", active=0, showactive=True,
             buttons=[
-                dict(label=f"최근 {DRAM_CHART_DEFAULT_DAYS}일", method="restyle",
+                dict(label=f"최근 {default_days}일", method="restyle",
                      args=[{"x": x_recent, "y": y_recent}]),
                 dict(label="전체", method="restyle",
                      args=[{"x": x_all, "y": y_all}]),
@@ -2587,8 +2592,9 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
     caption = "오른쪽 위에서 품목을 고릅니다(이름은 위 표 기준으로 줄여 적었습니다). " if n > 1 else ""
     if split:
-        caption += (f"왼쪽 위에서 기간(최근 {DRAM_CHART_DEFAULT_DAYS}일 / 전체)을 바꿀 수 있고, "
-                    "기간을 바꾸면 세로 축도 그 구간에 맞춰 다시 잡힙니다. ")
+        caption += (f"왼쪽 위에서 기간(최근 {default_days}일 / 전체)을 바꿀 수 있고, "
+                    "기간을 바꾸면 세로 축도 그 구간에 맞춰 다시 잡힙니다. 위 '변동률 비교 기간'을 "
+                    "바꾸면 이 기본 구간도 같이 바뀝니다. ")
     st.caption(caption + "하루에 여러 번 들어오는 값 중 그 날 마지막 값만 찍고, 시세가 없는 주말은 축에서 뺐습니다.")
 
 
@@ -3935,7 +3941,8 @@ def _render_tab_dram():
                 _render_dram_price_table(chip_display, ["변동률(%)", f"{compare_days_chip}일 전 대비"])
                 if chip_hist["날짜"].nunique() >= 2:
                     st.markdown("**칩 현물가 추이 (누적 기록)**")
-                    _render_dram_trend_chart(history, list(chip_df["품목"]), "dram_chip_toggle", "chart_dram_chip")
+                    _render_dram_trend_chart(history, list(chip_df["품목"]), "dram_chip_toggle", "chart_dram_chip",
+                                              default_days=compare_days_chip)
                 else:
                     st.caption("아직 사이트 업데이트가 한 번만 기록돼 있어서, 다음 업데이트부터 추이 그래프가 표시됩니다.")
 
@@ -3970,7 +3977,8 @@ def _render_tab_dram():
                 _render_dram_price_table(module_display, ["변동률(%)", f"{compare_days_module}일 전 대비"])
                 if module_hist["날짜"].nunique() >= 2:
                     st.markdown("**모듈 현물가 추이 (누적 기록)**")
-                    _render_dram_trend_chart(history, list(module_df["품목"]), "dram_module_toggle", "chart_dram_module")
+                    _render_dram_trend_chart(history, list(module_df["품목"]), "dram_module_toggle", "chart_dram_module",
+                                              default_days=compare_days_module)
                 else:
                     st.caption("아직 사이트 업데이트가 한 번만 기록돼 있어서, 다음 업데이트부터 추이 그래프가 표시됩니다.")
         except Exception as e:
