@@ -421,8 +421,12 @@ st.markdown(
        기본 다크 테마 링크 색과 같다)을 옅게 둘러 "여기 누를 수 있다"는 신호만
        준다. 글자는 순백 대신 옅은 회색으로 낮추고 굵기·외곽선 없이 그대로
        둔다 — 대비를 확 낮추면 애초에 번짐(halation)이 생길 여지가 없다. */
+    /* 배경색 덮어쓰기는 **품목 드롭다운에만** 건다. 기간 버튼(.updatemenu-button-group)
+       까지 걸면 Plotly가 활성 버튼에 칠하는 activecolor를 !important가 이겨 버려서,
+       지금 '최근 30일'인지 '전체'인지 구분이 안 된다. 기간 버튼 색은 Python 쪽
+       bgcolor/activecolor로 직접 준다. */
     div[class*="st-key-chart_dram_"] .updatemenu-header .updatemenu-item-rect,
-    div[class*="st-key-chart_dram_"] .updatemenu-item-rect {
+    div[class*="st-key-chart_dram_"] .updatemenu-dropdown-button-group .updatemenu-item-rect {
         fill: #1c1f26 !important;
         fill-opacity: 1 !important;
         stroke: #3d9df3 !important;
@@ -430,13 +434,17 @@ st.markdown(
         stroke-width: 1px !important;
         rx: 6px;                      /* SVG rect 모서리 둥글리기 */
     }
+    div[class*="st-key-chart_dram_"] .updatemenu-button-group .updatemenu-item-rect {
+        stroke-opacity: 0.45 !important;
+        rx: 6px;
+    }
     div[class*="st-key-chart_dram_"] text.updatemenu-item-text {
         fill: #e3e6ea !important;
         fill-opacity: 1 !important;
         font-weight: 400 !important;
     }
     div[class*="st-key-chart_dram_"] .updatemenu-header:hover .updatemenu-item-rect,
-    div[class*="st-key-chart_dram_"] .updatemenu-item-rect:hover {
+    div[class*="st-key-chart_dram_"] .updatemenu-dropdown-button-group .updatemenu-item-rect:hover {
         fill: #262a33 !important;
         stroke: #3d9df3 !important;
         stroke-opacity: 0.8 !important;
@@ -2442,6 +2450,9 @@ def _short_item_labels(items: list[str]) -> list[str]:
     return short
 
 
+DRAM_CHART_DEFAULT_DAYS = 30
+
+
 def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix: str, chart_key: str) -> None:
     """가격대가 서로 다른 여러 품목을 한 그래프에 겹쳐 그리면 스케일 차이로 잘 안 보이므로,
     한 번에 한 품목만 보이게 하고 나머지는 숨긴다.
@@ -2450,17 +2461,43 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     trace 가시성만 바꾸므로 서버로 왕복하지 않는다. 예전에는 st.radio라서 클릭 한 번에
     이 탭 프래그먼트가 통째로 다시 돌았고(CSV 재기록·표 2개·차트 2개 재렌더) 4초 가까이
     걸렸다. 이제는 사실상 즉시다.
+
+    기간 전환도 같은 이유로 updatemenus를 쓰는데, 방식이 다르다. 품목은 `visible`만
+    토글하면 되지만 기간은 **trace의 데이터 자체를 갈아끼운다**(restyle의 x·y에
+    trace당 배열을 하나씩 넘긴다). 데이터가 바뀌면 Plotly가 y축을 다시 잡아 주므로,
+    "기간을 좁혀도 y축이 그대로라 선이 납작하게 눌려 보이던" 문제가 같이 풀린다
+    (rangeslider로 x만 좁히던 예전 방식은 y를 건드리지 않아 그게 안 됐다).
     """
     n = len(items)
     labels = _short_item_labels(items)
+
+    # 같은 날 11:00·14:40·18:10 세 번 기록된다. 대부분 값이 같은데도 점만 세 배로
+    # 늘어 x축이 빽빽해진다. 날짜별 마지막 값 하나로 접는다(그 날 확정된 값).
+    daily = history.copy()
+    daily["일자"] = pd.to_datetime(daily["날짜"]).dt.normalize()
+    daily = daily.sort_values("날짜").groupby(["품목", "일자"], as_index=False).last()
+    cutoff = daily["일자"].max() - pd.Timedelta(days=DRAM_CHART_DEFAULT_DAYS)
+
     fig = go.Figure()
+    x_recent, y_recent, x_all, y_all = [], [], [], []
     for i, item in enumerate(items):
-        hist = history[history["품목"] == item].sort_values("날짜")
+        hist = daily[daily["품목"] == item].sort_values("일자")
+        recent = hist[hist["일자"] >= cutoff]
+        if len(recent) < 2:          # 한 달 넘게 안 바뀐 품목은 접히면 선이 안 그려진다
+            recent = hist
+        # updatemenus의 args는 plotly의 날짜 변환을 안 타므로 문자열로 넘긴다.
+        to_str = lambda s: [d.strftime("%Y-%m-%d") for d in s]
+        x_all.append(to_str(hist["일자"]))
+        y_all.append(list(hist["평균가(USD)"]))
+        x_recent.append(to_str(recent["일자"]))
+        y_recent.append(list(recent["평균가(USD)"]))
         fig.add_trace(go.Scatter(
-            x=hist["날짜"], y=hist["평균가(USD)"], name=item,
-            mode="lines", visible=(i == 0),
+            x=x_recent[i], y=y_recent[i], name=item,
+            mode="lines+markers", marker=dict(size=4), visible=(i == 0),
+            hovertemplate="%{x|%m-%d} · $%{y:,.3f}<extra></extra>",
         ))
 
+    menus = []
     if n > 1:
         # 각 버튼은 자기 trace만 보이게 한다. Plotly가 가시성 변화에 맞춰 y축을 알아서
         # 다시 잡으므로(품목마다 가격대가 다르다) 여기서 yaxis.autorange를 넘기지 않는다 —
@@ -2478,14 +2515,33 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
         # 왼쪽(= 그림 왼쪽 + margin.l)이라 제목보다 항상 여백만큼 들여쓰기된다.
         # 이걸 음수 x로 당기려면 보정값이 폭마다 달라진다(458px에서 -0.12, 343px에서
         # -0.17). 오른쪽 정렬은 margin.r만큼만 떨어지므로 폭과 무관하게 가장자리에 붙는다.
-        fig.update_layout(updatemenus=[dict(
+        menus.append(dict(
             type="dropdown", direction="down", active=0,
             buttons=buttons, showactive=True,
             x=1, xanchor="right", y=1.0, yanchor="bottom",
             pad=dict(t=0, b=8, l=0, r=0),
             bgcolor="#1c1f26", bordercolor="#3d9df3", borderwidth=1,
             font=dict(color="#e3e6ea", size=15),
-        )])
+        ))
+
+    # 기간 버튼은 왼쪽 위. 여기는 x=0이 플롯 영역 왼쪽(=y축 눈금 위)이라 축과 세로로
+    # 맞아떨어진다. 지금 어느 기간인지는 Plotly가 활성 버튼에 칠하는 activebgcolor로
+    # 보인다 — 그래서 위 CSS의 `fill !important`는 드롭다운 쪽에만 걸어 둔다.
+    menus.append(dict(
+        type="buttons", direction="right", active=0, showactive=True,
+        buttons=[
+            dict(label=f"최근 {DRAM_CHART_DEFAULT_DAYS}일", method="restyle",
+                 args=[{"x": x_recent, "y": y_recent}]),
+            dict(label="전체", method="restyle",
+                 args=[{"x": x_all, "y": y_all}]),
+        ],
+        x=0, xanchor="left", y=1.0, yanchor="bottom",
+        pad=dict(t=0, b=8, l=0, r=0),
+        bgcolor="#1c1f26", activecolor="#2b5c86",
+        bordercolor="#3d9df3", borderwidth=1,
+        font=dict(color="#e3e6ea", size=13),
+    ))
+    fig.update_layout(updatemenus=menus)
 
     # 제목은 없앤다 — 드롭다운이 그 자리에서 같은 일을 한다.
     _style_chart_mobile(fig, title=None, show_legend=False)
@@ -2493,16 +2549,21 @@ def _render_dram_trend_chart(history: pd.DataFrame, items: list[str], key_prefix
     # 왼쪽 여백을 좁히는 이유: updatemenus의 x=0은 그림 왼쪽이 아니라 **플롯 영역**
     # 왼쪽이라, 기본 여백(80px)이면 메뉴가 위의 섹션 제목보다 안쪽으로 들여쓰기돼
     # 혼자 떠 있는 것처럼 보인다. 축 눈금(두세 자리 숫자)에는 48px이면 넉넉하다.
-    fig.update_layout(margin=dict(t=58 if n > 1 else 30, l=48, r=16))
+    fig.update_layout(margin=dict(t=58, l=48, r=16))
     # _style_chart_mobile은 모든 축에 fixedrange=True를 건다. 그 상태로 품목을 바꾸면
     # (visible 토글) Plotly가 잠긴 y축을 autorange하려다 "axis scaling" 오류를 낸다.
-    # y축만 풀어 준다 — 세로 줌이 열리지만, 스크롤 오작동의 원인인 가로 줌은 x축에
-    # 그대로 잠겨 있고 x는 rangeslider로 조정한다.
+    # y축만 풀어 준다 — 세로 줌이 열리고, 기간 버튼이 데이터를 갈아끼울 때도 여기서
+    # 다시 잡힌다. 가로 줌은 스크롤 오작동 때문에 x축에 그대로 잠가 둔다.
     fig.update_yaxes(fixedrange=False, autorange=True)
-    fig.update_xaxes(rangeslider_visible=True)
+    # 현물가는 평일에만 나온다. 날짜 축을 그대로 쓰면 토·일 이틀이 빈칸으로 남아
+    # 가로가 1.4배로 늘어나고 선이 주마다 끊겨 보인다. 주말을 축에서 아예 뺀다.
+    fig.update_xaxes(type="date", rangebreaks=[dict(bounds=["sat", "mon"])])
     st.plotly_chart(fig, width="stretch", key=chart_key, config=PLOTLY_CONFIG)
-    st.caption("오른쪽 위 상자에서 품목을 고르면 바로 바뀝니다(이름은 위 표 기준으로 줄여 적었습니다). "
-               "차트 하단 슬라이더로 기간을 좁힐 수 있습니다.")
+    st.caption(
+        f"왼쪽 위에서 기간(최근 {DRAM_CHART_DEFAULT_DAYS}일 / 전체), 오른쪽 위에서 품목을 고릅니다"
+        "(이름은 위 표 기준으로 줄여 적었습니다). 기간을 바꾸면 세로 축도 그 구간에 맞춰 다시 잡힙니다. "
+        "하루 세 번(11:00·14:40·18:10) 들어오는 값 중 그 날 마지막 값만 찍고, 시세가 없는 주말은 축에서 뺐습니다."
+    )
 
 
 DOWNTREND_WINDOW = 20
