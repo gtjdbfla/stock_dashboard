@@ -1523,6 +1523,98 @@ def fetch_foreign_desk(ticker: str) -> dict:
     return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
 
 
+def fetch_investor_estimate(ticker: str) -> dict:
+    """KIS '종목별 외국인·기관 추정가집계'. 장중에 갱신되는 누적 추정 순매수(주).
+
+    거래소 확정 수급은 마감 뒤에야 나온다. 이 API가 그 사이를 메운다 — **종목별로**
+    장중에 외국인·기관을 볼 수 있는 경로다(예전에 "종목별은 장중에 볼 방법이 없다"고
+    화면에 써 뒀던 건 네이버만 보던 시절 이야기였다).
+
+    **개인은 주지 않는다.** 합계에서 빼서 유도하지 말 것 — 기타법인이 빠져서 실제와
+    어긋난다(§5의 같은 함정). 실측(2026-09-18 SK하이닉스): 다섯 시점이 +59천 → +129천
+    → +212천 → +416천 → +483천으로 단조 증가하는 누적값이었고, 그날 확정치(외국인
+    +716,206주)와 방향이 같았다. 같은 시각 삼성전자는 -1,533천주로 전혀 다른 값이
+    나와서, 종목별로 제대로 갈리는 값임을 교차 확인했다.
+    """
+    token = _kis_get_token()
+    if not token:
+        return {}
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "HHPTJ04160200",
+        "custtype": "P",
+    }
+    r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
+                     headers=headers, params={"MKSC_SHRN_ISCD": ticker}, timeout=10)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("rt_cd") != "0":
+        return {}
+    rows = body.get("output2") or []
+    # 응답에 날짜가 없다. 차수(bsop_hour_gb)가 가장 큰 줄이 그날의 최신 누적 추정이다.
+    best_seq, best_row = None, None
+    for row in rows:
+        try:
+            seq = int(str(row.get("bsop_hour_gb") or ""))
+        except ValueError:
+            continue
+        if best_seq is None or seq > best_seq:
+            best_seq, best_row = seq, row
+    if best_row is None:
+        return {}
+    foreign = _to_number(best_row.get("frgn_fake_ntby_qty"))
+    inst = _to_number(best_row.get("orgn_fake_ntby_qty"))
+    if foreign is None and inst is None:
+        return {}
+    return {"외국인": foreign, "기관": inst, "차수": best_seq, "집계수": len(rows)}
+
+
+def fetch_investor_daily_kis(ticker: str) -> pd.DataFrame:
+    """KIS '주식현재가 투자자'. 종목별 일별 개인·외국인·기관 순매수(주), 최신순 약 30일.
+
+    daily_history(네이버)와 같은 값이지만 **훨씬 빨리 나온다** — 네이버 일별 수급은
+    실측 18:25에야 올라오는데(flow_probe), 이쪽은 마감 12분 뒤인 15:42에 이미 당일
+    확정치가 있었다. 첫 화면에서 '오늘 누가 샀나'를 두세 시간 먼저 보여주는 용도다.
+    """
+    token = _kis_get_token()
+    if not token:
+        return pd.DataFrame(columns=["날짜", "종가", "개인", "외국인", "기관"])
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "FHKST01010900",
+        "custtype": "P",
+    }
+    r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
+                     headers=headers,
+                     params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker},
+                     timeout=10)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("rt_cd") != "0":
+        return pd.DataFrame(columns=["날짜", "종가", "개인", "외국인", "기관"])
+    rows = []
+    for row in body.get("output") or []:
+        day = str(row.get("stck_bsop_date") or "")
+        if len(day) != 8:
+            continue
+        rows.append({
+            "날짜": pd.Timestamp(dt.datetime.strptime(day, "%Y%m%d").date()),
+            "종가": _to_number(row.get("stck_clpr")),
+            "개인": _to_number(row.get("prsn_ntby_qty")),
+            "외국인": _to_number(row.get("frgn_ntby_qty")),
+            "기관": _to_number(row.get("orgn_ntby_qty")),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["날짜", "종가", "개인", "외국인", "기관"])
+    return pd.DataFrame(rows).sort_values("날짜").reset_index(drop=True)
+
+
 def fetch_short_sale_daily(ticker: str) -> pd.DataFrame:
     """KIS '국내주식 공매도 일별추이'. 최근 100거래일 정도가 최신순으로 온다.
 

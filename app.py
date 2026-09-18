@@ -90,10 +90,11 @@ from ai_inputs import (
     fetch_futures_foreign_history,
     fetch_futures_foreign_history_live,
     fetch_intraday_price,
+    fetch_investor_daily_kis,
+    fetch_investor_estimate,
     fetch_investor_netbuy,
     fetch_latest_bars,
     fetch_latest_futures_bars,
-    fetch_market_flow,
     fetch_short_balance,
     fetch_stock_snapshot,
     fetch_target_price_history,
@@ -154,6 +155,10 @@ _CACHED = {
     # 코스피200 선물 외국인 이력. 티커와 무관한 시장 전체 지표라 하루 한 번이면 충분하다.
     'fetch_futures_foreign_history': dict(ttl=24 * 3600, show_spinner="불러오는 중..."),
     'fetch_intraday_price': dict(ttl=10, show_spinner="불러오는 중..."),
+    # 아래 둘은 5초 프래그먼트 안에서 불린다. KIS는 초당 유량 제한이 있고 원자료도
+    # 자주 안 바뀌므로(추정 가집계는 하루 몇 회, 일별 확정은 하루 한 번) 넉넉히 잡는다.
+    'fetch_investor_estimate': dict(ttl=60, show_spinner=False),
+    'fetch_investor_daily_kis': dict(ttl=300, show_spinner=False),
     # 예전엔 매번 네이버를 700일 규모로 직접 훑어서 무거웠기에 1시간을 줬다. 이제 내부가
     # daily_history 파일 우선(가벼움) + fetch_latest_bars(ttl=60)로 바뀌었는데, 이 캐시가
     # 1시간으로 남아 있으면 안쪽이 최신이어도 바깥이 최대 1시간 묵은 결과를 그대로 돌려준다
@@ -163,7 +168,6 @@ _CACHED = {
     # 장중 계속 바뀌는 선물 최근분. 위 fetch_futures_foreign_history와 같은 이유로 짧게.
     'fetch_latest_futures_bars': dict(ttl=60, show_spinner="불러오는 중..."),
     'fetch_macro_summary': dict(ttl=1800, show_spinner=False),
-    'fetch_market_flow': dict(ttl=20, show_spinner=False),
     'fetch_news_with_summary': dict(ttl=1800, show_spinner="불러오는 중..."),
     'fetch_sector_news': dict(ttl=1800, show_spinner="업종·매크로 뉴스 수집 중..."),
     'fetch_stock_snapshot': dict(ttl=1800, show_spinner="불러오는 중..."),
@@ -222,7 +226,7 @@ def _streamlit_pool(max_workers: int) -> ThreadPoolExecutor:
 # 멈췄고, 셋이 한꺼번에 리런되면서 화면 전체가 동시에 흐려졌다.
 REFRESH_SEC = 5                 # 현재가 지표
 INTRADAY_REFRESH_SEC = 5        # 장중 차트
-MARKET_FLOW_REFRESH_SEC = 5     # 코스피 전체 수급
+MARKET_FLOW_REFRESH_SEC = 5     # 종목 투자자 동향(외국계 창구 + 추정·확정 수급)
 DEFAULT_STOCK_NAME = "SK하이닉스"
 NAVER_SEARCH_URL = "https://ac.stock.naver.com/ac"
 MEMORY_SEMICONDUCTOR_TICKERS = {"000660": "SK하이닉스", "005930": "삼성전자"}
@@ -934,10 +938,12 @@ def _render_foreign_desk_line() -> None:
     stamp = f" · {d['기준']} 조회" if d.get("기준") else ""
     _bold_label_with_help(
         f"외국계 창구 추정 {word} :{color}[{abs(net):,.0f}주]{stamp}",
-        "종목별 외국인·기관·개인 수급은 장 마감 후에야 공개됩니다. 장중에 볼 수 있는 건 "
-        f"거래원(증권사 창구) 기준인 이 값뿐입니다. {FOREIGN_DESK_NOTE}\n\n"
+        "거래원(증권사 창구) 기준으로 외국계 창구를 합산한 값입니다. "
+        f"{FOREIGN_DESK_NOTE}\n\n"
         "**기관·개인은 여기에 없습니다.** 갱신 간격은 45초~6분으로 일정하지 않고, "
-        "표시된 시각은 페이지를 조회한 시각입니다.",
+        "표시된 시각은 조회한 시각입니다.\n\n"
+        "바로 아래 '이 종목 투자자 동향'은 집계 방식이 다른 별개 값입니다 — 그쪽은 "
+        "외국인·기관 구분이고, 이쪽은 창구(증권사) 기준이라 숫자가 서로 다릅니다.",
         key="foreign_desk",
     )
 
@@ -2001,48 +2007,95 @@ def render_intraday_chart():
         _note_optional_failure("장중 주가 추이", exc)
 
 
-@st.fragment(run_every=MARKET_FLOW_REFRESH_SEC)
-def render_market_flow():
-    """코스피 전체 수급. 거래소가 1~2분마다 올리므로 그 주기에 맞춘다."""
-    try:
-        flow = fetch_market_flow()
-        if flow:
-            live = flow["is_today"]
-            flow_help = (
-                "**이 종목이 아니라 코스피 시장 전체 수급입니다.**\n\n"
-                "외국인·기관·개인 3분류를 종목별로 장중에 보는 방법은 없습니다. 거래소가 마감 후에만 "
-                "공개하기 때문이고, 증권사 공식 API도 종목별은 일별만 제공합니다. "
-                "바로 위의 '외국계 창구 추정'이 장중에 볼 수 있는 유일한 종목별 단서인데, "
-                "그건 외국인만 잡히는 추정치입니다.\n\n"
-                "시장 전체 잠정치는 장중 1~2분마다 갱신됩니다. 이 종목의 수급으로 읽지 말고, "
-                "'오늘 시장에서 외국인이 사는 날인가 파는 날인가' 정도의 배경으로만 보세요.\n\n"
-                "종목별 일별 확정 수급은 **수급 현황** 탭에 있습니다."
-            )
-            # 아래는 '시장 전체' 수급이라 이 종목 얘기가 아니다. 바로 위에 이 종목의
-            # 장중 단서를 한 줄만 둔다(자세한 창구별 내역까지는 여기서 다루지 않는다).
-            _render_foreign_desk_line()
+def _flow_metric_row(items: list[tuple[str, float | None]], row_key: str) -> None:
+    """순매수=초록 / 순매도=빨강으로 칠한 지표 줄. st.metric은 delta만 색을 입히고
+    값에는 못 입혀서, 컨테이너 key에 buy/sell을 넣고 CSS로 숫자까지 칠한다."""
+    with st.container(key=row_key):
+        cols = st.columns(len(items))
+        for col, (label, value) in zip(cols, items):
+            side = "none" if not value else ("buy" if value > 0 else "sell")
+            with col.container(key=f"metric_small_flow_{side}_{label}"):
+                st.metric(
+                    label,
+                    f"{value:+,.0f}주" if value is not None else "N/A",
+                    delta={"buy": "순매수", "sell": "순매도"}.get(side),
+                    delta_color="off",
+                )
 
-            _bold_label_with_help(
-                f"코스피 전체 수급 ({'장중 잠정' if live else flow['날짜'] + ' 확정'}, 억원)",
-                flow_help, key="market_flow",
-            )
-            with st.container(key="price_row_market_flow"):
-                cols = st.columns(4)
-                items = [("개인", flow["개인"]), ("외국인", flow["외국인"]),
-                         ("기관계", flow["기관계"]), ("프로그램 비차익", flow["비차익"])]
-                for col, (label, value) in zip(cols, items):
-                    # 순매수=초록 / 순매도=빨강. st.metric은 delta만 색을 입히고 값에는
-                    # 못 입혀서, 컨테이너 key에 buy/sell을 넣고 CSS로 숫자를 칠한다.
-                    side = "none" if not value else ("buy" if value > 0 else "sell")
-                    with col.container(key=f"metric_small_flow_{side}_{label}"):
-                        st.metric(
-                            label,
-                            f"{value:+,.0f}" if value is not None else "N/A",
-                            delta={"buy": "순매수", "sell": "순매도"}.get(side),
-                            delta_color="off",   # 색은 아래 CSS가 값·델타 양쪽에 같이 준다
-                        )
+
+@st.fragment(run_every=MARKET_FLOW_REFRESH_SEC)
+def render_stock_investor_flow():
+    """이 종목의 투자자별 수급. 장중엔 KIS 추정 가집계, 마감 뒤엔 당일 확정치.
+
+    예전엔 이 자리가 '코스피 전체 수급'(네이버 sise/investorDealTrendDay.naver)이었는데
+    그 페이지가 410으로 사라졌다(CONTEXT.md §5). 어차피 '이 종목 얘기가 아니다'라는
+    단서를 계속 달아야 하던 지표라, 같은 자리를 종목별 값으로 바꿔 채운다.
+    """
+    try:
+        # 외국계 창구 줄은 예전에 코스피 수급 블록 '안'에 있었다. 그래서 네이버가 죽자
+        # 멀쩡한 이 줄까지 같이 사라졌다. 이제 바깥에서 독립적으로 그린다.
+        _render_foreign_desk_line()
+
+        try:
+            daily = fetch_investor_daily_kis(TICKER)
+        except Exception:
+            daily = pd.DataFrame()
+        confirmed = None
+        if not daily.empty:
+            last = daily.iloc[-1]
+            # 세 값이 다 0이면 아직 집계 전이다(마감 직후 잠깐 그렇다).
+            if any(abs(float(last[c] or 0)) > 0 for c in INVESTOR_COLUMNS):
+                confirmed = last
+
+        intraday = _korea_session_now() == "정규장"
+        today = dt.date.today()
+        has_today = confirmed is not None and confirmed["날짜"].date() == today
+
+        if intraday or not has_today:
+            # 장중이면 확정치가 아직 없거나 있어도 진행 중이다. 추정 가집계를 쓴다.
+            est = fetch_investor_estimate(TICKER) if intraday else {}
+            if est:
+                foreign, inst = est.get("외국인"), est.get("기관")
+                _bold_label_with_help(
+                    f"이 종목 투자자 동향 (장중 추정 · {est['차수']}/{est['집계수']}차 집계)",
+                    "**증권사가 장중에 집계하는 추정치입니다(한국투자증권 Open API).** "
+                    "거래소 확정 수급은 마감 뒤에야 나오는데, 그 사이를 메워 줍니다.\n\n"
+                    "**개인은 여기에 없습니다.** 외국인·기관 두 분류만 제공되고, 합계에서 빼서 "
+                    "개인을 유도하면 기타법인이 섞여 실제와 어긋납니다.\n\n"
+                    "하루 몇 차례 갱신되는 누적값이라 분 단위로 움직이지는 않습니다. "
+                    "추정치이므로 마감 후 확정치와 차이가 납니다 — 실측 예로 추정 +483천주 vs "
+                    "확정 +716천주였습니다. 방향(사는 날/파는 날)을 보는 용도로 쓰세요.\n\n"
+                    "일별 확정 수급의 긴 추이는 **수급 현황** 탭에 있습니다.",
+                    key="stock_investor_est",
+                )
+                _flow_metric_row(
+                    [("외국인", foreign), ("기관", inst),
+                     ("외국인+기관", None if foreign is None or inst is None else foreign + inst)],
+                    "price_row_stock_investor",
+                )
+                return
+            if confirmed is None:
+                return
+
+        # 마감 뒤(또는 장중 추정이 없을 때): 가장 최근 거래일 확정치
+        if confirmed is None:
+            return
+        stamp = f"{confirmed['날짜']:%m-%d}"
+        _bold_label_with_help(
+            f"이 종목 투자자 동향 ({stamp} 확정)",
+            "거래소 확정 수급입니다(한국투자증권 Open API). **마감 12분 뒤면 이미 나옵니다** — "
+            "네이버 일별 수급이 18시를 넘겨야 올라오는 것보다 두세 시간 빠릅니다.\n\n"
+            "장중에는 이 자리에 증권사 추정 가집계(외국인·기관)가 대신 표시됩니다.\n\n"
+            "일별 확정 수급의 긴 추이는 **수급 현황** 탭에 있습니다.",
+            key="stock_investor_confirmed",
+        )
+        _flow_metric_row(
+            [(c, float(confirmed[c]) if confirmed[c] is not None else None)
+             for c in INVESTOR_COLUMNS],
+            "price_row_stock_investor",
+        )
     except Exception as exc:
-        _note_optional_failure("코스피 전체 수급", exc)
+        _note_optional_failure("종목 투자자 동향", exc)
 
 _boot_lap("상단(사이드바·타이틀·CSS) 완료")
 
@@ -2056,11 +2109,11 @@ render_intraday_chart()
 if _BOOT_PROFILE:
     print(f"[boot]   장중 차트 {time.monotonic() - _lf_t:.2f}s", flush=True)
 _lf_t = time.monotonic()
-render_market_flow()
+render_stock_investor_flow()
 if _BOOT_PROFILE:
-    print(f"[boot]   코스피 수급 {time.monotonic() - _lf_t:.2f}s", flush=True)
+    print(f"[boot]   종목 투자자 동향 {time.monotonic() - _lf_t:.2f}s", flush=True)
 
-_boot_lap("현재가·장중차트·코스피수급 완료")
+_boot_lap("현재가·장중차트·종목수급 완료")
 
 st.divider()
 
