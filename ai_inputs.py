@@ -1823,6 +1823,29 @@ def build_community_summary(ticker: str, stock_name: str, titles_per_source: int
             + "\n".join(f"  - {r['날짜']} {r['제목']} (조회 {r['조회수']}, 추천 {r['추천']})"
                         for _, r in dc.head(titles_per_source).iterrows())
         )
+    try:
+        toss = fetch_toss_community_posts(ticker, TOSS_COMMUNITY_MAX_COUNT)
+    except Exception:
+        toss = pd.DataFrame()
+    if not toss.empty:
+        # classify_sentiment는 날짜·제목·심리 세 열만 돌려준다(행 순서는 그대로 유지되므로
+        # 값만 되붙인다) - 추천수·보유여부까지 같이 써야 해서 원본에 심리 열만 얹는다.
+        toss = toss.assign(심리=classify_sentiment(toss)["심리"].values)
+        counts = toss["심리"].value_counts()
+        total = len(toss)
+        pos, neg, neu = (int(counts.get(k, 0)) for k in ("긍정", "부정", "중립"))
+        holders = int(toss["보유"].sum())
+        span = f"{toss['시각'].min()}~{toss['시각'].max()}" if toss["날짜"].nunique() == 1 else f"{toss['날짜'].min()}~{toss['날짜'].max()}"
+        # 표본은 크게(최대 300건) 잡아 비율을 계산하고, 실제로 읽힐 원문은 추천 많은 순으로
+        # titles_per_source개만 추린다 — 그래야 도배성 한줄 댓글이 아니라 대세 의견이 뽑힌다.
+        top = toss.sort_values("추천", ascending=False).head(titles_per_source)
+        blocks.append(
+            f"[토스증권 종목토론방] 최근 {total}건({span}, 종목 전용 댓글창) — "
+            f"긍정 {pos}건({pos / total:.0%}) / 부정 {neg}건({neg / total:.0%}) / 중립 {neu}건({neu / total:.0%})"
+            f" · 보유자 작성 {holders}건({holders / total:.0%}) (키워드 기반 대략치, 추천수 상위 발췌)\n"
+            + "\n".join(f"  - [{r['심리']}]{'[보유]' if r['보유'] else ''} 추천{int(r['추천'])} {r['제목']}"
+                        for _, r in top.iterrows())
+        )
     return "\n\n".join(blocks)
 
 
@@ -2117,6 +2140,94 @@ def fetch_dc_gallery_posts(keyword: str, count: int = 60) -> pd.DataFrame:
             seen_no.add(post["번호"])
             posts.append(post)
     return pd.DataFrame(posts[:count])
+
+
+# 토스증권 종목토론방("의견나누기"). 로그인 없이 여는 공개 JSON API라 별도 인증이 없다.
+# 실측(2026-09-18 SK하이닉스): 33분 사이 165건 — 네이버 종목토론방(2026-09-10 개편 후
+# 통째로 죽음, fetch_community_posts가 0건)이나 디시인사이드 검색(krstock, 10건 안팎)보다
+# 훨씬 크고 살아 있는 표본이다. subjectId는 종목코드가 아니라 ISIN(KR7000660001 같은
+# 12자리)이라 별도 조회가 필요하다.
+TOSS_STOCK_INFO_URL = "https://wts-info-api.tossinvest.com/api/v2/stock-infos/code-or-symbol/A{ticker}"
+TOSS_COMMENTS_URL = "https://wts-cert-api.tossinvest.com/api/v4/comments"
+# "표본을 분석에 무리 없는 최대로" — 실측 페이지당 11건, 정치·시황 게시판이 아니라
+# 이 종목 전용 댓글창이라 DC(krstock)처럼 무관한 글이 섞이지 않는다. 300건이면 활발한
+# 날은 최근 30분~1시간, 조용한 날은 하루 이상을 커버해 표본이 항상 두둑하다.
+TOSS_COMMUNITY_MAX_COUNT = 300
+
+_toss_isin_cache: dict[str, str] = {}
+
+
+def _toss_isin(ticker: str) -> str | None:
+    """티커(코드만, 접두 없이) -> 토스 내부 종목 식별자(ISIN). 프로세스 안에서 캐시한다
+    (상장폐지·재상장이 아닌 한 안 바뀐다)."""
+    if ticker in _toss_isin_cache:
+        return _toss_isin_cache[ticker]
+    try:
+        r = requests.get(TOSS_STOCK_INFO_URL.format(ticker=ticker),
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.raise_for_status()
+        isin = ((r.json() or {}).get("result") or {}).get("isinCode")
+    except Exception:
+        return None
+    if not isin:
+        return None
+    _toss_isin_cache[ticker] = isin
+    return isin
+
+
+def fetch_toss_community_posts(ticker: str, count: int = TOSS_COMMUNITY_MAX_COUNT) -> pd.DataFrame:
+    """토스증권 종목토론방 댓글을 최신순으로 count건까지 모은다.
+
+    페이지당 11건 고정이라(size 파라미터는 무시된다) lastCommentId 커서로 이어 받는다.
+    다른 소스처럼 병렬로 뿌리지 못하는 이유는 다음 페이지 커서가 이전 응답에서만
+    나오기 때문이다(선물 이력의 bizdate 워커와 같은 구조).
+    """
+    isin = _toss_isin(ticker)
+    if not isin:
+        return pd.DataFrame()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    rows: list[dict] = []
+    last_id = None
+    max_pages = count // 10 + 3      # 페이지당 11건이니 여유 있게
+    for _ in range(max_pages):
+        params = {"subjectType": "STOCK", "subjectId": isin, "commentSortType": "RECENT"}
+        if last_id is not None:
+            params["lastCommentId"] = last_id
+        try:
+            r = requests.get(TOSS_COMMENTS_URL, params=params, headers=headers, timeout=10)
+            r.raise_for_status()
+            result = (r.json() or {}).get("result") or {}
+        except Exception:
+            break
+        results = result.get("results") or []
+        if not results:
+            break
+        for c in results:
+            msg = c.get("message") or {}
+            title, body = (msg.get("title") or "").strip(), (msg.get("message") or "").strip()
+            # 제목 없이 본문만 쓴 글이 많다(짧은 잡담). 겹치지 않을 때만 둘 다 이어 붙인다.
+            if title and body and title != body:
+                content = f"{title} {body}"
+            else:
+                content = title or body
+            if not content:
+                continue
+            rows.append({
+                "날짜": (c.get("createdAt") or "")[:10],
+                "시각": (c.get("createdAt") or "")[11:16],
+                "제목": re.sub(r"\s+", " ", content)[:200],
+                "추천": (c.get("statistic") or {}).get("likeCount") or 0,
+                "보유": (c.get("holding") or {}).get("shareHoldingStatus") == "HOLDING",
+                "id": c.get("commentId"),
+            })
+        new_last_id = results[-1].get("commentId")
+        if new_last_id == last_id or new_last_id is None:
+            break                     # 커서가 안 움직이면 무한루프 방지
+        last_id = new_last_id
+        if len(rows) >= count or not result.get("hasNext", False):
+            break
+        time.sleep(0.1)               # 수십 페이지를 잇달아 걸므로 예의상 간격
+    return pd.DataFrame(rows[:count])
 
 
 def _parse_dram_last_update(soup: BeautifulSoup, category_label: str) -> str | None:
