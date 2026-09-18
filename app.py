@@ -4876,31 +4876,23 @@ _TAB_RENDERERS = {
 # 사이드바에서 숨기지 않은(선택된) 탭만 실제로 렌더링한다. 숨겨진 탭은 함수 자체가
 # 호출되지 않으므로 데이터 조회도 일어나지 않는다.
 #
-# 지연 렌더: `st.tabs`는 보이는 탭 8개를 한 번에 다 그리고, 그 루프가 동기라서
-# 처음 열 때 8개 데이터 조회가 순서대로 쌓여 20초가 걸렸다. 사용자는 한 번에 한
-# 탭만 본다. 그래서 **새 세션의 첫 렌더에서는 처음 열려 있는 탭(=첫 탭)만** 그리고,
-# 곧바로 st.rerun()을 한 번 걸어 나머지를 채운다. 그 사이에도 첫 탭은 이미 보이고
-# 눌린다 — 첫 탭까지 걸리는 시간이 ~20초에서 ~6초로 줄고, 나머지는 읽는 동안 채워진다.
-# (탭 전환은 그대로 즉시다. `st.tabs`의 CSS 토글이라 서버로 안 간다.)
-_TABS_WARMED_KEY = "_all_tabs_rendered"
-_tabs_warmed = st.session_state.get(_TABS_WARMED_KEY, False)
-
-for _i, _label in enumerate(_visible_tab_labels):
+# 예전엔 여기서 첫 탭만 그리고 st.rerun()으로 나머지를 채우는 2단계 지연 렌더를 썼다
+# (탭 8개가 각자 무거운 네트워크 스크레이핑을 했을 때 얘기 — 그때는 합쳐서 20초였다).
+# 그 뒤 데이터 소스가 대부분 파일 기반 캐시로 옮겨가면서, 지금은 8개를 전부 그려도
+# 서버 쪽 계산은 실측 1초 안쪽이다(BOOT_PROFILE). 반면 st.rerun() 한 번은 브라우저
+# ↔ 서버 왕복을 통째로 하나 더 만든다 — Tailscale Funnel처럼 왕복 지연이 큰 경로에서는
+# 그 왕복 자체가 계산 시간보다 훨씬 크다(실측 `/_stcore/health` 왕복만 약 0.7초).
+# 그래서 지연 렌더를 걷어내고 한 번에 다 그린다: 첫 화면이 뜨는 시점은 조금 늦어지지만
+# (계산 ~0.3초 -> ~1.3초), 그 대신 왕복 지연이 큰 네트워크에서 뒤따르던 재실행 왕복을
+# 통째로 없애 총 체감 시간이 줄어든다.
+for _label in _visible_tab_labels:
     _tab_t0 = time.monotonic()
     with _tab_map[_label]:
-        if _tabs_warmed or _i == 0:
-            _TAB_RENDERERS[_label]()
-        else:
-            st.caption("불러오는 중…")
+        _TAB_RENDERERS[_label]()
     if _BOOT_PROFILE:
-        print(f"[boot]   탭 '{_label}' {time.monotonic() - _tab_t0:6.2f}s"
-              + ("" if (_tabs_warmed or _i == 0) else " (지연)"), flush=True)
+        print(f"[boot]   탭 '{_label}' {time.monotonic() - _tab_t0:6.2f}s", flush=True)
 
 _boot_lap("탭 렌더 루프 완료")
-
-if not _tabs_warmed:
-    st.session_state[_TABS_WARMED_KEY] = True
-    st.rerun()
 
 
 # AI 분석 생성은 **여기서** 한다. 탭을 다 그린 뒤라야 과열도·DRAM 요약(그 탭이 그려질 때
