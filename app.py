@@ -1885,9 +1885,12 @@ def render_intraday_chart():
 
         if not adr_df.empty:
                 adr_visible = not show_host_first
-                # 본주 그래프와 같은 색 규칙: 정규장 빨강, 프리장·애프터장 회색.
+                # 본주 그래프와 같은 색 규칙: 정규장 빨강, 프리장 회색, 애프터장 주황.
+                # 범례 이름도 본주와 통일(프리장/정규장/애프터장) — "(ADR)"을 붙이면
+                # 모바일 폭에서 줄바꿈이 일어나 본주 범례와 어긋나 보였다. 호스트/ADR
+                # 트레이스는 visible 토글로 항상 한쪽만 화면에 보이니 이름이 겹쳐도 안전하다.
                 # 구간이 끊겨 보이지 않게, 이어지는 지점 한 점씩 겹쳐서 선을 붙인다.
-                for label, color in (("프리장", "#7f7f7f"), ("정규장", "#d62728"), ("애프터장", "#7f7f7f")):
+                for label, color in (("프리장", "#7f7f7f"), ("정규장", "#d62728"), ("애프터장", POST_MARKET_COLOR)):
                     seg = adr_df[adr_df["세션"] == label]
                     if seg.empty:
                         continue
@@ -1897,7 +1900,7 @@ def render_intraday_chart():
                     seg = adr_df.iloc[lo:hi] if label != "프리장" else adr_df.iloc[idx.min():hi]
                     fig_intraday.add_trace(go.Scatter(
                         x=seg["시각"], y=seg["가격"], mode="lines",
-                        line=dict(color=color), name=f"{label}(ADR)", visible=adr_visible,
+                        line=dict(color=color), name=label, visible=adr_visible,
                         hovertemplate="%{x|%H:%M}  $%{y:,.2f}<extra>" + label + "</extra>",
                     ))
                 # 하루 전체를 그리는 그래프라 기준선은 세션과 무관하게 '직전 거래일 종가'다
