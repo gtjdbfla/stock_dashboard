@@ -1807,12 +1807,8 @@ def render_intraday_chart():
                 x_end = max(x_end, pre_ticks["시각"].max().to_pydatetime())
 
             # --- 본주 트레이스 (기본 표시) ---
-            fig_intraday.add_trace(go.Scatter(
-                x=regular_df["시각"], y=regular_df["현재가"],
-                mode="lines", line=dict(color="#d62728"), name="정규장",
-                hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>정규장</extra>",
-            ))
-            host_traces = 1
+            # 범례 순서를 ADR(SKHY) 쪽과 맞추기 위해 프리장 -> 정규장 -> 애프터장 순으로 추가한다.
+            host_traces = 0
             if not pre_ticks.empty:
                 fig_intraday.add_trace(go.Scatter(
                     x=pre_ticks["시각"], y=pre_ticks["가격"],
@@ -1820,6 +1816,12 @@ def render_intraday_chart():
                     hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>프리장</extra>",
                 ))
                 host_traces += 1
+            fig_intraday.add_trace(go.Scatter(
+                x=regular_df["시각"], y=regular_df["현재가"],
+                mode="lines", line=dict(color="#d62728"), name="정규장",
+                hovertemplate="%{x|%H:%M}  %{y:,.0f}원<extra>정규장</extra>",
+            ))
+            host_traces += 1
             post_df = naver_post_df if post_from_naver else post_ticks
             post_y_col = "현재가" if post_from_naver else "가격"
             if not post_df.empty:
