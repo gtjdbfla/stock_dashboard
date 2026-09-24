@@ -425,6 +425,50 @@ def _walk_trend(ticker: str, enough) -> "list[pd.DataFrame]":
     return frames
 
 
+def _overlay_kis_confirmed_flow(ticker: str, hist: pd.DataFrame) -> pd.DataFrame:
+    """오늘 순매수를 KIS 확정치로 앞당긴다.
+
+    hist는 네이버 trend API 기반이라 당일 수급이 마감 18:25 전후에야 올라온다
+    (CONTEXT.md §5). 반면 '이 종목 투자자 동향' 위젯이 쓰는 KIS 확정 수급
+    (`fetch_investor_daily_kis`)은 마감 12분 뒤(15:42)면 이미 나온다. 네이버에
+    오늘 날짜가 아직 없거나 있어도 세 값이 다 0이면(집계 전) KIS 값으로 채워서,
+    이 차트도 위젯과 같은 속도로 오늘치를 보여준다. 거래량은 이미 더 빠른
+    `fetch_daily_ohlcv`가 따로 덮어쓰므로 여기서는 순매수 세 열만 다룬다.
+    """
+    if hist.empty:
+        return hist
+    try:
+        kis = fetch_investor_daily_kis(ticker)
+    except Exception:
+        return hist
+    if kis.empty:
+        return hist
+    today = pd.Timestamp(dt.date.today())
+    row = kis[kis["날짜"] == today]
+    if row.empty:
+        return hist
+    row = row.iloc[0]
+    if not any(abs(float(row[c] or 0)) > 0 for c in INVESTOR_COLUMNS):
+        return hist   # KIS도 아직 집계 전
+
+    hist = hist.copy()
+    existing = hist[hist["날짜"] == today]
+    if not existing.empty:
+        if existing[list(INVESTOR_COLUMNS)].abs().sum(axis=1).iloc[0] > 0:
+            return hist   # 네이버가 이미 올라왔다 — 그대로 둔다
+        for col in INVESTOR_COLUMNS:
+            hist.loc[hist["날짜"] == today, col] = row[col]
+        return hist
+
+    new_row = {col: np.nan for col in hist.columns}
+    new_row["날짜"] = today
+    new_row["종가"] = row.get("종가")
+    for col in INVESTOR_COLUMNS:
+        new_row[col] = row[col]
+    return (pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True)
+              .sort_values("날짜").reset_index(drop=True))
+
+
 def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     """일별 투자자별 순매수.
 
@@ -439,6 +483,7 @@ def fetch_investor_netbuy(ticker: str, days: int) -> pd.DataFrame:
     매일 밤 갱신되므로, 최소 전날까지는 항상 최신이 보장된다.
     """
     hist = fetch_backtest_history_live(ticker, target_days=700)
+    hist = _overlay_kis_confirmed_flow(ticker, hist)
     if hist.empty:
         return pd.DataFrame(columns=["개인", "외국인", "기관"])
     cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=days))
