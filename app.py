@@ -955,13 +955,34 @@ def _render_foreign_desk_line() -> None:
     net = d["순매수"]
     color = "green" if net > 0 else ("red" if net < 0 else "gray")
     word = "순매수" if net > 0 else ("순매도" if net < 0 else "보합")
-    stamp = f" · {d['기준']} 조회" if d.get("기준") else ""
+    stamp = f" · {d['기준']} 집계" if d.get("기준") else ""
+
+    # 표시된 '기준' 시각은 조회 시각이 아니라 KIS가 준 그 줄의 집계 시각이다. 정규장
+    # 중인데 이 시각이 15분 넘게 과거면, 어쩌다 거래가 뜸해서가 아니라 이 KIS 경로
+    # (frgnmem-pchs-trend)만 조용히 멈춘 것이다 — 실측(2026-10-01)으로 같은 시각
+    # investor_estimate·investor_daily_kis 등 다른 KIS 경로는 멀쩡히 갱신되고 있었다.
+    # 경고 없이 묵은 값을 계속 보여주면 '방금 조회'로 착각하게 되므로 여기서 알린다.
+    stale_note = ""
+    if d.get("기준") and _korea_session_now() == "정규장":
+        try:
+            now_kst = dt.datetime.now(om.KST)
+            stamp_dt = now_kst.replace(
+                hour=int(d["기준"][:2]), minute=int(d["기준"][3:5]), second=0, microsecond=0,
+            )
+            gap_min = (now_kst - stamp_dt).total_seconds() / 60
+            if gap_min > 15:
+                stale_note = f" :red[(※ {gap_min:.0f}분째 갱신 안 됨 — 이 경로만 멈춘 것으로 보입니다)]"
+        except (ValueError, TypeError):
+            pass
+
     _bold_label_with_help(
-        f"외국계 창구 추정 {word} :{color}[{abs(net):,.0f}주]{stamp}",
+        f"외국계 창구 추정 {word} :{color}[{abs(net):,.0f}주]{stamp}{stale_note}",
         "거래원(증권사 창구) 기준으로 외국계 창구를 합산한 값입니다. "
         f"{FOREIGN_DESK_NOTE}\n\n"
         "**기관·개인은 여기에 없습니다.** 갱신 간격은 45초~6분으로 일정하지 않고, "
-        "표시된 시각은 조회한 시각입니다.\n\n"
+        "표시된 시각은 조회한 시각이 아니라 KIS가 준 가장 최근 집계 시각입니다.\n\n"
+        "정규장 중 이 시각이 15분 넘게 과거면 거래가 뜸해서가 아니라 이 경로 자체가 "
+        "멈춘 것입니다(다른 KIS 수급 경로는 별개로 정상 갱신될 수 있습니다) — 빨간 경고가 그 신호입니다.\n\n"
         "바로 아래 '이 종목 투자자 동향'은 집계 방식이 다른 별개 값입니다 — 그쪽은 "
         "외국인·기관 구분이고, 이쪽은 창구(증권사) 기준이라 숫자가 서로 다릅니다.",
         key="foreign_desk",
@@ -3931,7 +3952,7 @@ def _render_tab_dram():
                 if chip_max_days >= 2:
                     compare_days_chip = st.slider(
                         "변동률 비교 기간 (일 전)", min_value=1, max_value=chip_max_days,
-                        value=min(7, chip_max_days), step=1, key="dram_chip_compare_days",
+                        value=min(30, chip_max_days), step=1, key="dram_chip_compare_days",
                     )
                 else:
                     compare_days_chip = 1
