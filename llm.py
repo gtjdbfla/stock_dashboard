@@ -57,7 +57,7 @@ def _call_gemini(prompt: str) -> tuple[str, str]:
     # SDK 재시도는 Retry-After를 상한 없이 sleep한다(ai_inputs._make_gemini_client 참고).
     # 아래 루프가 모델을 바꿔 가며 재시도하므로 SDK 쪽은 끈다.
     client = genai.Client(http_options=genai_types.HttpOptions(
-        retry_options=genai_types.HttpRetryOptions(attempts=0)))
+        retry_options=genai_types.HttpRetryOptions(attempts=1, http_status_codes=[999])))
     cfg = ({"generation_config": {"thinking_level": THINKING_LEVEL}}
            if THINKING_LEVEL else {})
     tried: list[str] = []

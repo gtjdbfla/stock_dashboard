@@ -226,11 +226,15 @@ def _make_gemini_client():
     time.sleep에 넣는다(_gaos/utils/retries.py). 요청 timeout도 이 sleep에는 안 걸린다.
     값이 크면 호출한 스레드가 로그도 에러도 없이 몇 시간씩 잔다 — 수집기의 단일 루프에서
     이게 걸리면 AI 분석·시세 기록이 통째로 멈춘다(2026-10-05 14:36 이후 18시간). 재시도는
-    아래 호출 루프가 모델을 바꿔 가며 이미 하고 있으므로 SDK 쪽은 0회로 둔다.
+    아래 호출 루프가 모델을 바꿔 가며 이미 하고 있으므로 SDK 쪽은 끈다.
+
+    attempts=0은 소용없다(부모 클라이언트가 1로 올려 버려서 재시도가 한 번 남고, 그 한 번도
+    Retry-After를 그대로 잔다). 대신 재시도 대상 상태코드를 절대 안 오는 값으로 바꾼다 —
+    그러면 429/5xx가 재시도 경로를 아예 안 탄다. 연결 오류 재시도는 남지만 대기가 최대 8초다.
     """
     from google.genai import types as genai_types
     return genai.Client(http_options=genai_types.HttpOptions(
-        retry_options=genai_types.HttpRetryOptions(attempts=0)))
+        retry_options=genai_types.HttpRetryOptions(attempts=1, http_status_codes=[999])))
 
 
 def _stream_gemini(prompt: str, used: dict):
