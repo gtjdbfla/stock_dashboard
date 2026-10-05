@@ -5,8 +5,10 @@ Streamlit은 브라우저 세션이 붙어야만 스크립트를 실행한다. �
 이 스크립트를 별도 컨테이너로 띄워 화면 접속과 무관하게 계속 돌린다.
 """
 import datetime as dt
+import faulthandler
 import os
 import sys
+import threading
 import time
 
 import ai_report
@@ -49,8 +51,33 @@ DIGEST_STOCK_NAME = os.environ.get("ANALYST_DIGEST_NAME", "SK하이닉스(000660
 AI_STOCK_NAME = os.environ.get("AI_ANALYSIS_NAME", "SK하이닉스")
 
 
+# 루프가 이만큼 한 바퀴도 못 돌면 멈춘 것으로 본다. 정상 한 바퀴의 최악은 AI 분석이 모델 여럿을
+# 차례로 기다리는 경우(수 분)와 선물 이력 최초 생성이라, 그보다 넉넉하게 잡는다.
+STALL_LIMIT_SEC = int(os.environ.get("COLLECTOR_STALL_LIMIT_SEC", "1800"))
+_progress = {"at": time.monotonic()}
+
+
+def _watchdog() -> None:
+    """메인 루프가 멈추면 스택을 남기고 프로세스를 끝내 docker가 다시 띄우게 한다.
+
+    2026-10-05 14:36 이후 18시간 동안 컨테이너는 Up인데 루프가 한 바퀴도 안 돌았다 — 로그도
+    에러도 없이 주 스레드가 sleep에 붙은 채였고(실측: 45초 사이 컨텍스트 스위치 0),
+    그동안 AI 분석 예약분과 프리장 기록이 통째로 빠졌다. 원인 위치를 못 봤으므로 다음엔
+    멈춘 줄이 로그에 남도록 모든 스레드의 스택을 먼저 덤프한다.
+    """
+    while True:
+        time.sleep(60)
+        stalled = time.monotonic() - _progress["at"]
+        if stalled > STALL_LIMIT_SEC:
+            log(f"수집기 루프가 {stalled:.0f}초째 멈춤 - 스택을 남기고 재시작합니다")
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            sys.stderr.flush()
+            os._exit(1)
+
+
 def main() -> None:
     log(f"수집기 시작 | 종목={om.COLLECT_TICKERS} | 주기={om.POLL_SEC}s | 저장={om.TICK_FILE}")
+    threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
     last_state = None
     day = None
     recorded = skipped = failed = 0
@@ -60,6 +87,7 @@ def main() -> None:
         return f"기록 {recorded}건 / 휴장·미체결 {skipped}회 / 오류 {failed}회"
 
     while True:
+        _progress["at"] = time.monotonic()
         now = dt.datetime.now(om.KST)
         if now.date() != day:                   # 날짜가 바뀌면 그날 집계를 마무리하고 초기화
             if day is not None:
