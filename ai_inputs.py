@@ -210,6 +210,29 @@ def _is_timeout(exc: Exception) -> bool:
     return "timeout" in name or "timeout" in str(exc).lower()
 
 
+def _is_transient(exc: Exception) -> bool:
+    """서버 쪽 일시 오류(과부하·점검·5xx)인지. SDK 재시도를 껐으므로 다음 모델로 넘기는 근거다."""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and (code in (408, 409) or code >= 500):
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in ("unavailable", "overloaded", "high demand"))
+
+
+def _make_gemini_client():
+    """SDK 자체 재시도를 끈 클라이언트.
+
+    google-genai는 429/5xx에 재시도하면서 응답의 Retry-After 값을 **상한 없이 그대로**
+    time.sleep에 넣는다(_gaos/utils/retries.py). 요청 timeout도 이 sleep에는 안 걸린다.
+    값이 크면 호출한 스레드가 로그도 에러도 없이 몇 시간씩 잔다 — 수집기의 단일 루프에서
+    이게 걸리면 AI 분석·시세 기록이 통째로 멈춘다(2026-10-05 14:36 이후 18시간). 재시도는
+    아래 호출 루프가 모델을 바꿔 가며 이미 하고 있으므로 SDK 쪽은 0회로 둔다.
+    """
+    from google.genai import types as genai_types
+    return genai.Client(http_options=genai_types.HttpOptions(
+        retry_options=genai_types.HttpRetryOptions(attempts=0)))
+
+
 def _stream_gemini(prompt: str, used: dict):
     """모델을 순서대로 시도하며 응답 조각을 흘려준다.
 
@@ -217,7 +240,7 @@ def _stream_gemini(prompt: str, used: dict):
     thinking_level까지 낮춘 뒤 실측(프롬프트 12,400자): 첫 글자 5.6초 / 완료 12.2초.
     실제로 답한 모델명은 used["model"]에 넣어 호출부에 알린다.
     """
-    client = genai.Client()
+    client = _make_gemini_client()
     tried: list[str] = []
     last_exc: Exception | None = None
     order = _gemini_models_to_try()
@@ -288,6 +311,9 @@ def _stream_gemini(prompt: str, used: dict):
                     used.setdefault("skipped", []).append(
                         (model, f"{GEMINI_STALL_SEC:.0f}초 동안 응답 없음"))
                     break
+                if _is_transient(exc):
+                    used.setdefault("skipped", []).append((model, "서버 일시 오류(과부하)"))
+                    break
                 raise
     raise RuntimeError(
         f"사용 가능한 모델을 찾지 못했습니다. 시도한 모델: {', '.join(tried)}. "
@@ -301,7 +327,7 @@ def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
     반환: (응답 텍스트, 실제로 사용된 모델명)
     한도 외의 오류(잘못된 요청 등)는 모델을 바꿔도 소용없으므로 바로 올린다.
     """
-    client = genai.Client()
+    client = _make_gemini_client()
     tried: list[str] = []
     last_exc: Exception | None = None
     for model in _gemini_models_to_try():
@@ -322,7 +348,7 @@ def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
                 if _is_quota_error(exc):
                     _mark_exhausted(model)
                     break
-                if _is_timeout(exc):    # 붙잡고 있는 모델은 버리고 다음 모델로
+                if _is_timeout(exc) or _is_transient(exc):    # 붙잡고 있거나 일시 오류인 모델은 다음 모델로
                     break
                 raise
     raise RuntimeError(

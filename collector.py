@@ -56,6 +56,30 @@ AI_STOCK_NAME = os.environ.get("AI_ANALYSIS_NAME", "SK하이닉스")
 STALL_LIMIT_SEC = int(os.environ.get("COLLECTOR_STALL_LIMIT_SEC", "1800"))
 _progress = {"at": time.monotonic()}
 
+# AI 분석은 한 번에 30~170초가 걸리고 외부 API에 매달린다. 메인 루프에서 직접 돌리면 그동안
+# 시세 기록이 멈추고, 분석이 어디선가 막히면 기록까지 같이 죽는다. 별도 스레드로 돌린다.
+AI_STALL_LIMIT_SEC = int(os.environ.get("COLLECTOR_AI_STALL_LIMIT_SEC", "1200"))
+_ai = {"thread": None, "started": None}
+
+
+def _tick_ai_async(now: dt.datetime) -> None:
+    """이전 분석이 아직 돌고 있으면 건너뛴다. 예약 시각 판정은 ai_report.tick이 한다."""
+    thread = _ai["thread"]
+    if thread is not None and thread.is_alive():
+        return
+
+    def run() -> None:
+        try:
+            ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log)
+        except Exception as exc:
+            log(f"AI분석 오류: {type(exc).__name__}: {exc}")
+        finally:
+            _ai["started"] = None
+
+    _ai["started"] = time.monotonic()
+    _ai["thread"] = threading.Thread(target=run, name="ai-tick", daemon=True)
+    _ai["thread"].start()
+
 
 def _watchdog() -> None:
     """메인 루프가 멈추면 스택을 남기고 프로세스를 끝내 docker가 다시 띄우게 한다.
@@ -68,11 +92,18 @@ def _watchdog() -> None:
     while True:
         time.sleep(60)
         stalled = time.monotonic() - _progress["at"]
+        ai_started = _ai["started"]
+        ai_running = None if ai_started is None else time.monotonic() - ai_started
         if stalled > STALL_LIMIT_SEC:
-            log(f"수집기 루프가 {stalled:.0f}초째 멈춤 - 스택을 남기고 재시작합니다")
-            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-            sys.stderr.flush()
-            os._exit(1)
+            reason = f"수집기 루프가 {stalled:.0f}초째 멈춤"
+        elif ai_running is not None and ai_running > AI_STALL_LIMIT_SEC:
+            reason = f"AI 분석이 {ai_running:.0f}초째 안 끝남"
+        else:
+            continue
+        log(f"{reason} - 스택을 남기고 재시작합니다")
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        sys.stderr.flush()
+        os._exit(1)
 
 
 def main() -> None:
@@ -146,10 +177,7 @@ def main() -> None:
         # 예전에는 대시보드가 만들었는데, Streamlit은 브라우저가 붙어야 스크립트를
         # 돌리므로 아무도 화면을 안 열어 둔 시각은 통째로 건너뛰었다(실측 11시간).
         # 한 번에 30~100초가 걸리지만 시세 기록은 20초 주기라 그 사이가 비지는 않는다.
-        try:
-            ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log)
-        except Exception as exc:
-            log(f"AI분석 오류: {type(exc).__name__}: {exc}")
+        _tick_ai_async(now)
 
         if not om.in_collect_window(now):
             if last_state != "idle":
