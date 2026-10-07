@@ -219,6 +219,15 @@ def _is_transient(exc: Exception) -> bool:
     return any(k in text for k in ("unavailable", "overloaded", "high demand"))
 
 
+def _is_bad_request(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 400
+
+
+# 같은 모델을 연달아 다시 부를 때(기본 모델 재시도 칸) 서버 일시 오류면 잠깐 숨을 돌린다.
+# SDK 재시도를 끄기 전에는 SDK의 짧은 백오프가 이 역할을 했다. Retry-After를 따르지 않고 고정 상한만 둔다.
+TRANSIENT_RETRY_WAIT_SEC = float(os.environ.get("GEMINI_TRANSIENT_WAIT_SEC", "5"))
+
+
 def _make_gemini_client():
     """SDK 자체 재시도를 끈 클라이언트.
 
@@ -302,8 +311,10 @@ def _stream_gemini(prompt: str, used: dict):
                 # 이미 글자가 나간 뒤 끊기면 다른 모델로 다시 시작할 수 없다. 그대로 올린다.
                 if produced:
                     raise
-                # thinking_level을 못 받는 모델이면 그 옵션만 빼고 같은 모델로 한 번 더
-                if cfg and _is_thinking_unsupported(exc):
+                # thinking_level을 못 받는 모델이면 그 옵션만 빼고 같은 모델로 한 번 더.
+                # 400은 메시지에 옵션 이름이 없어도("Request contains an invalid argument") 같은
+                # 원인일 수 있으니, 옵션을 뺀 채로 한 번은 다시 본다.
+                if cfg and (_is_thinking_unsupported(exc) or _is_bad_request(exc)):
                     continue
                 if _is_quota_error(exc):
                     _mark_exhausted(model)
@@ -317,6 +328,12 @@ def _stream_gemini(prompt: str, used: dict):
                     break
                 if _is_transient(exc):
                     used.setdefault("skipped", []).append((model, "서버 일시 오류(과부하)"))
+                    if pos + 1 < len(order) and order[pos + 1] == model:
+                        time.sleep(TRANSIENT_RETRY_WAIT_SEC)
+                    break
+                # 400은 이 모델·이 입력 조합의 문제일 수 있다. 체인 전체를 포기하지 말고 다음 모델로.
+                if _is_bad_request(exc):
+                    used.setdefault("skipped", []).append((model, "잘못된 요청(400)"))
                     break
                 raise
     raise RuntimeError(
@@ -334,7 +351,8 @@ def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
     client = _make_gemini_client()
     tried: list[str] = []
     last_exc: Exception | None = None
-    for model in _gemini_models_to_try():
+    order = _gemini_models_to_try()
+    for pos, model in enumerate(order):
         tried.append(model)
         for cfg in (_gemini_gen_config(), {}):
             try:
@@ -347,13 +365,15 @@ def _call_gemini(prompt: str, tools: list | None = None) -> tuple[str, str]:
                 return (interaction.output_text or "", model)
             except Exception as exc:
                 last_exc = exc
-                if cfg and _is_thinking_unsupported(exc):
+                if cfg and (_is_thinking_unsupported(exc) or _is_bad_request(exc)):
                     continue
                 if _is_quota_error(exc):
                     _mark_exhausted(model)
                     break
-                if _is_timeout(exc) or _is_transient(exc):    # 붙잡고 있거나 일시 오류인 모델은 다음 모델로
-                    break
+                if _is_transient(exc) and pos + 1 < len(order) and order[pos + 1] == model:
+                    time.sleep(TRANSIENT_RETRY_WAIT_SEC)
+                if _is_timeout(exc) or _is_transient(exc) or _is_bad_request(exc):
+                    break               # 붙잡고 있거나 일시 오류·400인 모델은 다음 모델로
                 raise
     raise RuntimeError(
         f"사용 가능한 모델을 찾지 못했습니다. 시도한 모델: {', '.join(tried)}. "
