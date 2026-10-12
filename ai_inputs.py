@@ -2378,9 +2378,18 @@ def _parse_dram_table(soup: BeautifulSoup, tbody_id: str, item_filter: set[str] 
 def _fetch_dram_soup() -> BeautifulSoup:
     """모듈가·칩가가 같은 페이지에 있으므로, 페이지 요청 자체는 한 번만 캐시해서 공유한다."""
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(DRAMEXCHANGE_URL, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    # 이 사이트는 연결·TLS는 0.1초에 끝나는데 첫 응답만 가끔 20초 넘게 끈다(같은 순간 연달아 재면
+    # 20초 → 1.9초 → 0.7초). 15초에서 포기하면 DRAM 탭에 빨간 에러가 뜨므로 읽기 대기를 늘리고
+    # 한 번 더 시도한다. 연결 단계는 짧게 끊어 정말 죽은 경우에 오래 붙들리지 않게 한다.
+    last_exc: Exception | None = None
+    for _ in range(2):
+        try:
+            resp = requests.get(DRAMEXCHANGE_URL, headers=headers, timeout=(5, 30))
+            resp.raise_for_status()
+            return BeautifulSoup(resp.text, "html.parser")
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def fetch_dram_module_prices() -> tuple[pd.DataFrame, str | None]:
