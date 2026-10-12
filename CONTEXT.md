@@ -44,6 +44,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 | `ai_analysis.py` | AI 분석 결과 **저장/로드만**. app을 import하지 않는다(순환 방지) |
 | `llm.py` | `analyst_digest`·`financial_digest` **전용** LLM 호출 |
 | `hbm.py` | **HBM 탭 데이터.** 출처 수집 → LLM 사실 추출 → 원문 대조 → 종합. 수집기가 `data/hbm_digest.json`을 채우고 화면은 읽기만 한다 |
+| `contract_outlook.py` | **DRAM 탭 고정가 전망 패널.** TrendForce 보도자료의 계약가 전망을 모아 검증하고 분기표·개정폭·둔화/가속·누적 지수를 코드가 계산. 수집기가 `data/contract_outlook.json`을 채운다 |
 | `data/` | DRAM 이력 등. gitignore |
 
 **탭 14개**(app.py:64), 기본 숨김 6개(app.py:707): 매매 신호·선물 경보·통합 신호·하락/상승 조기신호·커뮤니티.
@@ -140,6 +141,11 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
   - **무료 한도 아끼기**: 한 번에 LLM으로 읽는 문서는 3건(`MAX_DOCS_PER_TICK`), HBM 언급이 없어 건너뛰는 문서는 한 바퀴에 30건까지 거른다. 처음 백필(문서 125건)은 20분 넘게 걸린다. 종합 분석은 출처별 상한(`SOURCE_QUOTA`)으로 균형을 맞춘다 — 날짜순으로만 자르면 뉴스룸의 전시·수상 소식이 시장 분석을 밀어낸다.
   - **AI 분석에도 들어간다**(`hbm.summary_md()` → `ai_report` → `generate_ai_analysis(hbm_md=...)`). LLM이 쓴 종합 글이 아니라 **검증된 사실을 직접** 주제별로 13건(약 1,700자) 넣는다 — AI가 쓴 글을 또 AI가 요약하면 오류가 겹친다. 출력 형식의 `수요 배경과 지표 점검`에 HBM 줄을 추가했고(입력 섹션과 출력 줄을 같이 고쳐야 모델이 쓴다), 원본 데이터 보기(`ai_analysis.SOURCE_FIELDS`)에도 노출한다. 규칙: 사실 날짜를 밝히고, 경쟁사 호조를 SK하이닉스 호재로 단정하지 않으며, SK하이닉스 자체 수치는 지어내지 않는다.
   - **새 소스를 추가할 때**: `Dockerfile`은 모듈을 **하나씩 COPY한다** — 새 `.py`를 만들면 반드시 COPY 줄을 추가할 것. 빠뜨리면 대시보드와 수집기가 시작 시 `ModuleNotFoundError`로 죽는데, `/_stcore/health`는 200이라 `docker ps`도 정상으로 보인다(2026-10-12 실제로 7분간 그랬다). 배포 후 반드시 앱을 실제로 돌려 볼 것(헤드리스: `streamlit.testing.v1.AppTest.from_file("/app/app.py").run()`으로 예외·탭 목록 확인).
+- **메모리 고정가(계약가)의 실측은 공개되지 않는다 — 대신 TrendForce 보도자료의 분기 전망을 쌓는다(`contract_outlook.py`).** 조사 결과(2026-10-12): DRAMeXchange 계약가 상세(`/Price/NationalContractDramDetail`)·이력은 회원 로그인 전용이고 이력 차트는 이미지(`chart.dramexchange.com`)뿐이다. 모바일 DRAM·eMMC 계약가는 2019년부터 가격을 숨기고 이름만 보여준다. 공개로 나오는 건 홈 화면 AJAX `GET /Home/HomePrice?Source=NationalDramContract`(PC DRAM 모듈·칩, 로그인 없이 JSON) 하나뿐인데 **마지막 값이 2026-08-31에서 6주째 멈춰 있고**(원인 불명) PC용이라 서버·HBM과 거리가 멀어 **수집하지 않기로 했다.**
+  - **전망 수집**: TrendForce 보도자료(`/presscenter/news?page=N`)에서 `contract price`가 든 문서만 LLM이 `{품목, 분기, 기준(QoQ 등), 하한, 상한, 원문 인용}`으로 구조화한다. 130건 중 23건이 계약가 문서였고 전망 47건 중 품목 가드 후 35건을 쓴다. 범용 DRAM QoQ 실측 흐름: 1Q26 +90~95% → 2Q +58~63% → 3Q +13~18% → 4Q +10~15%(둔화), NAND 55~60 → 70~75 → 10~15 → 15~20(4Q 가속).
+  - **검증(`validate_forecast`)**: 인용이 본문에 글자 그대로 있는지 · 하한/상한 숫자가 인용에 있는지 · 분기 표기(`3Q26`, `third quarter of 2026`)가 본문에 있는지 · 인용에 품목 표현이 있는지(`category_ok`; LLM이 NOR 플래시 문장을 NAND로 붙인 실제 오분류를 잡았다). **방향은 숫자 부호로 코드가 정하고**, 수치 없는 서술형 전망은 방향 라벨 없이 원문만 보여준다(LLM의 방향 판단은 검증할 수 없다). 개정폭은 상한 있는 닫힌 범위끼리만 비교한다('60% 초과'와 비교하면 왜곡). 둔화/가속은 연속한 두 분기 중간값 차이가 1%p 이상일 때, 누적 지수는 연속 분기 중간값을 이어 곱한다(low/high는 모든 분기가 하한/상한인 극단이라 실제 범위보다 넓다).
+  - **한계**: 이 지수는 실측이 아니라 **전망의 누적**이다. 서버 DRAM·HBM의 달러 절대 수준은 유료 리서치에만 있다. 같은 분기 전망이 발표마다 바뀌므로(그래서 ▲▼를 표시) 앞으로 예측 이력을 쌓아 실제와 맞춰 봐야 신뢰도를 알 수 있다. 하루 LLM 호출은 새 보도자료 1건당 1회로 아낀다(최초 백필 130건 중 LLM은 23건).
+  - **삽입 지점 함정**: 패널은 DRAM 탭 맨 위에서 호출되고(`_render_dram_contract_outlook`), 실패해도 아래 현물가 화면이 살도록 `try/except`로 감쌌다. 단위 테스트로 `basis.upper()`가 `"QoQ"`를 `"QOQ"`로 바꿔 전부 탈락시키던 버그를 배포 전에 잡았다 — **LLM 출력 검증기는 반드시 정상 입력이 통과하는 테스트를 같이 둘 것.**
 
 ## 6. 미해결 / 다음에 할 것
 
