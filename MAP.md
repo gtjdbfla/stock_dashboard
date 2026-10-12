@@ -87,7 +87,7 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 | 매매 신호 | `_render_tab_signal` 3130 |
 | 하락 조기신호 | `_render_tab_decline` 3311 |
 | 상승 조기신호 | `_render_tab_rally` 3455 |
-| DRAM 시세 | `_render_tab_dram` (맨 위에 `_render_dram_contract_outlook` 고정가 전망 패널) |
+| DRAM 시세 | `_render_tab_dram` — **안쪽 탭 3개**: `_render_dram_spot_tab`(현물가) · `_render_dram_contract_tab`(고정가 전망) · `_render_dram_compare_tab`(현물가 vs 고정가). 안쪽 탭마다 `try/except`로 격리 |
 | HBM | `_render_tab_hbm` (`grep -n '^def _render_tab_hbm' app.py`) — 파일만 읽는다. 데이터는 `hbm.py`가 수집기에서 채운다 |
 | 빅테크 Capex | `_render_tab_capex` 3730 |
 | 재무 데이터 | `_render_tab_financials` 3899 (재무 요약 `_render_financial_digest` 3852) |
