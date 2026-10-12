@@ -43,6 +43,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 | `daily_history.py` | 일별 시세·수급 이력 **CSV 저장/로드만**. 수집기가 채우고 화면이 읽는다 |
 | `ai_analysis.py` | AI 분석 결과 **저장/로드만**. app을 import하지 않는다(순환 방지) |
 | `llm.py` | `analyst_digest`·`financial_digest` **전용** LLM 호출 |
+| `hbm.py` | **HBM 탭 데이터.** 출처 수집 → LLM 사실 추출 → 원문 대조 → 종합. 수집기가 `data/hbm_digest.json`을 채우고 화면은 읽기만 한다 |
 | `data/` | DRAM 이력 등. gitignore |
 
 **탭 14개**(app.py:64), 기본 숨김 6개(app.py:707): 매매 신호·선물 경보·통합 신호·하락/상승 조기신호·커뮤니티.
@@ -132,6 +133,12 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
   - **격리**: `collector.py`는 AI 분석을 별도 스레드(`_tick_ai_async`)로 돌려 시세 기록 루프와 분리했고, 워치독이 메인 루프(30분, `COLLECTOR_STALL_LIMIT_SEC`)와 AI 스레드(20분, `COLLECTOR_AI_STALL_LIMIT_SEC`)를 감시해 멈추면 전 스레드 스택을 로그에 남기고 종료한다(`restart: unless-stopped`가 재기동). 재시작하면 `ai_report._last_slot`이 비어 지난 정시분을 한 번 바로 다시 만든다.
   - **진단법(컨테이너가 Up인데 의심될 때)**: 마지막 로그 시각 → `/proc/1/task/1/wchan`(`hrtimer_nanosleep`이면 sleep에 붙음) → `/proc/1/task/1/status`의 `voluntary_ctxt_switches`를 수십 초 간격으로 두 번 재서 안 늘면 루프가 안 도는 것. py-spy는 ptrace 권한이 없어 못 쓴다. 이제는 워치독이 남긴 스택이 로그에 있다.
 - **`gemini-3.6-flash`·`gemini-3.7-flash`는 자주 503("currently experiencing high demand")을 준다 — AI 분석이 `gemini-3.5-flash`/`-lite`로 내려가는 건 대개 이 때문이고 고장이 아니다.** 수집기 로그의 `기본 모델 대신 … 사용`이 그 흔적이다(2026-10-06~07 실측: 하루 대부분의 정시분이 폴백). 품질을 높이려면 코드가 아니라 기본 모델이 한가해질 때를 기다리는 수밖에 없다. 한 모델의 **400**(`Request contains an invalid argument`)이 체인 전체를 죽인 적이 있다(10-07 20:00) — 이제 400은 thinking 옵션을 빼고 한 번 더 본 뒤 다음 모델로 넘긴다.
+- **HBM 탭(`hbm.py`)은 숫자를 LLM에게 맡기지 않는다 — 세 겹으로 막는다.** HBM은 현물가가 없다(연·분기 계약가). 그래서 날짜·출처가 붙은 사실을 누적한다. ① 마이크론 사업부 숫자는 SEC 실적 8-K(Item 2.02)의 Exhibit 99.1 표를 정규식으로 직접 읽고, **네 사업부 매출 합이 전체 매출과 1% 안에서 맞을 때만** 쓴다(`parse_micron_release`). ② LLM이 뽑은 사실은 `quote`(원문 복사)를 같이 내게 하고, 그 인용이 본문에 글자 그대로 있는지(공백·하이픈 무시), `claim`의 숫자가 인용에 있는지 코드가 대조해 틀리면 버린다(`validate_fact`; 연도만 본문 전체에서 확인). 실측 123건 중 3건 탈락 — 위조 인용과 숫자 오기를 실제로 걸러냈다. ③ 종합 분석은 검증된 사실만 보고 문장마다 `[F3]`을 달게 하고, 없는 번호는 코드가 지운다. `해석:`으로 시작하는 문장만 추론이다.
+  - **출처와 등급**: A=마이크론 Prepared Remarks(IR 첫 화면 링크 + `Qn-FYyy-Prepared-Remarks.pdf` 규칙 추측)·SK하이닉스 뉴스룸(`news.skhynix.co.kr` 카테고리 press/ir/tech-and-ai + `?s=HBM`), B=TrendForce 보도자료(`/presscenter/news?page=N`, 페이지당 5건, 150일치 = 14쪽), C=TrendForce News 첫 화면(최근 7건뿐 — **태그·카테고리 페이지는 2026-06-30에 멈춘 사본이라 못 쓴다**)·네이버 헤드라인(본문·주소 없음).
+  - **막힌 길**: SK하이닉스 IR 페이지(`skhynix.com/ir`)는 자바스크립트로 그려서 PDF 링크가 HTML에 없다. 마이크론 보도자료(Exhibit 99.1) 본문에는 'HBM'이 한 번도 안 나온다(HBM 이야기는 Prepared Remarks에만). 마이크론은 HBM 매출을 따로 공개하지 않아 HBM이 속한 CMBU(클라우드 메모리 사업부)를 쓴다 — CMBU에는 고용량 서버 모듈도 있어 HBM 매출 그 자체는 아니다.
+  - **SK하이닉스 자체의 HBM 점유율·가격 수치는 공개 자료로 못 구한다.** 종합 분석의 '시사점'이 마이크론·업계 사실로 SK하이닉스를 해석하는 이유다. SK하이닉스 3분기 실적(10월 말) 발표 뒤 뉴스룸 IR 글로 첫 직접 수치가 들어올 것이다.
+  - **무료 한도 아끼기**: 한 번에 LLM으로 읽는 문서는 3건(`MAX_DOCS_PER_TICK`), HBM 언급이 없어 건너뛰는 문서는 한 바퀴에 30건까지 거른다. 처음 백필(문서 125건)은 20분 넘게 걸린다. 종합 분석은 출처별 상한(`SOURCE_QUOTA`)으로 균형을 맞춘다 — 날짜순으로만 자르면 뉴스룸의 전시·수상 소식이 시장 분석을 밀어낸다.
+  - **새 소스를 추가할 때**: `Dockerfile`은 모듈을 **하나씩 COPY한다** — 새 `.py`를 만들면 반드시 COPY 줄을 추가할 것. 빠뜨리면 대시보드와 수집기가 시작 시 `ModuleNotFoundError`로 죽는데, `/_stcore/health`는 200이라 `docker ps`도 정상으로 보인다(2026-10-12 실제로 7분간 그랬다). 배포 후 반드시 앱을 실제로 돌려 볼 것(헤드리스: `streamlit.testing.v1.AppTest.from_file("/app/app.py").run()`으로 예외·탭 목록 확인).
 
 ## 6. 미해결 / 다음에 할 것
 

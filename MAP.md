@@ -12,6 +12,7 @@
 | `ai_inputs.py` | 2,508 | AI 분석 재료를 만드는 계층. 수집기와 공용 |
 | `ai_report.py` | 356 | 재료를 모아 프롬프트에 태우고 저장 |
 | `daily_history.py` | 128 | 일별 이력 CSV 저장/로드. 네트워크 코드 없음(순환 방지) |
+| `hbm.py` | 약 700 | HBM 탭 데이터: 출처 수집·사실 추출·원문 검증·종합. streamlit 미import |
 
 ---
 
@@ -66,7 +67,7 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 | 줄 | 무엇 |
 |---|---|
 | 33~ | `ai_inputs`에서 이름 가져오기 + `_CACHED`로 캐시 ttl 다시 씌우기 |
-| 167 | `ALL_TAB_LABELS` — 탭 14개 정의 |
+| 167 | `ALL_TAB_LABELS` — 탭 15개 정의 |
 | 570 | `DEFAULT_HIDDEN_TAB_LABELS` — 기본 숨김 6개 |
 | 1518 | `render_current_price` (558줄. 현재가·장중차트·ADR) |
 | 2085~ | 자동 새로고침 시각 상수 (AI 분석은 여기 없다 — 수집기 소관) |
@@ -86,6 +87,7 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 | 하락 조기신호 | `_render_tab_decline` 3311 |
 | 상승 조기신호 | `_render_tab_rally` 3455 |
 | DRAM 시세 | `_render_tab_dram` 3614 |
+| HBM | `_render_tab_hbm` (`grep -n '^def _render_tab_hbm' app.py`) — 파일만 읽는다. 데이터는 `hbm.py`가 수집기에서 채운다 |
 | 빅테크 Capex | `_render_tab_capex` 3730 |
 | 재무 데이터 | `_render_tab_financials` 3899 (재무 요약 `_render_financial_digest` 3852) |
 | 공시 | `_render_tab_disclosure` 4130 |
