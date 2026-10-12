@@ -3902,6 +3902,84 @@ def _co_range_text(f: dict) -> str:
     return f"{f['low']:g}%" if f["low"] == f["high"] else f"{f['low']:g}~{f['high']:g}%"
 
 
+_SPOT_SHORT = {
+    "DDR5 16Gb (2Gx8) 4800/5600": "DDR5 16Gb 칩",
+    "DDR4 16Gb (2Gx8) 3200": "DDR4 16Gb 칩",
+    "DDR5 UDIMM 16GB 4800/5600": "DDR5 UDIMM 16GB",
+    "DDR5 RDIMM 32GB 4800/5600": "DDR5 RDIMM 32GB(서버)",
+}
+
+
+def _render_spot_vs_contract(table: dict, today: dt.date) -> None:
+    """분기별 현물가 변화율과 같은 분기 고정가 전망을 나란히 놓는다. 계산은 전부 contract_outlook이 한다."""
+    _bold_label_with_help(
+        "현물가 변화 vs 고정가 전망 (분기)",
+        "같은 분기에 **현물가가 실제로 얼마나 움직였는지**와 TrendForce의 **고정가 전망**을 나란히 봅니다. "
+        "현물가는 고정가보다 먼저 움직이는 경향이 있어, 현물가가 꺾이는지는 고정가 전망이 바뀔 신호로 참고합니다.\n\n"
+        "**읽는 법**: 분기 변화율은 '직전 분기말 값 대비 분기말(진행 중이면 오늘) 값'입니다. 진행 중인 분기는 전망이 분기 전체 기준이라 "
+        "경과일만큼 덜 오른 게 정상입니다. '모멘텀'은 최근 4주 변화율을 그 직전 4주와 비교한 것으로, 1%p 이상 차이면 가속/둔화입니다.\n\n"
+        "**한계**: 현물가는 대표 규격 하나이고 고정가 전망은 품목 믹스 전체의 평균이라 같은 물건이 아닙니다. "
+        "칩·UDIMM은 범용 DRAM, RDIMM은 서버 DRAM 전망과 짝지었습니다. DDR5와 DDR4는 방향이 반대일 수 있어 평균 내지 않고 품목별로 봅니다. "
+        "현물가 이력이 6월부터라 완결된 분기는 3분기 하나뿐이고, 선행성을 통계로 검증하기엔 이릅니다.",
+        key="contract_spot_cmp",
+    )
+    try:
+        hist = pd.read_csv(DRAM_HISTORY_FILE, parse_dates=["날짜"]) if os.path.exists(DRAM_HISTORY_FILE) else pd.DataFrame()
+    except Exception:
+        hist = pd.DataFrame()
+    if hist.empty:
+        st.caption("현물가 이력이 아직 없어 비교할 수 없습니다.")
+        return
+    cmp = contract_outlook.compare_spot(hist, table, today)
+    if not cmp["rows"]:
+        st.caption("비교할 현물가 품목이 이력에 없습니다.")
+        return
+    if cmp["latest_spot_date"] and (today - cmp["latest_spot_date"]).days > 4:
+        st.caption(f":red[현물가 이력의 마지막 기록이 {cmp['latest_spot_date']}로 {(today - cmp['latest_spot_date']).days}일 묵었습니다.]")
+
+    periods = [p for p in cmp["periods"] if any(r["quarters"][p]["spot_pct"] is not None for r in cmp["rows"])]
+    label_of = {i["item"]: i["label"] for v in cmp["verdicts"] for i in v["items"]}
+    rows = []
+    for r in cmp["rows"]:
+        row = {"현물가 품목": _SPOT_SHORT.get(r["item"], r["item"]), "짝지은 전망": r["category"]}
+        for p in periods:
+            q = r["quarters"][p]
+            spot = "-" if q["spot_pct"] is None else f"{q['spot_pct']:+.1f}%" + (f" ({q['elapsed_days']}일째)" if q["partial"] else "")
+            row[f"{p} 현물가"] = spot
+            row[f"{p} 고정가 전망"] = "-" if q["contract"] is None else _co_range_text(q["contract"])
+        row["최근 4주"] = "-" if r["recent4"] is None else f"{r['recent4']:+.1f}%"
+        row["직전 4주"] = "-" if r["prior4"] is None else f"{r['prior4']:+.1f}%"
+        row["모멘텀"] = label_of.get(r["item"], "-")
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    for v in cmp["verdicts"]:
+        labels = " · ".join(f"{_SPOT_SHORT.get(i['item'], i['item'])} {i['label']}" for i in v["items"])
+        pace = v["pace"]
+        if pace:
+            st.markdown(_md_safe(
+                f"- **{v['category']}**: 고정가 전망은 **{pace['label']}**({pace['from']} {pace['from_mid']:g}% → {pace['to']} {pace['to_mid']:g}%). "
+                f"현물가 모멘텀은 {labels} → **{v['n_items']}개 중 {v['match']}개**가 같은 방향입니다."))
+        else:
+            st.markdown(_md_safe(f"- **{v['category']}**: 연속한 두 분기 전망이 없어 고정가 쪽 속도는 비교할 수 없습니다. 현물가 모멘텀은 {labels}입니다."))
+
+    base_day = contract_outlook._quarter_end(cmp["periods"][0])
+    series = contract_outlook.rebased_spot(hist, base_day)
+    if series:
+        fig = go.Figure()
+        for item, (xs, ys) in series.items():
+            fig.add_trace(go.Scatter(x=xs, y=ys, name=_SPOT_SHORT.get(item, item), mode="lines"))
+        prev_end = contract_outlook._quarter_end(contract_outlook._prev_quarter(cmp["periods"][-1]))
+        if prev_end > base_day:
+            fig.add_shape(type="line", x0=prev_end.isoformat(), x1=prev_end.isoformat(), y0=0, y1=1, yref="paper",
+                          line=dict(color="gray", dash="dash", width=1))
+            fig.add_annotation(x=prev_end.isoformat(), y=1, yref="paper", text="분기 경계", showarrow=False,
+                               yanchor="bottom", font=dict(color="gray", size=11))
+        fig.update_layout(yaxis_title=f"{base_day} = 100")
+        _style_chart_mobile(fig, title=f"현물가 추이 ({base_day} = 100)")
+        st.plotly_chart(fig, width="stretch", key="chart_contract_spot_cmp", config=PLOTLY_CONFIG)
+
+
 def _render_dram_contract_outlook() -> None:
     """TrendForce 보도자료의 메모리 고정가(계약가) 전망. 파일만 읽는다(수집기가 채운다)."""
     _subheader_with_help(
@@ -3977,6 +4055,8 @@ def _render_dram_contract_outlook() -> None:
                          if pace else "")
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    _render_spot_vs_contract(table, today)
 
     # ── 분기별 막대(범위) ──
     default_cats = [c for c in ("범용 DRAM", "서버 DRAM", "NAND") if c in cats] or cats[:3]

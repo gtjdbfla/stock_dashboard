@@ -316,6 +316,120 @@ def build_index(cat_row: dict[str, dict]) -> dict | None:
     return {"base": base, "points": pts}
 
 
+# ── 현물가 변화 vs 고정가 전망 ──────────────────────────────────────────────
+
+# 현물가 품목이 어느 고정가 전망 품목과 짝인지. 칩·UDIMM은 범용 DRAM, RDIMM은 서버 DRAM으로 본다.
+# 같은 품목이 아니라 '같은 시장의 대리 지표'다(고정가 전망은 품목 믹스 전체의 평균이고 현물가는 대표 규격 하나).
+SPOT_PROXY = {
+    "DDR5 16Gb (2Gx8) 4800/5600": "범용 DRAM",
+    "DDR4 16Gb (2Gx8) 3200": "범용 DRAM",
+    "DDR5 UDIMM 16GB 4800/5600": "범용 DRAM",
+    "DDR5 RDIMM 32GB 4800/5600": "서버 DRAM",
+}
+SPOT_MAX_AGE_DAYS = 15          # 분기 경계에서 이만큼 넘게 묵은 값이면 쓰지 않는다(모듈은 사이트가 주 1회 갱신)
+MOMENTUM_THRESHOLD = 1.0        # 최근 4주와 직전 4주 변화율 차이가 이 %p 이상이면 가속/둔화
+
+
+def _quarter_end(period: str) -> dt.date:
+    import calendar
+    y, q = int(period[:4]), int(period[5])
+    return dt.date(y, q * 3, calendar.monthrange(y, q * 3)[1])
+
+
+def _spot_series(history, item: str):
+    """품목의 일별 마지막 값(Series, 날짜 인덱스). 하루에 여러 번 기록되면 마지막 값만 쓴다."""
+    s = history[history["품목"] == item].sort_values("날짜")
+    if s.empty:
+        return s["평균가(USD)"]
+    s = s.assign(일자=s["날짜"].dt.normalize()).groupby("일자")["평균가(USD)"].last()
+    return s.astype(float)
+
+
+def _value_at(series, date: dt.date):
+    import pandas as pd
+    cutoff = pd.Timestamp(date)
+    s = series[series.index <= cutoff]
+    if s.empty or (cutoff - s.index[-1]).days > SPOT_MAX_AGE_DAYS:
+        return None
+    return float(s.iloc[-1])
+
+
+def _label(diff: float) -> str:
+    return "둔화" if diff <= -MOMENTUM_THRESHOLD else ("가속" if diff >= MOMENTUM_THRESHOLD else "비슷")
+
+
+def compare_spot(history, table: dict, today: dt.date) -> dict:
+    """분기별 현물가 변화율과 같은 분기 고정가 전망을 나란히 놓고, 현물가의 최근 모멘텀을 잰다.
+
+    - 분기 변화율 = (분기 끝 또는 오늘의 값) / (직전 분기 끝 값) - 1. 시작 값이 없으면(이력이 짧으면) None.
+    - 모멘텀 = 최근 4주 변화율과 그 직전 4주 변화율. 현물가가 고정가보다 먼저 움직인다는 가설을 눈으로 볼 수 있게 한다.
+    - 카테고리별 판정은 두 모멘텀의 방향(둔화/가속/비슷)이 같은지만 말한다. 예측이 아니다."""
+    import pandas as pd
+    cur_q = f"{today.year}Q{(today.month - 1) // 3 + 1}"
+    periods = [cur_q]
+    for _ in range(2):
+        periods.insert(0, _prev_quarter(periods[0]))
+
+    rows = []
+    for item, cat in SPOT_PROXY.items():
+        s = _spot_series(history, item)
+        if s.empty:
+            continue
+        row = {"item": item, "category": cat, "quarters": {}}
+        for p in periods:
+            q_end = _quarter_end(p)
+            start = _value_at(s, _quarter_end(_prev_quarter(p)))
+            end = _value_at(s, min(q_end, today))
+            pct = (end / start - 1) * 100 if start and end else None
+            cell = table.get(cat, {}).get(p)
+            contract = cell["cur"] if cell and cell["cur"]["high"] is not None else None
+            partial = today < q_end
+            row["quarters"][p] = {
+                "spot_pct": pct, "partial": partial,
+                "elapsed_days": (today - _quarter_end(_prev_quarter(p))).days if partial else None,
+                "contract": contract, "contract_mid": mid_of(contract) if contract else None,
+            }
+        last = s.index[-1]
+        t0 = last.date()
+        v0, v4, v8 = (_value_at(s, t0), _value_at(s, t0 - dt.timedelta(days=28)), _value_at(s, t0 - dt.timedelta(days=56)))
+        row["last_date"] = t0
+        row["recent4"] = (v0 / v4 - 1) * 100 if v0 and v4 else None
+        row["prior4"] = (v4 / v8 - 1) * 100 if v4 and v8 else None
+        rows.append(row)
+
+    # 판정은 품목별로 낸다. DDR5와 DDR4처럼 세대가 다르면 현물가 방향이 반대일 수 있어 평균 내면 가려진다.
+    verdicts = []
+    for cat in dict.fromkeys(SPOT_PROXY.values()):
+        crow = [r for r in rows if r["category"] == cat and r["recent4"] is not None and r["prior4"] is not None]
+        if not crow:
+            continue
+        pace = pace_change(table[cat]) if cat in table else None
+        items = [{"item": r["item"], "recent4": r["recent4"], "prior4": r["prior4"],
+                  "label": _label(r["recent4"] - r["prior4"])} for r in crow]
+        match = sum(1 for i in items if pace and i["label"] == pace["label"]) if pace else None
+        verdicts.append({"category": cat, "items": items, "pace": pace, "match": match, "n_items": len(items)})
+    latest = max((r["last_date"] for r in rows), default=None)
+    return {"periods": periods, "rows": rows, "verdicts": verdicts, "latest_spot_date": latest}
+
+
+def rebased_spot(history, since: dt.date) -> dict:
+    """품목별 현물가를 since 시점 = 100으로 맞춘 일별 시계열({품목: (날짜들, 값들)})."""
+    import pandas as pd
+    out = {}
+    for item in SPOT_PROXY:
+        s = _spot_series(history, item)
+        if s.empty:
+            continue
+        part = s[s.index >= pd.Timestamp(since)]
+        if part.empty:
+            continue
+        base = _value_at(s, since)
+        if base is None:                        # since 이전 기록이 없으면 첫 기록을 기준으로
+            base = float(part.iloc[0])
+        out[item] = ([d.date() for d in part.index], [float(v) / base * 100 for v in part.values])
+    return out
+
+
 # ── AI 분석 프롬프트용 요약 ─────────────────────────────────────────────────
 
 PROMPT_CATEGORIES = ("범용 DRAM", "서버 DRAM", "NAND", "모바일 DRAM", "PC DRAM", "컨슈머 DRAM", "HBM",
