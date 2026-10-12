@@ -316,6 +316,76 @@ def build_index(cat_row: dict[str, dict]) -> dict | None:
     return {"base": base, "points": pts}
 
 
+# ── AI 분석 프롬프트용 요약 ─────────────────────────────────────────────────
+
+PROMPT_CATEGORIES = ("범용 DRAM", "서버 DRAM", "NAND", "모바일 DRAM", "PC DRAM", "컨슈머 DRAM", "HBM",
+                     "클라이언트 SSD", "엔터프라이즈 SSD", "그래픽 DRAM")
+PROMPT_QUARTERS_BACK = 3        # 현재 분기를 포함해 최근 4분기까지 보여준다(둔화·가속 흐름이 보이도록)
+
+
+def _range_text(f: dict) -> str:
+    if f["high"] is None:
+        return f">{f['low']:g}%"
+    return f"{f['low']:g}%" if f["low"] == f["high"] else f"{f['low']:g}~{f['high']:g}%"
+
+
+def summary_md(store: dict | None = None) -> str:
+    """AI 분석 프롬프트에 넣을 고정가 전망. 파일을 읽기만 한다.
+
+    검증을 통과한 전망(원문 인용 확인)만 쓰고, 상향/하향·둔화/가속·누적 지수는 코드가 계산한 값이다.
+    LLM이 쓴 글이 아니라 숫자와 날짜만 넘긴다."""
+    store = store if store is not None else load()
+    forecasts = flat_forecasts(store)
+    table = latest_table(forecasts)
+    if not table:
+        return ""
+    today = hbm._now().date()
+    first_q = f"{today.year}Q{(today.month - 1) // 3 + 1}"
+    for _ in range(PROMPT_QUARTERS_BACK):
+        first_q = _prev_quarter(first_q)
+    lo_key = _period_key(first_q)
+    cur_q = f"{today.year}Q{(today.month - 1) // 3 + 1}"
+    prev_q = _prev_quarter(cur_q)
+
+    lines, newest = [], ""
+    for cat in PROMPT_CATEGORIES:
+        row = table.get(cat)
+        if not row:
+            continue
+        periods = sorted((p for p in row if p[4] == "Q" and _period_key(p) >= lo_key), key=_period_key)
+        # 최신 전망이 지난 분기보다 오래된 품목(예: 1Q26에서 멈춘 PC DRAM)은 지금 상황처럼 읽히지 않게 뺀다.
+        if not periods or _period_key(periods[-1]) < _period_key(prev_q):
+            continue
+        parts = []
+        for p in periods:
+            cell = row[p]
+            txt = f"{p} {_range_text(cell['cur'])}"
+            if cell["revision"] is not None and abs(cell["revision"]) >= 0.5:
+                txt += f"(직전 발표 대비 {'상향' if cell['revision'] > 0 else '하향'} {abs(cell['revision']):g}%p)"
+            parts.append(txt)
+            newest = max(newest, cell["cur"]["date"])
+        pace = pace_change(row)
+        tail = f" → 증가 속도 {pace['label']}({pace['from']} 중간 {pace['from_mid']:g}% → {pace['to']} {pace['to_mid']:g}%)" if pace else ""
+        lines.append(f"- {cat} QoQ: " + " / ".join(parts) + tail)
+
+    idx_parts = []
+    for cat in ("범용 DRAM", "NAND"):
+        idx = build_index(table[cat]) if cat in table else None
+        if idx:
+            last = idx["points"][-1]
+            idx_parts.append(f"{cat} {idx['base']}=100 기준 {last['period']}까지 약 {last['mid']:.0f}(극단 {last['low']:.0f}~{last['high']:.0f})")
+    if not lines:
+        return ""
+    n_docs = sum(1 for d in store.get("docs", {}).values() if d.get("status") == "extracted")
+    out = [f"(TrendForce 보도자료 {n_docs}건에서 원문 인용이 확인된 전망 · 수집 기준 {store.get('checked_at', '시점 미상')} · "
+           f"가장 최근 발표 {newest})", *lines]
+    if idx_parts:
+        out.append("- 전망 중간값을 이어 곱한 누적 추정 지수: " + "; ".join(idx_parts))
+    out.append("※ 고정가(계약가)의 실측은 공개되지 않는다. 위는 TrendForce의 **전망**이고 발표마다 바뀐다 — 실제 계약가라고 쓰지 말고 "
+               "'전망'임과 발표일을 밝혀라. 서버 DRAM·HBM의 달러 수준은 데이터에 없다. 숫자를 새로 계산하거나 평균 내지 마라.")
+    return "\n".join(out)
+
+
 # ── 수집기 진입점 ───────────────────────────────────────────────────────────
 
 def _pending(store: dict) -> list[tuple[str, dict]]:

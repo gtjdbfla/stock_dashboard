@@ -30,6 +30,7 @@ SOURCE_FIELDS = [
     ("정량 신호 (매매·통합·선물)", "quant_signal"),
     ("가격 과열도 백테스트", "overheat"),
     ("DRAM 현물가", "dram"),
+    ("DRAM 고정가 전망 (TrendForce)", "contract_outlook"),
     ("빅테크 분기 Capex", "capex"),
     ("HBM 펀더멘털 (검증된 사실)", "hbm"),
     ("다가오는 실적 발표", "earnings"),
