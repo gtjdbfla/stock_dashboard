@@ -25,6 +25,7 @@ COPY disclosure.py .
 COPY financial_digest.py .
 COPY fnguide.py .
 COPY hbm.py .
+COPY contract_outlook.py .
 COPY llm.py .
 COPY .streamlit/ .streamlit/
 

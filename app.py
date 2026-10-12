@@ -23,6 +23,7 @@ import streamlit as st
 import ai_analysis
 import analyst_digest
 import analyst_targets
+import contract_outlook
 import disclosure
 import financial_digest
 import fnguide
@@ -3893,11 +3894,165 @@ def _render_tab_rally():
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
 # 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
+def _co_range_text(f: dict) -> str:
+    if f["low"] is None:
+        return "-"
+    if f["high"] is None:
+        return f">{f['low']:g}%"
+    return f"{f['low']:g}%" if f["low"] == f["high"] else f"{f['low']:g}~{f['high']:g}%"
+
+
+def _render_dram_contract_outlook() -> None:
+    """TrendForce 보도자료의 메모리 고정가(계약가) 전망. 파일만 읽는다(수집기가 채운다)."""
+    _subheader_with_help(
+        "메모리 고정가 전망 (TrendForce)",
+        "**고정가(계약가)의 실측치는 공개되지 않습니다.** DRAMeXchange의 계약가 상세·이력은 회원 전용이고, "
+        "서버·모바일 DRAM 계약가는 가격 자체를 숨깁니다. 대신 TrendForce가 분기마다 보도자료로 "
+        "\"범용 DRAM 계약가 4Q26 +10~15% QoQ\"처럼 **범위로 전망**을 냅니다. 그 전망을 발표 순서대로 모았습니다.\n\n"
+        "**정확도**: AI가 보도자료에서 전망을 뽑을 때 원문 문장을 같이 내게 하고, 그 문장이 본문에 글자 그대로 있는지, "
+        "하한·상한 숫자가 그 문장에 있는지, 분기 표기가 본문에 있는지 코드가 확인해 틀리면 버립니다. "
+        "방향(상승/하락)과 아래의 모든 계산(상향·하향, 둔화·가속, 누적 지수)은 AI가 아니라 코드가 합니다.\n\n"
+        "**한계**: 실측이 아니라 **전망**입니다. 같은 분기 전망도 발표마다 바뀝니다(그래서 ▲▼로 수정 방향을 보여줍니다). "
+        "서버 DRAM·HBM의 달러 절대 수준은 유료 리서치에만 있어 알 수 없고, 누적 지수는 '전망 중간값을 이어 곱한 값'이라 "
+        "실제 계약가 지수와 다를 수 있습니다. QoQ는 직전 분기 대비입니다.",
+        key="contract_outlook",
+    )
+    store = contract_outlook.load()
+    docs = store.get("docs", {})
+    if not docs:
+        st.info("수집기가 TrendForce 보도자료를 모으는 중입니다. 처음에는 수십 분 걸릴 수 있습니다.")
+        return
+    forecasts = contract_outlook.flat_forecasts(store)
+    n_extracted = sum(1 for d in docs.values() if d["status"] == "extracted")
+    n_pending = sum(1 for d in docs.values() if d["status"] == "pending")
+    checked = store.get("checked_at")
+    st.caption(f"마지막 확인 {checked or '-'} · 계약가 전망이 든 보도자료 {n_extracted}건 · 검증된 전망 {len(forecasts)}건"
+               + (f" · 읽는 중 {n_pending}건" if n_pending else ""))
+    if checked:
+        age_h = (dt.datetime.now(om.KST).replace(tzinfo=None) - dt.datetime.strptime(checked, "%Y-%m-%d %H:%M")).total_seconds() / 3600
+        if age_h > 12:
+            st.warning(f"수집기가 {age_h:.0f}시간째 이 패널을 갱신하지 못했습니다. 아래 내용은 그 이전 기준입니다.")
+    if not store.get("source_status", {}).get("ok", True):
+        st.caption(f":red[TrendForce 목록을 못 가져오고 있습니다: {store['source_status'].get('error')}]")
+    if not forecasts:
+        st.caption("아직 검증을 통과한 전망이 없습니다.")
+        return
+
+    table = contract_outlook.latest_table(forecasts)
+    today = dt.datetime.now(om.KST).date()
+    cur_q = f"{today.year}Q{(today.month - 1) // 3 + 1}"
+    lo_key = contract_outlook._period_key(contract_outlook._prev_quarter(cur_q))
+    all_periods = sorted({p for row in table.values() for p in row if p[4] == "Q"}, key=contract_outlook._period_key)
+    periods = [p for p in all_periods if contract_outlook._period_key(p) >= lo_key]
+    cats = [c for c in contract_outlook.CATEGORIES if c in table]
+
+    # ── 분기별 최신 전망표 ──
+    _bold_label_with_help(
+        "분기별 최신 전망 (QoQ)",
+        "품목별로 가장 최근에 발표된 전망입니다. ▲▼는 바로 앞선 발표 대비 전망 **중간값**이 몇 %p 올랐는지(상향)·내렸는지(하향)이고, "
+        "'증가 속도'는 연속한 두 분기 전망을 비교한 것입니다(1%p 이상 차이면 가속/둔화). "
+        "고정가가 계속 오르더라도 증가폭이 줄면 '둔화'로 표시됩니다.",
+        key="contract_table",
+    )
+    rows = []
+    for cat in cats:
+        row = {"품목": cat}
+        for p in periods:
+            cell = table[cat].get(p)
+            if not cell:
+                row[p] = ""
+                continue
+            txt = _co_range_text(cell["cur"])
+            rev = cell["revision"]
+            if rev is not None and abs(rev) >= 0.5:
+                txt += f"  {'▲' if rev > 0 else '▼'}{abs(rev):g}%p"
+            row[p] = txt
+        pace = contract_outlook.pace_change(table[cat])
+        row["증가 속도"] = (f"{pace['label']} ({pace['from']} {pace['from_mid']:g}% → {pace['to']} {pace['to_mid']:g}%)"
+                         if pace else "")
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    # ── 분기별 막대(범위) ──
+    default_cats = [c for c in ("범용 DRAM", "서버 DRAM", "NAND") if c in cats] or cats[:3]
+    pick = st.multiselect("차트에 보일 품목", cats, default=default_cats, key="contract_pick")
+    if pick and periods:
+        fig_bar = go.Figure()
+        for cat in pick:
+            xs, mids, plus, minus = [], [], [], []
+            for p in periods:
+                cell = table[cat].get(p)
+                if not cell or cell["cur"]["high"] is None:
+                    continue
+                f = cell["cur"]
+                m = contract_outlook.mid_of(f)
+                xs.append(p)
+                mids.append(m)
+                plus.append(f["high"] - m)
+                minus.append(m - f["low"])
+            if xs:
+                fig_bar.add_trace(go.Bar(x=xs, y=mids, name=cat, error_y=dict(type="data", array=plus, arrayminus=minus),
+                                         hovertemplate="%{x}  중간 %{y:.1f}%<extra>" + cat + "</extra>"))
+        fig_bar.update_layout(barmode="group", yaxis_title="전망 변동률(QoQ, %)")
+        _style_chart_mobile(fig_bar, title="TrendForce 계약가 전망 (QoQ, 막대=중간값, 선=범위)")
+        st.plotly_chart(fig_bar, width="stretch", key="chart_contract_bar", config=PLOTLY_CONFIG)
+
+    # ── 누적 추정 지수 ──
+    indexes = {c: contract_outlook.build_index(table[c]) for c in cats}
+    indexes = {c: v for c, v in indexes.items() if v}
+    if indexes:
+        _bold_label_with_help(
+            "누적 추정 지수 (시작 직전 분기말 = 100)",
+            "연속한 분기 전망의 **중간값을 이어 곱한** 값입니다. 예를 들어 3Q +15.5%, 4Q +12.5%이면 100 → 115.5 → 129.9입니다. "
+            "점선은 모든 분기가 전망 하한(상한)대로 실현되는 극단이라 실제 범위보다 넓게 나옵니다.\n\n"
+            "**실제 계약가 지수가 아닙니다.** TrendForce가 이미 지난 분기에는 실제 결과에 맞춰 전망을 고쳐 내므로 과거 구간은 "
+            "실측에 가깝지만, 앞으로의 구간은 예측입니다. 품목마다 시작 시점이 달라 서로 비교하면 안 됩니다.",
+            key="contract_index",
+        )
+        fig_idx = go.Figure()
+        colors = ["#4c78a8", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
+        for i, (cat, idx) in enumerate(indexes.items()):
+            color = colors[i % len(colors)]
+            xs = [pt["period"] for pt in idx["points"]]
+            fig_idx.add_trace(go.Scatter(x=xs, y=[pt["mid"] for pt in idx["points"]], name=f"{cat}(시작 {idx['base']}=100)",
+                                         mode="lines+markers", line=dict(color=color), legendgroup=cat))
+            for key, dash in (("high", "dot"), ("low", "dot")):
+                fig_idx.add_trace(go.Scatter(x=xs, y=[pt[key] for pt in idx["points"]], mode="lines", showlegend=False,
+                                             line=dict(color=color, dash=dash, width=1), legendgroup=cat, hoverinfo="skip"))
+        fig_idx.update_layout(yaxis_title="지수")
+        _style_chart_mobile(fig_idx, title="누적 추정 지수 (전망 중간값 이어 곱하기)")
+        st.plotly_chart(fig_idx, width="stretch", key="chart_contract_index", config=PLOTLY_CONFIG)
+
+    # ── 발표 이력 (원문 인용 포함) ──
+    with st.expander("전망 발표 이력과 원문 인용"):
+        cat_filter = st.selectbox("품목", ["전체"] + cats, key="contract_hist_cat")
+        hist_rows = [
+            {"발표일": f["date"], "품목": f["category"], "분기": f["period"], "기준": f["basis"],
+             "전망": _co_range_text(f), "원문 인용": f["quote"], "보도자료": f["url"]}
+            for f in reversed(forecasts) if f["low"] is not None and (cat_filter == "전체" or f["category"] == cat_filter)]
+        if hist_rows:
+            st.dataframe(pd.DataFrame(hist_rows), hide_index=True, width="stretch",
+                         column_config={"보도자료": st.column_config.LinkColumn(display_text="열기")})
+        qualitative = [f for f in reversed(forecasts) if f["low"] is None]
+        if qualitative:
+            st.caption("숫자 없이 서술만 있는 전망 (방향 판단 없이 원문만 보여줍니다)")
+            for f in qualitative[:8]:
+                st.markdown(_md_safe(f"- **{f['date']}** {f['category']} {f['period']}  :gray[“{f['quote']}”]"))
+    st.divider()
+
+
 @st.fragment
 def _render_tab_dram():
     global dram_summary
 
     dram_summary = "해당 없음 (메모리 반도체 관련주가 아니라 DRAM 시세를 표시하지 않음)"
+
+    if TICKER in MEMORY_SEMICONDUCTOR_TICKERS:
+        try:
+            _render_dram_contract_outlook()
+        except Exception as exc:                  # 이 패널이 깨져도 아래 현물가 화면은 살린다
+            print(f"[dram] 고정가 전망 패널 실패: {type(exc).__name__}: {exc}", flush=True)
+            st.caption(f":red[고정가 전망 패널을 표시하지 못했습니다 ({type(exc).__name__}).]")
 
     _subheader_with_help(
         "DRAM 현물가 (모듈 + 칩)",

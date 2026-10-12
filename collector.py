@@ -18,6 +18,7 @@ import daily_history
 import disclosure
 import financial_digest
 import flow_probe
+import contract_outlook
 import futures_history
 import hbm
 import over_market as om
@@ -63,6 +64,7 @@ _progress = {"at": time.monotonic()}
 _jobs = {
     "AI분석": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_AI_STALL_LIMIT_SEC", "1200"))},
     "HBM수집": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_HBM_STALL_LIMIT_SEC", "3600"))},
+    "고정가수집": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_CONTRACT_STALL_LIMIT_SEC", "3600"))},
 }
 
 
@@ -185,6 +187,7 @@ def main() -> None:
         # 한 번에 30~100초가 걸리지만 시세 기록은 20초 주기라 그 사이가 비지는 않는다.
         _tick_async("AI분석", lambda: ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log))
         _tick_async("HBM수집", lambda: hbm.tick(now, log=log))
+        _tick_async("고정가수집", lambda: contract_outlook.tick(now, log=log))
 
         if not om.in_collect_window(now):
             if last_state != "idle":
