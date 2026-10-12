@@ -24,6 +24,7 @@ COPY analyst_targets.py .
 COPY disclosure.py .
 COPY financial_digest.py .
 COPY fnguide.py .
+COPY hbm.py .
 COPY llm.py .
 COPY .streamlit/ .streamlit/
 
