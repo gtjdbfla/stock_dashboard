@@ -3905,9 +3905,34 @@ def _co_range_text(f: dict) -> str:
 _SPOT_SHORT = contract_outlook.SPOT_SHORT
 
 
-def _render_spot_vs_contract(table: dict, today: dt.date) -> None:
-    """분기별 현물가 변화율과 같은 분기 고정가 전망을 나란히 놓는다. 계산은 전부 contract_outlook이 한다."""
+def _render_dram_change_bars(history: pd.DataFrame, items: list[str]) -> None:
+    """현물가 탭: 품목별 7·30·90일 변화율을 한 번에 비교하는 막대."""
+    rows = []
+    for item in items:
+        for days in (7, 30, 90):
+            pct = _period_change_pct(history, item, days)
+            if pct is not None:
+                rows.append({"품목": _SPOT_SHORT.get(item, item), "기간": f"{days}일 전 대비", "변화율(%)": pct})
+    if not rows:
+        return
+    st.divider()
     _bold_label_with_help(
+        "품목별 기간 변화율",
+        "이 대시보드가 쌓은 현물가 이력으로 계산한 7·30·90일 전 대비 변화율입니다. "
+        "이력이 그 기간만큼 쌓이지 않은 품목은 해당 막대가 없습니다.",
+        key="dram_change_bars",
+    )
+    fig = px.bar(pd.DataFrame(rows), x="품목", y="변화율(%)", color="기간", barmode="group",
+                 category_orders={"기간": ["7일 전 대비", "30일 전 대비", "90일 전 대비"]})
+    fig.update_traces(hovertemplate="%{x}<br>%{y:+.1f}%<extra>%{fullData.name}</extra>")
+    _style_chart_mobile(fig, title="현물가 기간 변화율")
+    st.plotly_chart(fig, width="stretch", key="chart_dram_change_bars", config=PLOTLY_CONFIG)
+
+
+def _render_dram_compare_tab() -> None:
+    """현물가 vs 고정가 탭. 분기별 현물가 변화율과 같은 분기 고정가 전망을 나란히 놓는다.
+    계산은 전부 contract_outlook이 한다(AI가 아니다)."""
+    _subheader_with_help(
         "현물가 변화 vs 고정가 전망 (분기)",
         "같은 분기에 **현물가가 실제로 얼마나 움직였는지**와 TrendForce의 **고정가 전망**을 나란히 봅니다. "
         "현물가는 고정가보다 먼저 움직이는 경향이 있어, 현물가가 꺾이는지는 고정가 전망이 바뀔 신호로 참고합니다.\n\n"
@@ -3918,6 +3943,12 @@ def _render_spot_vs_contract(table: dict, today: dt.date) -> None:
         "현물가 이력이 6월부터라 완결된 분기는 3분기 하나뿐이고, 선행성을 통계로 검증하기엔 이릅니다.",
         key="contract_spot_cmp",
     )
+    store = contract_outlook.load()
+    forecasts = contract_outlook.flat_forecasts(store)
+    table = contract_outlook.latest_table(forecasts) if forecasts else {}
+    today = dt.datetime.now(om.KST).date()
+    if not forecasts:
+        st.caption("고정가 전망이 아직 없어 현물가 쪽만 보여줍니다.")
     try:
         hist = pd.read_csv(DRAM_HISTORY_FILE, parse_dates=["날짜"]) if os.path.exists(DRAM_HISTORY_FILE) else pd.DataFrame()
     except Exception:
@@ -3958,6 +3989,52 @@ def _render_spot_vs_contract(table: dict, today: dt.date) -> None:
         else:
             st.markdown(_md_safe(f"- **{v['category']}**: 연속한 두 분기 전망이 없어 고정가 쪽 속도는 비교할 수 없습니다. 현물가 모멘텀은 {labels}입니다."))
 
+    # ── 그래프 1: 완결 분기의 현물가 변화율 vs 같은 분기 고정가 전망 범위 ──
+    done = [p for p in cmp["periods"]
+            if any(r["quarters"][p]["spot_pct"] is not None and not r["quarters"][p]["partial"] for r in cmp["rows"])]
+    if done:
+        p = done[-1]
+        names, spots, mids, plus, minus, mid_x = [], [], [], [], [], []
+        for r in cmp["rows"]:
+            q = r["quarters"][p]
+            if q["spot_pct"] is None:
+                continue
+            name = _SPOT_SHORT.get(r["item"], r["item"])
+            names.append(name)
+            spots.append(q["spot_pct"])
+            c = q["contract"]
+            if c is not None:
+                m = contract_outlook.mid_of(c)
+                mid_x.append(name)
+                mids.append(m)
+                plus.append(c["high"] - m)
+                minus.append(m - c["low"])
+        fig_q = go.Figure()
+        fig_q.add_trace(go.Bar(x=names, y=spots, name=f"{p} 현물가 변화율", marker_color="#4c78a8",
+                               hovertemplate="%{x}<br>현물가 %{y:+.1f}%<extra></extra>"))
+        if mids:
+            fig_q.add_trace(go.Scatter(x=mid_x, y=mids, mode="markers", name=f"{p} 고정가 전망(중간값·범위)",
+                                       marker=dict(symbol="diamond", size=11, color="#d62728"),
+                                       error_y=dict(type="data", array=plus, arrayminus=minus, color="#d62728"),
+                                       hovertemplate="%{x}<br>전망 중간 %{y:.1f}%<extra></extra>"))
+        fig_q.update_layout(yaxis_title="QoQ 변화율(%)")
+        _style_chart_mobile(fig_q, title=f"{p} 현물가 변화율 vs 고정가 전망 범위")
+        st.plotly_chart(fig_q, width="stretch", key="chart_cmp_quarter", config=PLOTLY_CONFIG)
+
+    # ── 그래프 2: 모멘텀(최근 4주 vs 직전 4주) ──
+    mom = [r for r in cmp["rows"] if r["recent4"] is not None and r["prior4"] is not None]
+    if mom:
+        names = [_SPOT_SHORT.get(r["item"], r["item"]) for r in mom]
+        fig_m = go.Figure()
+        fig_m.add_trace(go.Bar(x=names, y=[r["prior4"] for r in mom], name="직전 4주", marker_color="#9ecae1",
+                               hovertemplate="%{x}<br>직전 4주 %{y:+.1f}%<extra></extra>"))
+        fig_m.add_trace(go.Bar(x=names, y=[r["recent4"] for r in mom], name="최근 4주", marker_color="#08519c",
+                               hovertemplate="%{x}<br>최근 4주 %{y:+.1f}%<extra></extra>"))
+        fig_m.update_layout(barmode="group", yaxis_title="4주 변화율(%)")
+        _style_chart_mobile(fig_m, title="현물가 모멘텀 (최근 4주 vs 직전 4주)")
+        st.plotly_chart(fig_m, width="stretch", key="chart_cmp_momentum", config=PLOTLY_CONFIG)
+
+    # ── 그래프 3: 분기 시작 대비 현물가 추이 ──
     base_day = contract_outlook._quarter_end(cmp["periods"][0])
     series = contract_outlook.rebased_spot(hist, base_day)
     if series:
@@ -3975,7 +4052,7 @@ def _render_spot_vs_contract(table: dict, today: dt.date) -> None:
         st.plotly_chart(fig, width="stretch", key="chart_contract_spot_cmp", config=PLOTLY_CONFIG)
 
 
-def _render_dram_contract_outlook() -> None:
+def _render_dram_contract_tab() -> None:
     """TrendForce 보도자료의 메모리 고정가(계약가) 전망. 파일만 읽는다(수집기가 채운다)."""
     _subheader_with_help(
         "메모리 고정가 전망 (TrendForce)",
@@ -4051,8 +4128,6 @@ def _render_dram_contract_outlook() -> None:
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
-    _render_spot_vs_contract(table, today)
-
     # ── 분기별 막대(범위) ──
     default_cats = [c for c in ("범용 DRAM", "서버 DRAM", "NAND") if c in cats] or cats[:3]
     pick = st.multiselect("차트에 보일 품목", cats, default=default_cats, key="contract_pick")
@@ -4118,21 +4193,38 @@ def _render_dram_contract_outlook() -> None:
             st.caption("숫자 없이 서술만 있는 전망 (방향 판단 없이 원문만 보여줍니다)")
             for f in qualitative[:8]:
                 st.markdown(_md_safe(f"- **{f['date']}** {f['category']} {f['period']}  :gray[“{f['quote']}”]"))
-    st.divider()
 
 
 @st.fragment
 def _render_tab_dram():
+    """DRAM 시세 탭. 안쪽 탭 셋: 현물가 / 고정가 전망 / 둘의 비교. 한 부분이 깨져도 나머지는 산다."""
     global dram_summary
 
     dram_summary = "해당 없음 (메모리 반도체 관련주가 아니라 DRAM 시세를 표시하지 않음)"
+    if TICKER not in MEMORY_SEMICONDUCTOR_TICKERS:
+        st.caption("이 지표는 메모리 반도체 관련주(SK하이닉스, 삼성전자)에서만 제공됩니다.")
+        return
 
-    if TICKER in MEMORY_SEMICONDUCTOR_TICKERS:
+    tab_spot, tab_contract, tab_cmp = st.tabs(["DRAM 현물가", "DRAM 고정가", "현물가 vs 고정가"])
+    with tab_spot:
+        _render_dram_spot_tab()
+    with tab_contract:
         try:
-            _render_dram_contract_outlook()
-        except Exception as exc:                  # 이 패널이 깨져도 아래 현물가 화면은 살린다
-            print(f"[dram] 고정가 전망 패널 실패: {type(exc).__name__}: {exc}", flush=True)
-            st.caption(f":red[고정가 전망 패널을 표시하지 못했습니다 ({type(exc).__name__}).]")
+            _render_dram_contract_tab()
+        except Exception as exc:
+            print(f"[dram] 고정가 탭 실패: {type(exc).__name__}: {exc}", flush=True)
+            st.caption(f":red[고정가 탭을 표시하지 못했습니다 ({type(exc).__name__}).]")
+    with tab_cmp:
+        try:
+            _render_dram_compare_tab()
+        except Exception as exc:
+            print(f"[dram] 비교 탭 실패: {type(exc).__name__}: {exc}", flush=True)
+            st.caption(f":red[비교 탭을 표시하지 못했습니다 ({type(exc).__name__}).]")
+
+
+def _render_dram_spot_tab():
+    """DRAM 현물가 안쪽 탭. (예전 DRAM 탭의 본문 — 칩·모듈 현물가 표와 추이.)"""
+    global dram_summary
 
     _subheader_with_help(
         "DRAM 현물가 (모듈 + 칩)",
@@ -4244,6 +4336,8 @@ def _render_tab_dram():
                                               default_days=compare_days_module)
                 else:
                     st.caption("아직 사이트 업데이트가 한 번만 기록돼 있어서, 다음 업데이트부터 추이 그래프가 표시됩니다.")
+
+                _render_dram_change_bars(history, list(combined_df["품목"]))
         except Exception as e:
             st.error(f"DRAM 현물가 조회에 실패했습니다: {e}")
 
