@@ -50,7 +50,7 @@ def available_providers() -> dict[str, bool]:
     }
 
 
-def _call_gemini(prompt: str) -> tuple[str, str]:
+def _call_gemini(prompt: str, min_usable: int | None = None) -> tuple[str, str]:
     from google import genai
     from google.genai import types as genai_types
 
@@ -66,6 +66,7 @@ def _call_gemini(prompt: str) -> tuple[str, str]:
              + [m for m in FALLBACK_MODELS if m != MODEL])
     best = ""
     best_model = ""
+    need = MIN_USABLE if min_usable is None else min_usable
     for model in order:
         tried.append(model)
         for kwargs in (cfg, {}):
@@ -79,7 +80,7 @@ def _call_gemini(prompt: str) -> tuple[str, str]:
                     if piece:
                         out.append(piece)
                 text = "".join(out)
-                if len(text.strip()) >= MIN_USABLE:
+                if len(text.strip()) >= need:
                     return text, model
                 if len(text.strip()) > len(best):
                     best, best_model = text.strip(), model
@@ -117,10 +118,14 @@ def _call_openai(prompt: str) -> tuple[str, str]:
     return (r.output_text or ""), OPENAI_MODEL
 
 
-def call(prompt: str) -> tuple[str, str]:
-    """설정된 제공자로 부른다. 반환: (본문, 실제로 답한 모델명)."""
+def call(prompt: str, min_usable: int | None = None) -> tuple[str, str]:
+    """설정된 제공자로 부른다. 반환: (본문, 실제로 답한 모델명).
+
+    min_usable: 이보다 짧은 답은 잘린 것으로 보고 다음 모델로 넘어가는 기준(Gemini만 해당).
+    기본값(LLM_MIN_USABLE)은 보고서 같은 긴 글 기준이라, 짧은 JSON처럼 원래 짧은 답을 받을 땐
+    낮춰서 불러야 모델을 줄줄이 헛돌지 않는다."""
     if PROVIDER == "anthropic":
         return _call_anthropic(prompt)
     if PROVIDER == "openai":
         return _call_openai(prompt)
-    return _call_gemini(prompt)
+    return _call_gemini(prompt, min_usable=min_usable)

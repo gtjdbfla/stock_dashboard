@@ -26,6 +26,7 @@ import analyst_targets
 import disclosure
 import financial_digest
 import fnguide
+import hbm
 import over_market as om
 from bs4 import BeautifulSoup
 from google import genai
@@ -240,6 +241,7 @@ ALL_TAB_LABELS = [
     "하락 조기신호",
     "상승 조기신호",
     "DRAM 시세",
+    "HBM",
     "빅테크 Capex",
     "재무 데이터",
     "공시",
@@ -4010,6 +4012,183 @@ def _render_tab_dram():
         except Exception as e:
             st.error(f"DRAM 현물가 조회에 실패했습니다: {e}")
 
+
+def _md_safe(text: str) -> str:
+    """Streamlit은 $...$를 수식으로 읽는다. '$1 billion' 같은 금액이 깨지지 않게 막는다."""
+    return str(text).replace("$", "\\$")
+
+
+def _hbm_direction_tag(direction: str) -> str:
+    return {"호재": ":green[호재]", "악재": ":red[악재]"}.get(direction, ":gray[중립]")
+
+
+def _hbm_fact_card(f: dict, fid: str | None = None) -> None:
+    """검증된 사실 한 건. 원문 인용을 접지 않고 그대로 보여준다 — 근거가 보여야 믿을 수 있다."""
+    with st.container(border=True):
+        head = (f"**{fid}** · " if fid else "") + (
+            f"**{f['date']}** · {hbm.TIER_LABEL[f['tier']]}({hbm.SOURCE_LABEL[f['source']]}) · "
+            f"{f['subject']} · {f['topic']} · {_hbm_direction_tag(f['direction'])}")
+        st.markdown(_md_safe(head))
+        st.markdown(_md_safe(f["claim"]))
+        st.caption(_md_safe(f"원문: “{f['quote']}” — [{f['title']}]({f['url']})"))
+
+
+@st.fragment
+def _render_tab_hbm():
+    _subheader_with_help(
+        "HBM 펀더멘털",
+        "HBM은 현물가가 없습니다(고객사와 연·분기 단위로 협상하는 계약가). 그래서 매일 움직이는 숫자 대신 "
+        "**날짜와 출처가 붙은 사실**을 모읍니다.\n\n"
+        "**출처 등급**: 회사 자료(마이크론 실적·Prepared Remarks, SK하이닉스 뉴스룸) / TrendForce 리서치 보도자료 / "
+        "언론 보도를 인용한 기사(소문일 수 있음).\n\n"
+        "**정확도를 지키는 방법**: AI가 본문에서 사실을 뽑을 때 원문 문장을 같이 내게 하고, 그 문장이 "
+        "본문에 **글자 그대로 있는지**, 요약에 쓴 숫자가 그 문장에 있는지 코드가 확인합니다. 하나라도 틀리면 "
+        "버립니다. 마이크론 사업부 숫자는 AI를 거치지 않고 SEC 공시 표에서 코드가 직접 읽습니다.\n\n"
+        "**한계**: 호재/악재 표시는 AI의 판단이라 틀릴 수 있습니다(HBM 시장의 가격·수요·공급 환경 기준). "
+        "SK하이닉스의 HBM 점유율·가격 같은 수치는 공개되지 않아 직접 보여드리지 못하고, 마이크론이 가장 가까운 "
+        "비교 대상입니다.",
+        key="hbm",
+    )
+    store = hbm.load()
+    docs = store.get("docs", {})
+    if not docs:
+        st.info("수집기가 HBM 자료를 모으는 중입니다. 처음에는 수십 분 걸릴 수 있습니다.")
+        return
+
+    counts: dict[str, int] = {}
+    for d in docs.values():
+        counts[d["status"]] = counts.get(d["status"], 0) + 1
+    checked = store.get("checked_at")
+    line = f"마지막 확인 {checked or '-'} · 읽은 문서 {counts.get('extracted', 0)}건"
+    if counts.get("pending"):
+        line += f" · 읽는 중 {counts['pending']}건"
+    st.caption(line)
+    if checked:
+        now_naive = dt.datetime.now(om.KST).replace(tzinfo=None)
+        age_h = (now_naive - dt.datetime.strptime(checked, "%Y-%m-%d %H:%M")).total_seconds() / 3600
+        if age_h > 12:
+            st.warning(f"수집기가 {age_h:.0f}시간째 이 탭을 갱신하지 못했습니다. 아래 내용은 그 이전 기준입니다.")
+    failed = [k for k, v in (store.get("source_status") or {}).items() if not v.get("ok")]
+    if failed:
+        st.caption(f":red[일부 출처를 못 가져오고 있습니다: {', '.join(failed)}]  (아래 '수집 현황' 참고)")
+
+    # ── 종합 ──
+    synth = store.get("synthesis")
+    _bold_label_with_help(
+        "펀더멘털 종합",
+        "검증을 통과한 사실만 근거로 AI가 정리한 글입니다. 문장 끝의 [F3]은 근거 사실 번호이고, [M2]는 코드가 "
+        "SEC 표에서 뽑은 마이크론 숫자입니다. 번호가 목록에 없으면 코드가 지웁니다.\n\n"
+        "'해석:'으로 시작하는 문장만 AI의 추론입니다. 나머지는 근거 사실을 옮긴 것입니다.",
+        key="hbm_synth",
+    )
+    if synth:
+        removed = synth.get("invalid_citations_removed", 0)
+        st.caption(f"종합 기준 {synth['generated_at']} · 근거 사실 {len(synth['facts'])}건 · 모델 {synth['model']} · "
+                   f"문장 중 근거 번호가 붙은 비율 {synth['cited_line_ratio']:.0%}"
+                   + (f" · 존재하지 않는 번호 {removed}개 제거" if removed else ""))
+        st.markdown(_md_safe(synth["text"]))
+        with st.expander(f"근거 사실 목록 (F1~F{len(synth['facts'])})"):
+            for m_i, ml in enumerate(synth.get("micron_lines", []), 1):
+                st.markdown(_md_safe(f"**M{m_i}** · {ml}"))
+            for f in synth["facts"]:
+                _hbm_fact_card(f, f["fid"])
+    else:
+        st.caption("아직 종합을 만들 만큼 사실이 모이지 않았습니다.")
+
+    # ── 마이크론 ──
+    quarters = store.get("micron_quarters", [])
+    if quarters:
+        st.divider()
+        _bold_label_with_help(
+            "마이크론 클라우드 메모리 사업부 (HBM 포함)",
+            "마이크론은 HBM만 따로 매출을 공개하지 않고, HBM이 속한 클라우드 메모리 사업부(CMBU)의 매출·마진을 "
+            "분기마다 공개합니다. SEC에 제출한 실적 보도자료의 표를 코드가 직접 읽었고, 네 사업부 매출의 합이 전체 "
+            "매출과 맞는 것만 씁니다.\n\n"
+            "SK하이닉스 실적(10월 말 예정) 전에 HBM 업황의 방향을 가늠하는 가장 가까운 공개 지표입니다. "
+            "다만 CMBU에는 HBM 외에 고용량 서버 모듈도 들어 있어 HBM 매출 그 자체는 아닙니다.",
+            key="hbm_micron",
+        )
+        rows = []
+        for i, q in enumerate(quarters):
+            prev = quarters[i - 1] if i else None
+            rows.append({
+                "분기": q["quarter"], "전체 매출($B)": q["revenue"] / 1000, "CMBU 매출($B)": q["CMBU_rev"] / 1000,
+                "CMBU 전분기 대비": (q["CMBU_rev"] / prev["CMBU_rev"] - 1) if prev else None,
+                "CMBU 비중": q["CMBU_rev"] / q["revenue"], "CMBU 매출총이익률": q["CMBU_gm"] / 100,
+                "CMBU 영업이익률": q["CMBU_om"] / 100,
+            })
+        mdf = pd.DataFrame(rows)
+        fig_mu = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_mu.add_trace(go.Bar(x=mdf["분기"], y=mdf["CMBU 매출($B)"], name="CMBU 매출($B)", marker_color="#4c78a8"),
+                         secondary_y=False)
+        fig_mu.add_trace(go.Scatter(x=mdf["분기"], y=mdf["CMBU 매출총이익률"] * 100, name="매출총이익률(%)",
+                                    mode="lines+markers", line=dict(color="#d62728")), secondary_y=True)
+        fig_mu.update_yaxes(title_text="매출($B)", secondary_y=False)
+        fig_mu.update_yaxes(title_text="총이익률(%)", range=[0, 100], secondary_y=True)
+        _style_chart_mobile(fig_mu, title="마이크론 CMBU 분기 매출과 총이익률")
+        st.plotly_chart(fig_mu, width="stretch", key="chart_hbm_micron", config=PLOTLY_CONFIG)
+        st.dataframe(
+            mdf.iloc[::-1], hide_index=True, width="stretch",
+            column_config={
+                "전체 매출($B)": st.column_config.NumberColumn(format="%.2f"),
+                "CMBU 매출($B)": st.column_config.NumberColumn(format="%.2f"),
+                "CMBU 전분기 대비": st.column_config.NumberColumn(format="percent"),
+                "CMBU 비중": st.column_config.NumberColumn(format="percent"),
+                "CMBU 매출총이익률": st.column_config.NumberColumn(format="percent"),
+                "CMBU 영업이익률": st.column_config.NumberColumn(format="percent"),
+            })
+
+    # ── 사실 타임라인 ──
+    st.divider()
+    _bold_label_with_help(
+        "검증된 사실 타임라인",
+        "원문 인용이 확인된 사실만 최신순으로 보여줍니다. 필터로 주제·기간·출처 등급을 좁힐 수 있습니다.",
+        key="hbm_timeline",
+    )
+    facts = hbm.collect_fact_list(store, balanced=False)
+    col_a, col_b, col_c = st.columns([0.45, 0.3, 0.25])
+    topic_pick = col_a.multiselect("주제", hbm.TOPICS, default=[], key="hbm_topic", placeholder="전체")
+    span = col_b.selectbox("기간", ["최근 30일", "최근 90일", "전체"], index=1, key="hbm_span")
+    with_c = col_c.checkbox("언론 보도 인용 포함", value=True, key="hbm_with_c")
+    today = dt.datetime.now(om.KST).date()
+    limit_days = {"최근 30일": 30, "최근 90일": 90}.get(span)
+    shown = [f for f in facts
+             if (not topic_pick or f["topic"] in topic_pick)
+             and (with_c or f["tier"] != "C")
+             and (limit_days is None or (today - dt.date.fromisoformat(f["date"])).days <= limit_days)]
+    st.caption(f"{len(shown)}건")
+    page = st.session_state.get("hbm_page", 12)
+    for f in shown[:page]:
+        _hbm_fact_card(f)
+    if len(shown) > page and st.button("더 보기", key="hbm_more"):
+        st.session_state["hbm_page"] = page + 12
+        st.rerun(scope="fragment")
+
+    # ── 헤드라인 / 수집 현황 ──
+    headlines = store.get("headlines", [])
+    if headlines:
+        with st.expander(f"한국 뉴스 헤드라인 {len(headlines)}건 (참고용 — 본문 검증 없음)"):
+            for h in headlines[:25]:
+                st.markdown(_md_safe(f"- {h['title']}  :gray[{h.get('when') or h['first_seen']}]"))
+    with st.expander("수집 현황"):
+        by_src: dict[str, dict[str, int]] = {}
+        for d in docs.values():
+            by_src.setdefault(d["source"], {})
+            by_src[d["source"]][d["status"]] = by_src[d["source"]].get(d["status"], 0) + 1
+        source_state = store.get("source_status") or {}
+        status_rows = []
+        for key, label in hbm.SOURCE_LABEL.items():
+            c = by_src.get(key, {})
+            info = source_state.get("micron" if key == "micron_remarks" else key, {})
+            status_rows.append({"출처": label, "등급": hbm.TIER_LABEL[hbm.SOURCE_TIER[key]],
+                                "읽음": c.get("extracted", 0), "HBM 무관": c.get("skipped", 0), "대기": c.get("pending", 0),
+                                "최근 확인": info.get("at", "-"), "상태": "정상" if info.get("ok", True) else "실패"})
+        st.dataframe(pd.DataFrame(status_rows), hide_index=True, width="stretch")
+        for k, v in source_state.items():
+            if not v.get("ok"):
+                st.caption(f":red[{k}: {v.get('error')}]")
+
+
 # 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
 # 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
@@ -4891,6 +5070,7 @@ _TAB_RENDERERS = {
     "하락 조기신호": _render_tab_decline,
     "상승 조기신호": _render_tab_rally,
     "DRAM 시세": _render_tab_dram,
+    "HBM": _render_tab_hbm,
     "빅테크 Capex": _render_tab_capex,
     "재무 데이터": _render_tab_financials,
     "공시": _render_tab_disclosure,

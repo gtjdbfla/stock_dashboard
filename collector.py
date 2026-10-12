@@ -19,6 +19,7 @@ import disclosure
 import financial_digest
 import flow_probe
 import futures_history
+import hbm
 import over_market as om
 
 # 로그 한 줄 때문에 수집기가 죽는 일이 없게 한다.
@@ -56,29 +57,32 @@ AI_STOCK_NAME = os.environ.get("AI_ANALYSIS_NAME", "SK하이닉스")
 STALL_LIMIT_SEC = int(os.environ.get("COLLECTOR_STALL_LIMIT_SEC", "1800"))
 _progress = {"at": time.monotonic()}
 
-# AI 분석은 한 번에 30~170초가 걸리고 외부 API에 매달린다. 메인 루프에서 직접 돌리면 그동안
-# 시세 기록이 멈추고, 분석이 어디선가 막히면 기록까지 같이 죽는다. 별도 스레드로 돌린다.
-AI_STALL_LIMIT_SEC = int(os.environ.get("COLLECTOR_AI_STALL_LIMIT_SEC", "1200"))
-_ai = {"thread": None, "started": None}
+# AI 분석·HBM 수집은 한 번에 수십 초~수 분이 걸리고 외부 API에 매달린다. 메인 루프에서 직접 돌리면
+# 그동안 시세 기록이 멈추고, 어디선가 막히면 기록까지 같이 죽는다. 각자 별도 스레드로 돌린다.
+# 이름 -> {thread, started, limit(초: 이만큼 안 끝나면 멈춘 것으로 본다)}
+_jobs = {
+    "AI분석": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_AI_STALL_LIMIT_SEC", "1200"))},
+    "HBM수집": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_HBM_STALL_LIMIT_SEC", "3600"))},
+}
 
 
-def _tick_ai_async(now: dt.datetime) -> None:
-    """이전 분석이 아직 돌고 있으면 건너뛴다. 예약 시각 판정은 ai_report.tick이 한다."""
-    thread = _ai["thread"]
-    if thread is not None and thread.is_alive():
+def _tick_async(name: str, fn) -> None:
+    """이전 실행이 아직 돌고 있으면 건너뛴다. 실행 시각 판정은 fn 쪽이 한다."""
+    job = _jobs[name]
+    if job["thread"] is not None and job["thread"].is_alive():
         return
 
     def run() -> None:
         try:
-            ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log)
+            fn()
         except Exception as exc:
-            log(f"AI분석 오류: {type(exc).__name__}: {exc}")
+            log(f"{name} 오류: {type(exc).__name__}: {exc}")
         finally:
-            _ai["started"] = None
+            job["started"] = None
 
-    _ai["started"] = time.monotonic()
-    _ai["thread"] = threading.Thread(target=run, name="ai-tick", daemon=True)
-    _ai["thread"].start()
+    job["started"] = time.monotonic()
+    job["thread"] = threading.Thread(target=run, name=name, daemon=True)
+    job["thread"].start()
 
 
 def _watchdog() -> None:
@@ -92,13 +96,15 @@ def _watchdog() -> None:
     while True:
         time.sleep(60)
         stalled = time.monotonic() - _progress["at"]
-        ai_started = _ai["started"]
-        ai_running = None if ai_started is None else time.monotonic() - ai_started
+        reason = None
         if stalled > STALL_LIMIT_SEC:
             reason = f"수집기 루프가 {stalled:.0f}초째 멈춤"
-        elif ai_running is not None and ai_running > AI_STALL_LIMIT_SEC:
-            reason = f"AI 분석이 {ai_running:.0f}초째 안 끝남"
         else:
+            for name, job in _jobs.items():
+                if job["started"] is not None and time.monotonic() - job["started"] > job["limit"]:
+                    reason = f"{name}이(가) {time.monotonic() - job['started']:.0f}초째 안 끝남"
+                    break
+        if reason is None:
             continue
         log(f"{reason} - 스택을 남기고 재시작합니다")
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
@@ -177,7 +183,8 @@ def main() -> None:
         # 예전에는 대시보드가 만들었는데, Streamlit은 브라우저가 붙어야 스크립트를
         # 돌리므로 아무도 화면을 안 열어 둔 시각은 통째로 건너뛰었다(실측 11시간).
         # 한 번에 30~100초가 걸리지만 시세 기록은 20초 주기라 그 사이가 비지는 않는다.
-        _tick_ai_async(now)
+        _tick_async("AI분석", lambda: ai_report.tick(now, DIGEST_TICKER, AI_STOCK_NAME, log=log))
+        _tick_async("HBM수집", lambda: hbm.tick(now, log=log))
 
         if not om.in_collect_window(now):
             if last_state != "idle":
