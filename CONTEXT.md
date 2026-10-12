@@ -138,6 +138,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
   - **막힌 길**: SK하이닉스 IR 페이지(`skhynix.com/ir`)는 자바스크립트로 그려서 PDF 링크가 HTML에 없다. 마이크론 보도자료(Exhibit 99.1) 본문에는 'HBM'이 한 번도 안 나온다(HBM 이야기는 Prepared Remarks에만). 마이크론은 HBM 매출을 따로 공개하지 않아 HBM이 속한 CMBU(클라우드 메모리 사업부)를 쓴다 — CMBU에는 고용량 서버 모듈도 있어 HBM 매출 그 자체는 아니다.
   - **SK하이닉스 자체의 HBM 점유율·가격 수치는 공개 자료로 못 구한다.** 종합 분석의 '시사점'이 마이크론·업계 사실로 SK하이닉스를 해석하는 이유다. SK하이닉스 3분기 실적(10월 말) 발표 뒤 뉴스룸 IR 글로 첫 직접 수치가 들어올 것이다.
   - **무료 한도 아끼기**: 한 번에 LLM으로 읽는 문서는 3건(`MAX_DOCS_PER_TICK`), HBM 언급이 없어 건너뛰는 문서는 한 바퀴에 30건까지 거른다. 처음 백필(문서 125건)은 20분 넘게 걸린다. 종합 분석은 출처별 상한(`SOURCE_QUOTA`)으로 균형을 맞춘다 — 날짜순으로만 자르면 뉴스룸의 전시·수상 소식이 시장 분석을 밀어낸다.
+  - **AI 분석에도 들어간다**(`hbm.summary_md()` → `ai_report` → `generate_ai_analysis(hbm_md=...)`). LLM이 쓴 종합 글이 아니라 **검증된 사실을 직접** 주제별로 13건(약 1,700자) 넣는다 — AI가 쓴 글을 또 AI가 요약하면 오류가 겹친다. 출력 형식의 `수요 배경과 지표 점검`에 HBM 줄을 추가했고(입력 섹션과 출력 줄을 같이 고쳐야 모델이 쓴다), 원본 데이터 보기(`ai_analysis.SOURCE_FIELDS`)에도 노출한다. 규칙: 사실 날짜를 밝히고, 경쟁사 호조를 SK하이닉스 호재로 단정하지 않으며, SK하이닉스 자체 수치는 지어내지 않는다.
   - **새 소스를 추가할 때**: `Dockerfile`은 모듈을 **하나씩 COPY한다** — 새 `.py`를 만들면 반드시 COPY 줄을 추가할 것. 빠뜨리면 대시보드와 수집기가 시작 시 `ModuleNotFoundError`로 죽는데, `/_stcore/health`는 200이라 `docker ps`도 정상으로 보인다(2026-10-12 실제로 7분간 그랬다). 배포 후 반드시 앱을 실제로 돌려 볼 것(헤드리스: `streamlit.testing.v1.AppTest.from_file("/app/app.py").run()`으로 예외·탭 목록 확인).
 
 ## 6. 미해결 / 다음에 할 것
