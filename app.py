@@ -3941,7 +3941,10 @@ def _render_dram_contract_outlook() -> None:
     table = contract_outlook.latest_table(forecasts)
     today = dt.datetime.now(om.KST).date()
     cur_q = f"{today.year}Q{(today.month - 1) // 3 + 1}"
-    lo_key = contract_outlook._period_key(contract_outlook._prev_quarter(cur_q))
+    first_q = cur_q
+    for _ in range(3):                       # 현재 분기를 포함해 최근 4분기부터 보여준다(둔화·가속 흐름이 보이도록)
+        first_q = contract_outlook._prev_quarter(first_q)
+    lo_key = contract_outlook._period_key(first_q)
     all_periods = sorted({p for row in table.values() for p in row if p[4] == "Q"}, key=contract_outlook._period_key)
     periods = [p for p in all_periods if contract_outlook._period_key(p) >= lo_key]
     cats = [c for c in contract_outlook.CATEGORIES if c in table]
@@ -3956,6 +3959,8 @@ def _render_dram_contract_outlook() -> None:
     )
     rows = []
     for cat in cats:
+        if not any(table[cat].get(p) for p in periods):
+            continue                         # 표시 기간에 전망이 없는 품목은 줄을 만들지 않는다(원문 이력에는 남아 있다)
         row = {"품목": cat}
         for p in periods:
             cell = table[cat].get(p)
