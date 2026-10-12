@@ -3902,12 +3902,7 @@ def _co_range_text(f: dict) -> str:
     return f"{f['low']:g}%" if f["low"] == f["high"] else f"{f['low']:g}~{f['high']:g}%"
 
 
-_SPOT_SHORT = {
-    "DDR5 16Gb (2Gx8) 4800/5600": "DDR5 16Gb 칩",
-    "DDR4 16Gb (2Gx8) 3200": "DDR4 16Gb 칩",
-    "DDR5 UDIMM 16GB 4800/5600": "DDR5 UDIMM 16GB",
-    "DDR5 RDIMM 32GB 4800/5600": "DDR5 RDIMM 32GB(서버)",
-}
+_SPOT_SHORT = contract_outlook.SPOT_SHORT
 
 
 def _render_spot_vs_contract(table: dict, today: dt.date) -> None:

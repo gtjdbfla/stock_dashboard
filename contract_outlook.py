@@ -326,6 +326,13 @@ SPOT_PROXY = {
     "DDR5 UDIMM 16GB 4800/5600": "범용 DRAM",
     "DDR5 RDIMM 32GB 4800/5600": "서버 DRAM",
 }
+SPOT_SHORT = {
+    "DDR5 16Gb (2Gx8) 4800/5600": "DDR5 16Gb 칩",
+    "DDR4 16Gb (2Gx8) 3200": "DDR4 16Gb 칩",
+    "DDR5 UDIMM 16GB 4800/5600": "DDR5 UDIMM 16GB",
+    "DDR5 RDIMM 32GB 4800/5600": "DDR5 RDIMM 32GB(서버)",
+}
+SPOT_HISTORY_FILE = os.environ.get("DRAM_HISTORY_FILE", "data/dram_spot_history.csv")
 SPOT_MAX_AGE_DAYS = 15          # 분기 경계에서 이만큼 넘게 묵은 값이면 쓰지 않는다(모듈은 사이트가 주 1회 갱신)
 MOMENTUM_THRESHOLD = 1.0        # 최근 4주와 직전 4주 변화율 차이가 이 %p 이상이면 가속/둔화
 
@@ -432,6 +439,50 @@ def rebased_spot(history, since: dt.date) -> dict:
 
 # ── AI 분석 프롬프트용 요약 ─────────────────────────────────────────────────
 
+def _spot_compare_lines(table: dict, today: dt.date) -> list[str]:
+    """현물가 이력과 고정가 전망의 비교를 프롬프트용 줄로. 이력이 없거나 읽기 실패하면 조용히 빈 목록."""
+    try:
+        import pandas as pd
+        if not os.path.exists(SPOT_HISTORY_FILE):
+            return []
+        cmp = compare_spot(pd.read_csv(SPOT_HISTORY_FILE, parse_dates=["날짜"]), table, today)
+    except Exception:
+        return []
+    if not cmp["rows"]:
+        return []
+    done = [p for p in cmp["periods"] if any(r["quarters"][p]["spot_pct"] is not None and not r["quarters"][p]["partial"]
+                                              for r in cmp["rows"])]
+    live = [p for p in cmp["periods"] if any(r["quarters"][p]["partial"] and r["quarters"][p]["spot_pct"] is not None
+                                              for r in cmp["rows"])]
+    lines = []
+    for label, periods in (("완결", done[-1:]), ("진행 중", live[-1:])):
+        for p in periods:
+            bycat: dict[str, list[str]] = {}
+            ranges: dict[str, str] = {}
+            elapsed = None
+            for r in cmp["rows"]:
+                q = r["quarters"][p]
+                if q["spot_pct"] is None:
+                    continue
+                bycat.setdefault(r["category"], []).append(f"{SPOT_SHORT.get(r['item'], r['item'])} {q['spot_pct']:+.1f}%")
+                ranges[r["category"]] = _range_text(q["contract"]) if q["contract"] else "(발표 없음)"
+                elapsed = q["elapsed_days"]
+            if bycat:
+                body = " / ".join(f"{', '.join(v)} (같은 분기 {c} 고정가 전망 {ranges[c]})" for c, v in bycat.items())
+                tail = f", {elapsed}일 경과분이라 분기 전체 전망보다 덜 오른 게 정상" if label == "진행 중" and elapsed else ""
+                lines.append(f"- 현물가 실제 변화 vs 고정가 전망, {p} {label}{tail}: {body}")
+    mom = []
+    for v in cmp["verdicts"]:
+        items = ", ".join(f"{SPOT_SHORT.get(i['item'], i['item'])} {i['label']}({i['recent4']:+.1f}% vs 직전 {i['prior4']:+.1f}%)"
+                          for i in v["items"])
+        pace = v["pace"]
+        same = f" → 고정가 전망({pace['label']})과 같은 방향 {v['match']}/{v['n_items']}" if pace else ""
+        mom.append(f"{v['category']}: {items}{same}")
+    if mom:
+        lines.append("- 현물가 모멘텀(최근 4주 vs 직전 4주, 품목별 — 평균 내지 마라): " + "; ".join(mom))
+    return lines
+
+
 PROMPT_CATEGORIES = ("범용 DRAM", "서버 DRAM", "NAND", "모바일 DRAM", "PC DRAM", "컨슈머 DRAM", "HBM",
                      "클라이언트 SSD", "엔터프라이즈 SSD", "그래픽 DRAM")
 PROMPT_QUARTERS_BACK = 3        # 현재 분기를 포함해 최근 4분기까지 보여준다(둔화·가속 흐름이 보이도록)
@@ -495,6 +546,7 @@ def summary_md(store: dict | None = None) -> str:
            f"가장 최근 발표 {newest})", *lines]
     if idx_parts:
         out.append("- 전망 중간값을 이어 곱한 누적 추정 지수: " + "; ".join(idx_parts))
+    out.extend(_spot_compare_lines(table, today))
     out.append("※ 고정가(계약가)의 실측은 공개되지 않는다. 위는 TrendForce의 **전망**이고 발표마다 바뀐다 — 실제 계약가라고 쓰지 말고 "
                "'전망'임과 발표일을 밝혀라. 서버 DRAM·HBM의 달러 수준은 데이터에 없다. 숫자를 새로 계산하거나 평균 내지 마라.")
     return "\n".join(out)
