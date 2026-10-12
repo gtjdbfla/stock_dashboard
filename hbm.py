@@ -531,6 +531,46 @@ def synthesize(facts: list[dict], quarters: list[dict]) -> dict:
             "cited_line_ratio": round(cited / len(body_lines), 2) if body_lines else 0.0}
 
 
+# ── AI 분석 프롬프트용 요약 ─────────────────────────────────────────────────
+
+# 주제별로 몇 건씩 넣을지. 프롬프트가 길수록 생성이 급격히 느려져서(CONTEXT §4) 전체를 1,800자 안쪽으로 묶는다.
+PROMPT_TOPIC_QUOTA = (("가격", 3), ("수급·생산능력", 2), ("수요", 2), ("점유율·경쟁", 2),
+                      ("제품·로드맵", 1), ("고객·퀄", 1), ("리스크", 2), ("실적·마진", 1))
+PROMPT_WINDOW_DAYS = 75
+_PROMPT_SOURCE = {"micron_remarks": "마이크론", "skhynix_newsroom": "SK하이닉스 뉴스룸(회사 발표)",
+                  "trendforce_research": "TrendForce 리서치", "trendforce_news": "언론 보도 인용"}
+
+
+def summary_md(store: dict | None = None) -> str:
+    """AI 분석 프롬프트에 넣을 HBM 재료. 파일을 읽기만 한다.
+
+    종합 분석 글(LLM이 쓴 글)은 넣지 않고 **검증된 사실을 직접** 넣는다 — AI가 쓴 글을 또 AI가
+    요약하면 오류가 겹친다. 호재/악재 라벨도 AI의 판단이라 뺐다. 원문 인용은 길어서 뺐고 날짜·출처만 남긴다."""
+    store = store if store is not None else load()
+    facts = collect_fact_list(store, balanced=False)
+    if not facts:
+        return ""
+    today = _now().date()
+    recent = [f for f in facts if (today - dt.date.fromisoformat(f["date"])).days <= PROMPT_WINDOW_DAYS] or facts[:12]
+    lines = []
+    for topic, n in PROMPT_TOPIC_QUOTA:
+        cands = [f for f in recent if f["topic"] == topic]       # collect_fact_list가 이미 최신순
+        cands.sort(key=lambda f: f["tier"] == "C")               # 안정 정렬 — 회사·리서치 자료를 보도 인용보다 먼저
+        for f in cands[:n]:
+            src = _PROMPT_SOURCE[f["source"]]
+            lines.append(f"- [{topic}] ({f['date']}, {src}) {f['claim']}")
+    quarters = store.get("micron_quarters", [])
+    micron = _micron_lines(quarters)[-2:] if quarters else []
+    head = (f"(HBM 자료 정리 기준 {store.get('checked_at', '시점 미상')} · 원문 인용이 확인된 사실 {len(facts)}건 중 "
+            f"{len(lines)}건 · 가장 최근 사실 {facts[0]['date']})")
+    out = [head, *lines]
+    if micron:
+        out.append("- [마이크론 실적 — SEC 공시 표에서 직접 읽은 숫자] " + " / ".join(micron))
+    out.append("※ SK하이닉스 자체의 HBM 점유율·가격·매출은 공개 자료에 없다. 위 사실은 업계·경쟁사·고객 쪽 자료이니 "
+               "SK하이닉스에 어떻게 이어지는지는 추론이라고 밝히고, 사실 날짜를 같이 써라.")
+    return "\n".join(out)
+
+
 # ── 수집기 진입점 ───────────────────────────────────────────────────────────
 
 def _pending(store: dict) -> list[tuple[str, dict]]:

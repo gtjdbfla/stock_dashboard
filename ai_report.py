@@ -16,6 +16,7 @@ import pandas as pd
 
 import ai_analysis
 import analyst_digest
+import hbm
 import analyst_targets
 import disclosure
 import financial_digest
@@ -151,6 +152,8 @@ def build_and_save(ticker: str, stock_name: str, use_search: bool = True,
             lambda: build_dram_summary(),
             # 매매 신호·통합 신호·선물 경보 — 탭에는 있는데 여태 프롬프트에는 안 들어가던 값.
             lambda: build_quant_signal_summary(ticker),
+            # HBM 탭이 모은 검증된 사실. 파일에서 읽기만 한다(수집기가 채운다). 비용 없음.
+            lambda: hbm.summary_md(),
         )
         with ThreadPoolExecutor(max_workers=len(_fetch_jobs)) as _pool:
             (news_items, reports_df, trendforce_df, macro_md, sector_news_md,
@@ -159,7 +162,7 @@ def build_and_save(ticker: str, stock_name: str, use_search: bool = True,
              earnings_md, consensus_md, market_state_md, short_sale_md,
              credit_balance_md, foreign_desk_md, analyst_view_md, broker_targets_md,
              disclosure_view_md, financial_view_md,
-             _overheat, _dram, quant_signal_md) = list(_pool.map(_quiet, _fetch_jobs))
+             _overheat, _dram, quant_signal_md, hbm_md) = list(_pool.map(_quiet, _fetch_jobs))
 
         # 실패한 자리에는 _quiet가 ""를 넣는다. 표를 기대하는 쪽은 빈 표로 되돌린다.
         news_items = news_items or []
@@ -273,6 +276,7 @@ def build_and_save(ticker: str, stock_name: str, use_search: bool = True,
             capex_md, early_signal_md, quant_signal_md, recent_price_md, earnings_md, consensus_md,
             market_state_md, short_sale_md, credit_balance_md, foreign_desk_md, analyst_view_md,
             broker_targets_md, disclosure_view_md, financial_view_md,
+            hbm_md=hbm_md,
             _stream_to=stream_to,
         )
 
@@ -294,6 +298,7 @@ def build_and_save(ticker: str, stock_name: str, use_search: bool = True,
             "early_signal": early_signal_md,
             "quant_signal": quant_signal_md,
             "capex": capex_md,
+            "hbm": hbm_md,
             "earnings": earnings_md,
             "consensus": consensus_md,
             "short_sale": short_sale_md,

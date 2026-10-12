@@ -31,6 +31,7 @@ SOURCE_FIELDS = [
     ("가격 과열도 백테스트", "overheat"),
     ("DRAM 현물가", "dram"),
     ("빅테크 분기 Capex", "capex"),
+    ("HBM 펀더멘털 (검증된 사실)", "hbm"),
     ("다가오는 실적 발표", "earnings"),
     ("컨센서스 목표주가 변화", "consensus"),
     ("차입공매도 비중", "short_sale"),
