@@ -87,31 +87,51 @@ REFRESH_FROM = dt.time(18, 30)
 REFRESH_TO = dt.time(23, 0)
 TARGET_DAYS = int(os.environ.get("DAILY_HISTORY_DAYS", "700"))
 
-_last_refresh_date: dt.date | None = None
+# 18:30에 받아도 그날 마감 수급이 아직 안 올라온 날이 많다(수급탐침 실측: 네이버 전 경로가
+# 모이는 건 20:22 안팎) — 그러면 파일이 하루 늦은 채로 다음 날 18:30까지 간다. 그래서
+# 마지막 시도 30분 뒤에도 파일 최신일이 오늘 이전이면 창 안에서 다시 받는다.
+RETRY_MIN = 30
+MAX_ATTEMPTS_PER_DAY = 4         # 평일 휴장일엔 영영 안 올라온다 — 무한 재시도 방지
+
+_last_attempt: dict[str, dt.datetime] = {}
+_attempts: dict[tuple[str, dt.date], int] = {}
+
+
+def _newest(ticker: str) -> dt.date | None:
+    try:
+        df = pd.read_csv(path_for(ticker), parse_dates=["날짜"], usecols=["날짜"])
+        return df["날짜"].max().date() if not df.empty else None
+    except Exception:
+        return None
 
 
 def tick(now: dt.datetime, ticker: str, log=print) -> None:
     """조건이 맞을 때만 네이버에서 받아 파일을 갱신한다. 아니면 즉시 돌아간다."""
-    global _last_refresh_date
-    if _last_refresh_date == now.date():
+    last = _last_attempt.get(ticker)
+    if last is not None and (now - last) < dt.timedelta(minutes=RETRY_MIN):
         return
 
     first_build = load(ticker, TARGET_DAYS) is None
     in_window = now.weekday() < 5 and REFRESH_FROM <= now.time() <= REFRESH_TO
     if not (first_build or in_window):
         return
+    # 창 안인데 오늘치까지 이미 받았으면 끝. (최초 생성이면 무조건 받는다.)
+    if not first_build and _newest(ticker) == now.date():
+        return
 
-    _last_refresh_date = now.date()
+    if _attempts.get((ticker, now.date()), 0) >= MAX_ATTEMPTS_PER_DAY and not first_build:
+        return
+    _last_attempt[ticker] = now
+    _attempts[(ticker, now.date())] = _attempts.get((ticker, now.date()), 0) + 1
     # ai_inputs가 이 모듈을 import하므로 여기서 늦게 부른다(순환 방지).
     import ai_inputs
     try:
         fresh = ai_inputs._fetch_backtest_history_web(ticker, TARGET_DAYS)
     except Exception as exc:
-        _last_refresh_date = None       # 실패는 오늘 안에 다시 시도할 수 있게 둔다
-        log(f"[일별이력] 받기 실패: {type(exc).__name__}: {exc}")
+        log(f"[일별이력] {ticker} 받기 실패: {type(exc).__name__}: {exc}")
         return
     save(ticker, fresh)
-    log(f"[일별이력] {'최초 생성' if first_build else '갱신'} — {status(ticker)}")
+    log(f"[일별이력] {ticker} {'최초 생성' if first_build else '갱신'} — {status(ticker)}")
 
 
 def status(ticker: str) -> str:

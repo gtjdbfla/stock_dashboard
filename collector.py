@@ -168,10 +168,12 @@ def main() -> None:
 
         # 일별 시세·수급 이력 파일. 화면이 700일 백테스트를 볼 때 네이버 35페이지를
         # 받지 않고 이 파일을 읽게 한다(콜드 로드에서 5~7초짜리 한 덩어리였다).
-        try:
-            daily_history.tick(now, DIGEST_TICKER, log=log)
-        except Exception as exc:
-            log(f"일별이력 오류: {type(exc).__name__}: {exc}")
+        # 삼성전자도 같이 쌓는다 — 안 쌓으면 삼성전자 화면을 볼 때마다 네트워크로 간다.
+        for hist_ticker in (DIGEST_TICKER, "005930"):
+            try:
+                daily_history.tick(now, hist_ticker, log=log)
+            except Exception as exc:
+                log(f"일별이력 오류({hist_ticker}): {type(exc).__name__}: {exc}")
 
         # 코스피200 선물 외국인 순매수 이력 파일. 옛 소스가 통째로 없어져서(HTTP 410)
         # 하루치씩만 주는 새 API로 갈아탔다 - 파일이 없는 최초 1회는 700일을 하루씩
