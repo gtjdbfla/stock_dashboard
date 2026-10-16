@@ -2924,13 +2924,16 @@ def _render_tab_overheat():
             st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
                        "결과가 21년·10년 기준과 다를 수 있습니다.]")
         rep = _render_overheat_situation(hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
-        overheat_hist = hist_full.tail(2520).reset_index(drop=True)      # 괴리율 구간 분석은 최근 10년
+        # 괴리율 구간 분석도 위 '분석 기간' 선택을 따른다(둘이 다른 표본을 보면 숫자가 어긋난다).
+        recent_only = str(st.session_state.get("overheat_situation_period", "")).startswith("최근")
+        period_label = "최근 10년" if recent_only else "전체 약 21년"
+        overheat_hist = (hist_full.tail(2520) if recent_only else hist_full).reset_index(drop=True)
 
         st.divider()
         _subheader_with_help(
             "이동평균 괴리율 구간 분석 (경향성 약함)",
             "괴리율 구간별로 하락·상승 확률과 이후 평균 수익을 봅니다. 위에서 말했듯 괴리율은 U자형이라 '높을수록 하락 확률 증가'가 "
-            "성립하지 않습니다. 구간은 점-시점 분위로 판정한 최근 10년 결과입니다.",
+            "성립하지 않습니다. 구간은 점-시점 분위로 판정했고, 위의 '분석 기간' 선택을 따릅니다.",
             key="overheat_dev",
         )
         overheat_results, overheat_results_low = _cached_overheat_results(
@@ -2965,7 +2968,7 @@ def _render_tab_overheat():
             )
             st.caption(
                 f"현재 괴리율 {current_deviation:+.1%} — {current_regime_label}"
-                + (f" (최근 10년 분포의 {current_rank * 100:.0f}백분위)" if current_rank is not None else "")
+                + (f" ({period_label} 분포의 {current_rank * 100:.0f}백분위)" if current_rank is not None else "")
                 + f" · 표본 {overheat_result['n']:,}일 · 기저 하락 확률 {overheat_result['base_rate']:.1%} · 기저 상승 확률 {overheat_result['base_up_rate']:.1%}"
             )
 
