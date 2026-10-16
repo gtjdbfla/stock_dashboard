@@ -2732,13 +2732,18 @@ def _render_tab_supply():
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
 # 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
 @st.cache_data(ttl=900, show_spinner=False)
-def _cached_overheat_results(hist: pd.DataFrame, ma: int, horizon: int, thr: float) -> tuple[dict, dict]:
-    """점-시점 분위 + 순열검정이라 8번 합쳐 1초쯤 걸린다. 같은 이력·조건이면 15분간 재사용한다."""
-    high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="high")
-            for q in OVERHEAT_QUANTILES}
-    low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="low")
-           for q in OVERHEAT_QUANTILES}
+def _cached_overheat_results(hist: pd.DataFrame, ma: int, horizon: int, thr: float, pit: bool) -> tuple[dict, dict]:
+    """순열검정이라 8번 합쳐 1초쯤 걸린다. 같은 이력·조건이면 15분간 재사용한다."""
+    high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="high",
+                                           point_in_time=pit) for q in OVERHEAT_QUANTILES}
+    low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="low",
+                                          point_in_time=pit) for q in OVERHEAT_QUANTILES}
     return high, low
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_dev_robustness(hist: pd.DataFrame, ma: int, horizon: int, thr: float) -> pd.DataFrame:
+    return signal_lab.deviation_robustness(hist, ma_window=ma, horizon=horizon, thr=thr)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -2790,8 +2795,9 @@ def _cached_risk_report(hist: pd.DataFrame, sox: pd.DataFrame) -> dict:
 
 def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon: int, thr: float) -> dict | None:
     """'지금 상황': 상승 확률(기관 수급)·변동성(위험 크기)·괴리율. 하락 확률 지표는 매도 근거로 약해 상세 expander로 내렸다."""
-    years_opt = st.radio("분석 기간", ["전체 (약 21년)", "최근 10년"], horizontal=True, key="overheat_situation_period",
-                         help="길수록 표본이 많아 확률이 안정적입니다. 10년으로 줄여도 방향은 같지만 지표 순위가 조금 바뀝니다.")
+    years_opt = st.radio("분석 기간", ["전체 (약 21년)", "최근 10년"], index=1, horizontal=True, key="overheat_situation_period",
+                         help="기본은 최근 10년입니다. 괴리율 그래프의 정비례는 2016년 이후에서 성립하고 2005~2015년을 포함하면 깨집니다"
+                              "(아래 '기간을 바꿔 보면' 표). 전체로 늘리면 표본이 많아 확률은 안정적이지만 시대가 섞입니다.")
     hist_c = signal_lab.drop_incomplete_last_row(hist_full)
     if years_opt.startswith("최근"):
         hist_c = hist_c.tail(2520)
@@ -2818,7 +2824,7 @@ def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon:
         c2.caption(f"하락 {row['하락']:.0%} · 상승 {row['상승']:.0%} (방향 없음)")
     cur_dev = hist_full["종가"].iloc[-1] / hist_full["종가"].rolling(ma_window).mean().iloc[-1] - 1
     c3.metric(f"현재 괴리율 ({ma_window}일선, 장중 포함)", f"{cur_dev:+.1%}",
-              help="마지막 종가(장중이면 현재가) 기준입니다. 괴리율은 U자형이라 높고 낮음이 방향을 알려주지 않습니다.")
+              help="마지막 종가(장중이면 현재가) 기준입니다. 괴리율 구간별 하락 확률은 아래 '이동평균 괴리율 구간 분석'에서 봅니다.")
     st.caption(
         "하락 확률 카드는 뺐습니다: 수급 과열 점수가 높은 날 팔아도 이후 10일 평균 수익이 +0.6%(전체 +1.3%)로 안 떨어졌고 "
         "차이도 유의하지 않았습니다(p=0.19). 상승 확률은 확률이 평균보다 몇 %p 높은 수준이라 확정적 신호가 아닙니다."
@@ -2831,7 +2837,7 @@ def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon:
             cur = tbl[tbl["분위"] == d["bucket"]].iloc[0] if d["bucket"] else None
             note = "" if d["directional"] else "방향 없음 — 하락·상승 둘 다 커짐"
             if d["key"] == "dev":
-                note = "U자형 — 양 끝에서 하락·상승 모두 커짐"
+                note = "최근 10년은 정비례, 21년으로 늘리면 U자형"
             if d["key"] == "flow_heat":
                 note = "하락과 경향은 뚜렷하나 매도 성과는 미미(위 설명)"
             rows.append({
@@ -2999,7 +3005,8 @@ def _render_tab_overheat():
         "이후 하락·상승이 실제로 얼마나 있었는지의 비율입니다.\n\n"
         "**무엇이 남았나**(SK하이닉스 21년·10년 검증): 기관이 20일간 사 모으는 중이면 상승 확률이 높았고 신호 다음 날 매수한 수익도 "
         "전체 평균보다 높았습니다. 반면 **하락 확률 쪽은 매도 근거로 약했습니다** — 개인 매수 과열·수급 과열 점수가 높은 날 팔아도 이후 평균 수익이 "
-        "마이너스로 돌아서지 않았습니다(p=0.19). **이동평균 괴리율은 U자형**이라 높다고 떨어지는 게 아니라 변동폭이 커질 뿐입니다. "
+        "마이너스로 돌아서지 않았습니다(p=0.19). **이동평균 괴리율**은 최근 10년에서는 클수록 하락 확률이 늘어나는 정비례를 보이지만 "
+        "(독립 사건이 적고 2005~2015년엔 반대) 상승 확률도 같이 커집니다. "
         "외국인 보유율(수준·변화)은 검증했지만 예측력이 약해 뺐습니다.\n\n"
         "**점-시점 분위**: 각 날짜의 위치는 그날 이전 분포만으로 정합니다(전체 분포를 쓰면 미래 정보가 섞여 효과가 부풀려집니다). "
         "p값은 신호 군집을 보존한 정확 순열검정이며, 연속한 날짜를 독립 표본으로 세는 z검정은 p를 크게 과소평가해 쓰지 않습니다.\n\n"
@@ -3048,13 +3055,24 @@ def _render_tab_overheat():
 
         st.divider()
         _subheader_with_help(
-            "이동평균 괴리율 구간 분석 (경향성 약함)",
-            "괴리율 구간별로 하락·상승 확률과 이후 평균 수익을 봅니다. 위에서 말했듯 괴리율은 U자형이라 '높을수록 하락 확률 증가'가 "
-            "성립하지 않습니다. 구간은 점-시점 분위로 판정했고, 위의 '분석 기간' 선택을 따릅니다.",
+            "이동평균 괴리율 구간 분석",
+            "괴리율을 8개 구간(하위 5·10·15·20%, 상위 20·15·10·5%)으로 나누고 구간별 하락·상승 확률과 이후 평균 수익을 봅니다. "
+            "예전 탭의 그래프와 같은 방식입니다.\n\n"
+            "**최근 10년에서는 괴리율이 클수록 하락 확률이 늘어나는 정비례가 나옵니다**(하위 5% 6.6% → 상위 5% 33.6%). 700일 때 보였던 "
+            "정비례(3% → 63%)가 분석 기간을 5년·7년·10년으로 늘려도 유지됩니다. 다만 ① 기간이 길수록 기울기가 완만해지고(상위 5%: 63% → 49% → "
+            "42% → 33%) ② **독립 사건이 적어** 통계적 근거가 약하며(상위 5% 구간은 700일에서 2번, 10년에서 9번 나타난 사건) ③ "
+            "**2016년 이전을 포함하면 깨집니다** — 15년에서는 약해지고 21년에서는 U자형이 됩니다(2008년 위기 때 괴리율이 낮을수록 더 크게 하락). "
+            "어느 기간까지 성립하는지는 아래 '기간을 바꿔 보면'에서 확인하세요.\n\n"
+            "**읽을 때 주의**: 기본 방식(전체 분포)은 구간 경계를 선택한 기간 전체의 분포로 정해 미래 정보가 섞인 낙관적 방식입니다. "
+            "'점-시점(엄격)'으로 바꾸면 그날까지의 분포만 써서 상위 구간의 정비례가 거의 사라집니다(상위 5% 21% vs 나머지 18%). "
+            "p값은 하락 가설(상위=더 많이, 하위=더 적게)의 단측 순열검정입니다. 상승 확률도 같이 커지므로 매도 신호가 아닙니다.",
             key="overheat_dev",
         )
+        boundary = st.radio("구간 경계 방식", ["전체 분포 (옛 방식, 기본)", "점-시점 (엄격: 그날까지의 분포만)"], index=0,
+                            horizontal=True, key="overheat_boundary_mode")
+        use_pit = boundary.startswith("점-시점")
         overheat_results, overheat_results_low = _cached_overheat_results(
-            overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+            overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD, use_pit)
         overheat_result = overheat_results[OVERHEAT_QUANTILES[0]]
         if overheat_result["n"] < 30:
             st.warning("백테스트에 충분한 표본이 없습니다.")
@@ -3094,6 +3112,7 @@ def _render_tab_overheat():
                     "과열 구간": label,
                     "괴리율": r["hi_cutoff"],
                     "표본 수": r["hi_n"],
+                    "독립 사건": r["hi_events"],
                     "하락 확률": r["hi_rate"],
                     "p-value(하락)": r["p_value"],
                     "상승 확률": r["hi_up_rate"],
@@ -3112,8 +3131,8 @@ def _render_tab_overheat():
             fig_breakdown.add_trace(go.Scatter(
                 x=breakdown_df["괴리율"], y=breakdown_df["하락 확률"], name="하락 확률",
                 mode="lines+markers", line=dict(color="#d62728"), marker=dict(size=8),
-                customdata=breakdown_df[["과열 구간", "표본 수", "p-value(하락)"]],
-                hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · p-value %{customdata[2]:.2f}<extra></extra>",
+                customdata=breakdown_df[["과열 구간", "표본 수", "p-value(하락)", "독립 사건"]],
+                hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · 독립 사건 %{customdata[3]}번 · p-value %{customdata[2]:.2f}<extra></extra>",
             ))
             fig_breakdown.add_trace(go.Scatter(
                 x=breakdown_df["괴리율"], y=breakdown_df["상승 확률"], name="상승 확률",
@@ -3136,17 +3155,35 @@ def _render_tab_overheat():
                 )
             fig_breakdown.update_xaxes(title_text="괴리율 경계", tickformat=".0%")
             fig_breakdown.update_yaxes(title_text=f"{OVERHEAT_HORIZON}거래일 내 확률", tickformat=".0%")
-            _style_chart_mobile(fig_breakdown, title="괴리율 구간별 하락·상승 확률 (양끝에서 둘 다 커지면 변동폭 확대)")
+            _style_chart_mobile(fig_breakdown, title=f"괴리율 구간별 하락·상승 확률 ({period_label}, {'점-시점' if use_pit else '전체 분포'} 경계)")
             st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config=PLOTLY_CONFIG)
 
             shown = breakdown_df.copy()
             shown["괴리율"] = shown["괴리율"].map(lambda v: f"{v:+.1%}")
             shown["표본 수"] = shown["표본 수"].map(lambda v: f"{v:,}일")
+            shown["독립 사건"] = shown["독립 사건"].map(lambda v: f"{v}번")
             shown["하락 확률"] = shown["하락 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
             shown["상승 확률"] = shown["상승 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
             shown["p-value(하락)"] = shown["p-value(하락)"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
             shown[ret_col] = shown[ret_col].map(lambda v: f"{v:+.1%}" if pd.notna(v) else "N/A")
             st.dataframe(shown, hide_index=True, width="stretch")
+            st.caption("독립 사건 = 그 구간이 5거래일 넘게 끊겨 따로 나타난 횟수. 표본 수(일)가 아니라 이 숫자가 실제 근거의 개수입니다. "
+                       "p-value(하락)는 순열검정 단측: 상위=하락이 더 많다 / 하위=하락이 더 적다는 가설.")
+            with st.expander("기간을 바꿔 보면 — 이 정비례는 어디까지 성립하나"):
+                rb = _cached_dev_robustness(hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+                if rb.empty:
+                    st.caption("계산할 이력이 부족합니다.")
+                else:
+                    fmt = rb.copy()
+                    for c in ["기저 하락", "하위5%", "하위10%", "하위15%", "하위20%", "상위20%", "상위15%", "상위10%", "상위5%"]:
+                        fmt[c] = fmt[c].map(lambda v: f"{v:.0%}")
+                    fmt["순위상관"] = fmt["순위상관"].map(lambda v: f"{v:+.2f}")
+                    fmt["상위5% 독립사건"] = fmt["상위5% 독립사건"].map(lambda v: f"{v}번")
+                    st.dataframe(fmt, hide_index=True, width="stretch")
+                    st.caption("각 줄은 그 기간 안에서 구간 경계를 다시 정해 8구간 하락 확률을 구한 것이고, 순위상관 +1.00은 괴리율이 클수록 하락 확률이 "
+                               "빠짐없이 늘어났다는 뜻입니다. 최근 700일~10년은 +1.00으로 유지되지만 2005~2015년에는 음수입니다(위기 때 괴리율이 낮을수록 "
+                               "더 크게 하락). 2016~2020년과 2021~2026년을 따로 보면 둘 다 양수이고, 2016~2020년 경계를 2021~2026년에 그대로 적용해도 "
+                               "하위5% 8% · 하위10% 13% · 나머지 20% · 상위10% 23% · 상위5% 25%로 이어졌습니다. 즉 2016년 이후에 한해 성립한 규칙입니다.")
 
             overheat_hist_ma = overheat_hist.copy()
             overheat_hist_ma["MA"] = overheat_hist_ma["종가"].rolling(OVERHEAT_MA_WINDOW).mean()

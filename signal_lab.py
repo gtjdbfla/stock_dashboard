@@ -225,10 +225,14 @@ def early_signal_report(hist: pd.DataFrame, horizon: int = HORIZON, thr: float =
 
 def run_overheat_pit(df: pd.DataFrame, price_col: str, ma_window: int, horizon: int,
                      quantile: float = 0.2, drawdown_threshold: float = 0.05,
-                     gain_threshold: float | None = None, side: str = "high") -> dict:
-    """ai_inputs.run_overheat_backtest와 같은 키를 돌려주되 **점-시점 분위 + 순열 p값**을 쓴다.
+                     gain_threshold: float | None = None, side: str = "high",
+                     point_in_time: bool = True) -> dict:
+    """ai_inputs.run_overheat_backtest와 같은 키를 돌려주되 **순열 p값**을 쓴다(구간 경계는 두 가지 방식).
 
-    - 각 날짜가 상위(하위) quantile 구간인지는 그날 이전 과거 분포만으로 판정한다.
+    - point_in_time=True(엄격): 각 날짜가 상위(하위) quantile 구간인지는 그날 이전 과거 분포만으로 판정한다.
+    - point_in_time=False(옛 탭 방식): 주어진 이력 전체의 분포로 경계를 한 번 정한다. 미래 분포가 섞여 낙관적이지만,
+      "괴리율이 클수록 하락 확률이 늘어난다"는 정비례 그래프는 이 방식에서 최근 10년에 성립했다(2005~2015엔 반대).
+    - p값은 추세 방향 가설의 단측 검정이다: 상위(과열)는 하락이 더 많다, 하위(침체)는 하락이 더 적다.
     - hi_cutoff는 화면의 '현재 기준 경계'(전체 이력 분포)로, 오늘 어느 구간인지 보여주는 용도다.
     - 상승 확률과 이후 horizon일 평균수익도 같이 돌려준다. 과열 구간은 하락 확률만이 아니라
       상승 확률과 평균수익도 같이 높았다(10년: 상승 60~64% vs 30%, 평균수익 +6.5% vs +2.1%).
@@ -243,7 +247,7 @@ def run_overheat_pit(df: pd.DataFrame, price_col: str, ma_window: int, horizon: 
         "hi_n": 0, "rest_n": 0, "hi_rate": None, "rest_rate": None, "base_rate": None, "p_value": None,
         "hi_up_rate": None, "rest_up_rate": None, "base_up_rate": None, "up_p_value": None,
         "hi_ret": None, "rest_ret": None, "hi_cutoff": None, "current_deviation": None,
-        "current_regime": None, "point_in_time": True,
+        "current_regime": None, "point_in_time": point_in_time, "hi_events": 0,
     }
     dev_all = dev.dropna()
     if len(dev_all):
@@ -251,9 +255,14 @@ def run_overheat_pit(df: pd.DataFrame, price_col: str, ma_window: int, horizon: 
         result["hi_cutoff"] = float(dev_all.quantile(1 - quantile if side == "high" else quantile))
 
     q_cut = 1 - quantile if side == "high" else quantile
-    cut = dev.expanding(min_periods=MIN_PIT).quantile(q_cut).shift(1).to_numpy()
     dv = dev.to_numpy()
-    valid = ~np.isnan(cut) & ~np.isnan(dv) & ~np.isnan(dd)
+    if point_in_time:
+        cut = dev.expanding(min_periods=MIN_PIT).quantile(q_cut).shift(1).to_numpy()
+        valid = ~np.isnan(cut) & ~np.isnan(dv) & ~np.isnan(dd)
+    else:
+        known = ~np.isnan(dv) & ~np.isnan(dd)
+        cut = np.full(len(dv), np.quantile(dv[known], q_cut) if known.sum() else np.nan)
+        valid = known
     result["n"] = int(valid.sum())
     if result["n"] < 30:
         return result
@@ -263,6 +272,7 @@ def run_overheat_pit(df: pd.DataFrame, price_col: str, ma_window: int, horizon: 
     down = (dd <= -drawdown_threshold).astype(float)
     gain = (up >= gain_threshold).astype(float)
     result["hi_n"], result["rest_n"] = int(grp.sum()), int(rest.sum())
+    result["hi_events"] = episodes(grp)
     if grp.sum() == 0 or rest.sum() == 0:
         return result
     result["hi_rate"], result["rest_rate"] = float(down[grp].mean()), float(down[rest].mean())
@@ -271,7 +281,7 @@ def run_overheat_pit(df: pd.DataFrame, price_col: str, ma_window: int, horizon: 
     result["base_up_rate"] = float(gain[valid].mean())
     result["hi_ret"], result["rest_ret"] = float(ret[grp].mean()), float(ret[rest].mean())
     ylab = np.where(valid, down, np.nan)
-    _, result["p_value"] = perm_p(grp, ylab, horizon, expect="greater")
+    _, result["p_value"] = perm_p(grp, ylab, horizon, expect="greater" if side == "high" else "less")
     ylab = np.where(valid, gain, np.nan)
     _, result["up_p_value"] = perm_p(grp, ylab, horizon, expect="greater")
     cdev = result["current_deviation"]
@@ -682,3 +692,53 @@ def risk_rules_report(hist: pd.DataFrame, sox: pd.DataFrame | None, start="2006-
                 "info": {k: (float(v[-1]) if len(v) and not np.isnan(v[-1]) else None) for k, v in rw["info"].items()},
                 "weights": rw["weights"]})
     return out
+
+
+def deviation_robustness(hist: pd.DataFrame, ma_window: int = 80, horizon: int = 10, thr: float = 0.07) -> pd.DataFrame:
+    """옛 괴리율 그래프(8구간, 구간 경계는 그 기간 안의 분포)를 분석 기간·시대별로 다시 그려 정비례가 어디서 성립하는지 본다.
+
+    순위상관 = 8개 구간을 괴리율 경계 순으로 놓고 하락 확률과의 스피어만 상관(+1 = 완전 정비례).
+    독립사건 = 상위 5% 구간이 며칠 간격으로 몇 번 나뉘어 나타났는지(표본 수가 아니라 이 숫자가 실제 근거의 수).
+    """
+    from scipy.stats import spearmanr
+    h = hist.sort_values("날짜").reset_index(drop=True)
+    price = h["종가"].astype(float)
+    dev = (price / price.rolling(ma_window).mean() - 1).to_numpy()
+    dd, _, _ = forward_stats(price, horizon)
+    down = np.where(np.isnan(dd), np.nan, (dd <= -thr).astype(float))
+    yrs = pd.to_datetime(h["날짜"]).dt.year.to_numpy()
+    n = len(h)
+
+    def one(sel_idx):
+        v = sel_idx[~np.isnan(dev[sel_idx]) & ~np.isnan(down[sel_idx])]
+        if len(v) < 300:
+            return None
+        dv = dev[v]
+        rates, ev = [], 0
+        for q in (0.05, 0.10, 0.15, 0.20):
+            rates.append((np.quantile(dv, q), float(down[v][dv <= np.quantile(dv, q)].mean())))
+        for q in (0.20, 0.15, 0.10, 0.05):
+            c = np.quantile(dv, 1 - q)
+            m = dv >= c
+            rates.append((c, float(down[v][m].mean())))
+            if q == 0.05:
+                mask = np.zeros(n, bool); mask[v[m]] = True; ev = episodes(mask)
+        rates.sort(key=lambda t: t[0])
+        r = [t[1] for t in rates]
+        return r, float(spearmanr(np.arange(8), r)[0]), float(np.nanmean(down[v])), ev
+
+    rows = []
+    specs = [("최근 700일 (옛 탭)", np.arange(max(0, n - 700), n)), ("최근 5년", np.arange(max(0, n - 1260), n)),
+             ("최근 7년", np.arange(max(0, n - 1760), n)), ("최근 10년", np.arange(max(0, n - 2520), n)),
+             ("최근 15년", np.arange(max(0, n - 3780), n)), ("전체", np.arange(n))]
+    for a, b in ((2005, 2010), (2011, 2015), (2016, 2020), (2021, 2026)):
+        specs.append((f"{a}~{b}", np.flatnonzero((yrs >= a) & (yrs <= b))))
+    for label, idx in specs:
+        res = one(idx)
+        if res is None:
+            continue
+        r, rho, base, ev = res
+        d0 = pd.Timestamp(h["날짜"].iloc[idx[0]]).date()
+        rows.append({"기간": label, "시작": d0, "기저 하락": base, "하위5%": r[0], "하위10%": r[1], "하위15%": r[2], "하위20%": r[3],
+                     "상위20%": r[4], "상위15%": r[5], "상위10%": r[6], "상위5%": r[7], "순위상관": rho, "상위5% 독립사건": ev})
+    return pd.DataFrame(rows)

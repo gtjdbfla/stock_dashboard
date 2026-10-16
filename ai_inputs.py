@@ -3432,7 +3432,7 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
         return "가격 과열도 백테스트 미실행 (과거 데이터 부족)"
     situation = ""
     try:
-        sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist), ma_window=ma, horizon=horizon, thr=threshold)
+        sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist).tail(2520), ma_window=ma, horizon=horizon, thr=threshold)
         if sit.get("ok"):
             hu = sit.get("headline_up")
             parts_s = []
@@ -3465,7 +3465,8 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
         except Exception:
             rules_txt = ""
     situation = situation + rules_txt
-    kw = dict(drawdown_threshold=threshold)
+    hist = hist.tail(2520)                 # 화면 기본과 같은 최근 10년
+    kw = dict(drawdown_threshold=threshold, point_in_time=False)
     high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="high", **kw) for q in OVERHEAT_QUANTILES}
     low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="low", **kw) for q in OVERHEAT_QUANTILES}
     result = high[OVERHEAT_QUANTILES[0]]
@@ -3491,18 +3492,19 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
             return f"{tag}: N/A"
         p = "" if r["p_value"] is None else f", 하락 p={r['p_value']:.2f}"
         return (f"{tag}: 하락 {r['hi_rate']:.0%}·상승 {r['hi_up_rate']:.0%}·"
-                f"이후 {horizon}일 평균수익 {r['hi_ret']:+.1%}{p}")
+                f"이후 {horizon}일 평균수익 {r['hi_ret']:+.1%}·독립 사건 {r['hi_events']}번{p}")
 
     parts = [part(f"하위 {q:.0%}", low[q]) for q in sorted(OVERHEAT_QUANTILES)]
     parts += [part(f"상위 {q:.0%}", high[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)]
     return (
         situation
-        + f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, 점-시점 분위: 각 날짜의 구간을 그날까지의 과거 "
-        f"분포로만 판정): 전체 기준 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률 {result['base_rate']:.1%}, "
+        + f"가격 과열도 백테스트({ma}일선 괴리율, 최근 10년 표본 {result['n']}일, 구간 경계는 그 기간 전체 분포로 정함): "
+        f"전체 기준 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률 {result['base_rate']:.1%}, "
         f"상승 확률 {result['base_up_rate']:.1%}. 구간별 — {'; '.join(parts)}. "
-        + ("해석(SK하이닉스 10년·21년 검증): 상위(과열) 구간은 하락 확률 차이가 유의하지 않고 상승 확률과 이후 평균수익이 "
-           "오히려 높았다 — 변동폭 확대이지 하락 방향 신호가 아니다. 하위(침체) 구간은 상승 확률이 높고 하락 확률은 "
-           "기간에 따라 높거나 낮았다(하락장 지속과 반등이 섞임). "
+        + ("해석(SK하이닉스): 최근 10년에서는 괴리율이 클수록 하락 확률이 늘고 낮을수록 줄어드는 정비례를 보였다. 그러나 독립 사건이 "
+           "적고(상위 5%는 9번), 구간 경계를 그 기간 전체 분포로 정해 낙관적이며(점-시점 경계로 보면 상위 구간 효과가 거의 사라짐), "
+           "2005~2015년에는 반대였고(2008년 위기 때 괴리율이 낮을수록 더 크게 하락), 과열 구간은 상승 확률·이후 평균수익도 높아 "
+           "매도 신호가 아니다. "
            if ticker == DEFAULT_TICKER else
            "해석: 구간별 수치를 있는 그대로 읽되 '과열이면 하락'으로 단정하지 마라(하락 확률 차이의 유의성은 p 표기). ")
         + f"현재 상태: {label}"
