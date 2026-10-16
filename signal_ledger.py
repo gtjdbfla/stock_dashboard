@@ -129,3 +129,38 @@ def evaluate(led: pd.DataFrame, cost: float = sl.RISK_COST) -> dict:
     out["ok"] = out["buy_hold"] is not None
     out["judgeable"] = len(led) >= MIN_DAYS_TO_JUDGE
     return out
+
+
+# ── 괴리율 구간별 이후 결과(사전 등록) ───────────────────────────────────────────
+# 옛 괴리율 그래프("괴리율이 클수록 하락 확률이 늘어난다")는 과거 10년에서만 정비례였고 독립 사건이 9~15번뿐이라,
+# 장부에 기록되는 괴리율(80일선)로 앞으로 실제로 이어지는지 본다. 구간·기간·기준은 여기서 고정하고 바꾸지 않는다.
+DEV_EDGES = [-9.0, -0.10, 0.0, 0.10, 0.20, 0.30, 9.0]
+DEV_LABELS = ["-10% 미만", "-10~0%", "0~10%", "10~20%", "20~30%", "30% 이상"]
+DEV_HORIZON = 15
+DEV_THR = 0.10
+DEV_MIN_PER_BIN = 20
+
+
+def bin_outcomes(price, dev, horizon: int = DEV_HORIZON, thr: float = DEV_THR) -> pd.DataFrame:
+    """고정 괴리율 구간별로, 이후 horizon거래일 안에 -thr 이하 하락 / +thr 이상 상승한 비율과 마지막 날 평균 수익.
+    결과가 확정된 날(뒤에 horizon일이 더 있는 날)만 센다."""
+    price = np.asarray(price, float)
+    dev = np.asarray(dev, float)
+    dd, up, ret = sl.forward_stats(price, horizon)
+    known = ~np.isnan(dd) & ~np.isnan(dev)
+    rows = []
+    for i, lab in enumerate(DEV_LABELS):
+        m = known & (dev >= DEV_EDGES[i]) & (dev < DEV_EDGES[i + 1])
+        n = int(m.sum())
+        rows.append({"구간": lab, "n": n,
+                     "하락": float((dd[m] <= -thr).mean()) if n else None,
+                     "상승": float((up[m] >= thr).mean()) if n else None,
+                     "평균수익": float(ret[m].mean()) if n else None})
+    return pd.DataFrame(rows)
+
+
+def deviation_table(led: pd.DataFrame) -> pd.DataFrame:
+    """장부에 기록된 종가·괴리율(80일선)만으로 구간별 결과를 센다."""
+    if len(led) < 2:
+        return bin_outcomes([], [])
+    return bin_outcomes(led["종가"].astype(float).to_numpy(), led["괴리율80"].astype(float).to_numpy())

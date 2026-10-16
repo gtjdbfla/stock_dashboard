@@ -2946,14 +2946,54 @@ def _render_risk_rules_section(hist_full: pd.DataFrame) -> None:
     st.caption("샤프·최대낙폭은 위 가정(다음 날 종가 체결, 편도 0.15%)의 과거 결과이며 미래를 보장하지 않습니다.")
 
 
-def _render_ledger_section() -> None:
+def _render_ledger_deviation(led: pd.DataFrame, hist_full: pd.DataFrame) -> None:
+    """장부에 기록된 괴리율(80일선) 구간별로 이후 15거래일 결과를 센다 — 옛 괴리율 그래프를 표본외로 검증하는 표."""
+    st.markdown("**괴리율 구간별 이후 결과 — 장부 기록 vs 과거 10년**")
+    st.caption(
+        f"구간(고정): {' · '.join(signal_ledger.DEV_LABELS)}. 결과 = 기록한 날부터 {signal_ledger.DEV_HORIZON}거래일 안에 "
+        f"종가가 -{signal_ledger.DEV_THR:.0%} 이하로 내려간 비율(하락) / +{signal_ledger.DEV_THR:.0%} 이상 오른 비율(상승). "
+        "뒤에 15거래일이 더 쌓인 기록만 셉니다. 구간과 기준은 바꾸지 않습니다(바꾸면 사후 선택이 됩니다)."
+    )
+    p = hist_full["종가"].astype(float).reset_index(drop=True)
+    dev_hist = (p / p.rolling(80).mean() - 1).to_numpy()[-2520:]
+    hist_tbl = signal_ledger.bin_outcomes(p.to_numpy()[-2520:], dev_hist)
+    led_tbl = signal_ledger.deviation_table(led) if not led.empty else signal_ledger.bin_outcomes([], [])
+    mn = signal_ledger.DEV_MIN_PER_BIN
+
+    def cell(n, v):
+        return "-" if (n < mn or v is None) else f"{v:.0%}"
+
+    rows = []
+    for i in range(len(led_tbl)):
+        a, b = led_tbl.iloc[i], hist_tbl.iloc[i]
+        rows.append({"괴리율 구간": a["구간"],
+                     "장부: 확정 기록": f"{int(a['n'])}일", "장부: 하락": cell(int(a["n"]), a["하락"]), "장부: 상승": cell(int(a["n"]), a["상승"]),
+                     "과거 10년: 일수": f"{int(b['n']):,}일", "과거 10년: 하락": cell(int(b["n"]), b["하락"]), "과거 10년: 상승": cell(int(b["n"]), b["상승"])})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    resolved = int(led_tbl["n"].sum())
+    enough = led_tbl[led_tbl["n"] >= mn]
+    if resolved == 0:
+        st.caption("아직 결과가 확정된 기록이 없습니다 — 첫 기록 후 15거래일이 지나야 첫 칸이 채워집니다. 구간당 "
+                   f"{mn}일 이상 쌓여야 비율을 표시합니다.")
+    elif len(enough) < 3:
+        st.caption(f"결과가 확정된 기록 {resolved}일 — 구간당 {mn}일 이상인 구간이 {len(enough)}개뿐이라 정비례 여부는 판단하지 않습니다.")
+    else:
+        from scipy.stats import spearmanr
+        rho = spearmanr(np.arange(len(enough)), enough["하락"])[0]
+        st.caption(f"{len(enough)}개 구간 기준 괴리율↑ vs 하락 확률 순위상관 {rho:+.2f} (참고). 구간 수가 적고 같은 시기의 기록이 겹쳐 있어 "
+                   f"{signal_ledger.MIN_DAYS_TO_JUDGE}거래일 전에는 우열 판단에 쓰지 마세요.")
+
+
+def _render_ledger_section(hist_full: pd.DataFrame) -> None:
     """전향 검증 장부: 수집기가 마감 뒤 규칙 비중을 한 줄씩 기록한다. 수정·백필 금지(signal_ledger 모듈 설명)."""
     _subheader_with_help(
         "전향 검증 장부 (실제 기록)",
         "낙폭 관리 규칙 4개는 과거 데이터에서 골라서, 과거 백테스트는 더 이상 증거가 못 됩니다. 그래서 **매일 장 마감 뒤 규칙의 목표 비중을 "
         "한 줄씩 기록**하고 있습니다. 한 번 기록한 줄은 고치지 않고 과거를 채워 넣지도 않습니다. 성적은 기록된 비중을 다음 날 종가에 "
         "체결했다고 가정(편도 0.15%)해 단순 보유와 비교합니다. 규칙은 바꾸지 않습니다(바꾸려면 새 장부로 시작). "
-        f"**기록이 {signal_ledger.MIN_DAYS_TO_JUDGE}거래일(약 6개월) 쌓이기 전에는 판단을 보류**합니다.",
+        f"**기록이 {signal_ledger.MIN_DAYS_TO_JUDGE}거래일(약 6개월) 쌓이기 전에는 판단을 보류**합니다.\n\n"
+        "**괴리율 표**: 위 괴리율 구간 분석의 정비례(괴리율이 클수록 하락 확률 증가)는 과거 10년에서만 성립했고 독립 사건이 9~15번뿐이라, "
+        "장부에 기록되는 괴리율로 앞으로도 이어지는지 따로 셉니다. 구간과 기준은 고정입니다.",
         key="ledger",
     )
     if TICKER != DEFAULT_TICKER:
@@ -2962,6 +3002,7 @@ def _render_ledger_section() -> None:
     led = signal_ledger.load()
     if led.empty:
         st.caption("아직 기록이 없습니다. 오늘 장 마감 후(16:30 이후 확정 수급이 들어오면) 첫 줄이 기록됩니다.")
+        _render_ledger_deviation(led, hist_full)
         return
     ev = signal_ledger.evaluate(led)
     n = len(led)
@@ -2984,6 +3025,7 @@ def _render_ledger_section() -> None:
         st.caption("누적 수익은 기록 3번째 날부터(첫 신호의 체결 다음 날) 계산합니다. 단순 보유도 같은 구간으로 비교합니다.")
     else:
         st.caption("성적은 기록이 5일 이상 쌓이면 계산합니다.")
+    _render_ledger_deviation(led, hist_full)
     with st.expander("최근 기록 보기"):
         show = led.tail(20).copy()
         show["날짜"] = show["날짜"].dt.strftime("%Y-%m-%d")
@@ -3221,7 +3263,7 @@ def _render_tab_overheat():
         st.divider()
         _render_overheat_strategy(hist_full, OVERHEAT_MA_WINDOW)
         st.divider()
-        _render_ledger_section()
+        _render_ledger_section(hist_full)
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
 
