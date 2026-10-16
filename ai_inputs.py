@@ -1672,8 +1672,20 @@ def fetch_long_history_live(ticker: str, years: float = 10) -> pd.DataFrame:
     latest = fetch_latest_bars(ticker)
     if latest.empty:
         return base
+    latest = latest.copy()
+    flows = list(INVESTOR_COLUMNS)
+    # 네이버는 당일 수급을 마감 18:25 전후에야 올린다. 그 전까지 0인 값이 KIS 파일의 확정 수급(15:50 이후 저장)을
+    # 덮어쓰면 수급 지표가 하루 틀어지므로, 0인 날은 파일 값을 살린다.
+    zero = latest[flows].fillna(0).abs().sum(axis=1) == 0
+    if zero.any():
+        by_date = base.set_index("날짜")
+        for i in latest.index[zero]:
+            d = latest.at[i, "날짜"]
+            if d in by_date.index:
+                latest.loc[i, flows] = by_date.loc[d, flows].to_numpy()
     merged = pd.concat([base, latest], ignore_index=True).drop_duplicates(subset="날짜", keep="last")
-    return merged.sort_values("날짜").reset_index(drop=True)
+    merged = merged.sort_values("날짜").reset_index(drop=True)
+    return _overlay_kis_confirmed_flow(ticker, merged)
 
 
 def fetch_investor_estimate(ticker: str) -> dict:
@@ -3374,8 +3386,9 @@ def build_price_context(ticker: str) -> dict:
 # 여기서는 탭과 무관하게 데이터만으로 만든다.
 
 OVERHEAT_DEFAULT_MA_WINDOW = 80
-OVERHEAT_DEFAULT_HORIZON = 15
-OVERHEAT_DEFAULT_THRESHOLD = 0.10
+# 2026-10-16: 조기신호·수급 지표 검증과 같은 10거래일·7%로 맞췄다(예전 15일·10%).
+OVERHEAT_DEFAULT_HORIZON = 10
+OVERHEAT_DEFAULT_THRESHOLD = 0.07
 OVERHEAT_QUANTILES = [0.20, 0.15, 0.10, 0.05]
 
 
@@ -3390,6 +3403,29 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
     """
     if len(hist) < 330:
         return "가격 과열도 백테스트 미실행 (과거 데이터 부족)"
+    situation = ""
+    try:
+        sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist), ma_window=ma, horizon=horizon, thr=threshold)
+        if sit.get("ok"):
+            parts_s = []
+            hd, hu = sit.get("headline_dn"), sit.get("headline_up")
+            if hd:
+                lo, hi = hd["ci"]
+                parts_s.append(f"{hd['basis']} {hd['bucket']}/5분위 → {horizon}거래일 내 -{threshold:.0%} 하락 확률 "
+                               f"{hd['rate']:.1%}(전체 평균 {sit['base']['dn']:.1%}, 표본 {hd['n']:,}일, 95% {lo:.0%}~{hi:.0%})")
+            if hu:
+                lo, hi = hu["ci"]
+                parts_s.append(f"{hu['basis']} {hu['state']} → +{threshold:.0%} 상승 확률 {hu['rate']:.1%}"
+                               f"(전체 평균 {sit['base']['up']:.1%}, 표본 {hu['n']:,}일, 95% {lo:.0%}~{hi:.0%})")
+            strong = [d for d in sit["indicators"] if d["directional"] and d["key"] != "dev"][:3]
+            tends = "; ".join(
+                f"{d['name']} 하락 경향 ρ={d['rho_dn']:+.2f}(p={d['p_dn']:.2f}), 상승 경향 ρ={d['rho_up']:+.2f}(p={d['p_up']:.2f})"
+                for d in strong if d["rho_dn"] is not None and d["rho_up"] is not None)
+            situation = (f"[지금 상황 — {sit['asof']:%Y-%m-%d} 확정 기준, 점-시점 분위] " + "; ".join(parts_s)
+                         + f". 경향이 강한 지표: {tends}. 지표 값이 클수록 확률이 늘어나는 경향은 수급 과열 점수·개인 순매수 비중(하락)과 "
+                           "기관 순매수(상승)에서만 뚜렷했고 이동평균 괴리율은 U자형이라 약하다. 예측력은 몇 %p 수준이다. ")
+    except Exception:
+        situation = ""
     kw = dict(drawdown_threshold=threshold)
     high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="high", **kw) for q in OVERHEAT_QUANTILES}
     low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="low", **kw) for q in OVERHEAT_QUANTILES}
@@ -3421,7 +3457,8 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
     parts = [part(f"하위 {q:.0%}", low[q]) for q in sorted(OVERHEAT_QUANTILES)]
     parts += [part(f"상위 {q:.0%}", high[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)]
     return (
-        f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, 점-시점 분위: 각 날짜의 구간을 그날까지의 과거 "
+        situation
+        + f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, 점-시점 분위: 각 날짜의 구간을 그날까지의 과거 "
         f"분포로만 판정): 전체 기준 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률 {result['base_rate']:.1%}, "
         f"상승 확률 {result['base_up_rate']:.1%}. 구간별 — {'; '.join(parts)}. "
         + ("해석(SK하이닉스 10년·21년 검증): 상위(과열) 구간은 하락 확률 차이가 유의하지 않고 상승 확률과 이후 평균수익이 "
@@ -3440,7 +3477,7 @@ def build_overheat_summary(ticker: str) -> str:
     화면에는 이 조건을 바꾸는 슬라이더가 있지만, 그건 사람이 이것저것 눌러 보라고 둔
     것이다. AI에 넘기는 재료는 기준이 매번 달라지면 안 되므로 기본값만 쓴다.
     """
-    hist = fetch_long_history_live(ticker, years=10)
+    hist = fetch_long_history_live(ticker, years=25)
     return overheat_summary_text(hist, OVERHEAT_DEFAULT_MA_WINDOW, OVERHEAT_DEFAULT_HORIZON,
                                  OVERHEAT_DEFAULT_THRESHOLD, ticker=ticker)
 

@@ -2740,6 +2740,138 @@ def _cached_overheat_results(hist: pd.DataFrame, ma: int, horizon: int, thr: flo
     return high, low
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_overheat_summary(hist: pd.DataFrame, ma: int, horizon: int, thr: float, ticker: str) -> str:
+    return overheat_summary_text(hist, ma, horizon, thr, ticker=ticker)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_situation(hist: pd.DataFrame, ma: int, horizon: int, thr: float) -> dict:
+    """지표 7개의 점-시점 백분위와 정확 순열검정. 5천 행이면 1초쯤 걸려 15분간 재사용한다."""
+    return signal_lab.situation_report(hist, ma_window=ma, horizon=horizon, thr=thr)
+
+
+def _fmt_indicator_value(key: str, v) -> str:
+    if v is None:
+        return "N/A"
+    if key in ("retail", "inst", "frgn"):
+        return f"거래량의 {v:+.1%}"
+    if key == "inst_slope":
+        return f"거래량의 {v:+.2%}/일"
+    if key == "dev":
+        return f"{v:+.1%}"
+    if key == "vol":
+        return f"일 {v:.1%}"
+    return f"{v:.2f}"
+
+
+def _pct_pos_text(pct) -> str:
+    return "N/A" if pct is None else f"과거 분포 {pct * 100:.0f}백분위"
+
+
+def _rho_text(rho, p) -> str:
+    if rho is None:
+        return "N/A"
+    return f"{rho:+.2f} (p{_pv_text(p) if _pv_text(p).startswith('<') else '=' + _pv_text(p)})"
+
+
+def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon: int, thr: float) -> dict | None:
+    """'지금 상황': 경향성이 가장 크게 나온 지표로 지금의 하락·상승 확률을 보여준다."""
+    years_opt = st.radio("분석 기간", ["전체 (약 21년)", "최근 10년"], horizontal=True, key="overheat_situation_period",
+                         help="길수록 표본이 많아 확률이 안정적입니다. 10년으로 줄여도 방향은 같지만 지표 순위가 조금 바뀝니다.")
+    hist_c = signal_lab.drop_incomplete_last_row(hist_full)
+    if years_opt.startswith("최근"):
+        hist_c = hist_c.tail(2520)
+    rep = _cached_situation(hist_c.reset_index(drop=True), ma_window, horizon, thr)
+    if not rep.get("ok"):
+        st.warning("지표를 계산할 이력이 부족합니다.")
+        return None
+    base = rep["base"]
+    st.markdown(f"#### 지금 상황 — {rep['asof']:%Y-%m-%d} 확정 종가·수급 기준")
+    hd, hu = rep.get("headline_dn"), rep.get("headline_up")
+    c1, c2, c3 = st.columns(3)
+    if hd:
+        lo, hi = hd["ci"] if hd["ci"] else (None, None)
+        c1.metric(f"{horizon}거래일 내 -{thr:.0%} 하락 확률", f"{hd['rate']:.1%}",
+                  delta=f"평균 {base['dn']:.1%} 대비 {hd['rate'] - base['dn']:+.1%}p", delta_color="inverse",
+                  help=f"근거: {hd['basis']}가 과거 분포의 {hd['bucket']}/5분위일 때의 실제 비율입니다 "
+                       f"(표본 {hd['n']:,}일, 95% 구간 {lo:.0%}~{hi:.0%}). 하락과 가장 강한 경향을 보인 방향성 지표입니다.")
+    if hu:
+        lo, hi = hu["ci"] if hu["ci"] else (None, None)
+        c2.metric(f"{horizon}거래일 내 +{thr:.0%} 상승 확률", f"{hu['rate']:.1%}",
+                  delta=f"평균 {base['up']:.1%} 대비 {hu['rate'] - base['up']:+.1%}p", delta_color="normal",
+                  help=f"근거: 기관이 20일간 {hu['state']}일 때의 실제 비율입니다(표본 {hu['n']:,}일, 95% 구간 {lo:.0%}~{hi:.0%}). "
+                       f"같은 상태에서 하락 확률은 {hu['dn_rate']:.1%}였습니다.")
+    dev_ind = next((d for d in rep["indicators"] if d["key"] == "dev"), None)
+    cur_dev = hist_full["종가"].iloc[-1] / hist_full["종가"].rolling(ma_window).mean().iloc[-1] - 1
+    c3.metric(f"현재 괴리율 ({ma_window}일선, 장중 포함)", f"{cur_dev:+.1%}",
+              help="마지막 종가(장중이면 현재가) 기준입니다. 아래 지표 표의 괴리율 행은 확정 종가 기준이라 장중에는 조금 다를 수 있습니다.")
+    if hd and hu:
+        st.caption(
+            f"하락 확률은 **{hd['basis']}** {hd['bucket']}/5분위({_pct_pos_text(next(d for d in rep['indicators'] if d['key']=='flow_heat')['pct'])}), "
+            f"상승 확률은 **기관 20일 {hu['state']}** 기준입니다. 확률은 같은 상태였던 과거 날짜의 실제 비율이며, "
+            "아래 표처럼 지표마다 가리키는 방향이 다를 수 있습니다. 예측력은 몇 %p 수준이라 확정적 신호가 아닙니다."
+        )
+
+    st.markdown("**지표별 경향성 (경향이 강한 순)**")
+    rows = []
+    for d in rep["indicators"]:
+        tbl = d["table"]
+        cur = tbl[tbl["분위"] == d["bucket"]].iloc[0] if d["bucket"] else None
+        note = "" if d["directional"] else "방향 없음 — 하락·상승 둘 다 커짐"
+        if d["key"] == "dev":
+            note = "U자형 — 양 끝에서 하락·상승 모두 커짐"
+        rows.append({
+            "지표": d["name"],
+            "현재 값": _fmt_indicator_value(d["key"], d["raw"]),
+            "현재 위치": f"{d['bucket']}/5분위" if d["bucket"] else "N/A",
+            f"이 위치의 하락 확률": f"{cur['하락']:.0%}" if cur is not None else "N/A",
+            f"이 위치의 상승 확률": f"{cur['상승']:.0%}" if cur is not None else "N/A",
+            "하락 경향 (순위상관, p)": _rho_text(d["rho_dn"], d["p_dn"]),
+            "상승 경향 (순위상관, p)": _rho_text(d["rho_up"], d["p_up"]),
+            "비고": note,
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("순위상관 + = 지표가 클수록 확률 증가. p는 신호 군집을 보존한 정확 순열검정(양측). "
+               "지표 값이 클수록 하락 확률이 늘어나는 경향이 가장 뚜렷한 것은 수급 과열 점수·개인 순매수 비중이고, "
+               "상승은 기관 쪽입니다. 변동성은 방향이 없습니다.")
+
+    names = [d["name"] for d in rep["indicators"]]
+    default_ix = names.index("수급 과열 점수") if "수급 과열 점수" in names else 0
+    pick = st.selectbox("5분위별 확률 보기", names, index=default_ix, key="overheat_indicator_pick")
+    d = next(x for x in rep["indicators"] if x["name"] == pick)
+    t = d["table"]
+    st.caption(d["desc"] + " · 분위는 각 날짜 이전의 분포로만 정했습니다(1=가장 낮음, 5=가장 높음).")
+    fig = go.Figure()
+    xs = [f"{q}분위" for q in t["분위"]]
+    fig.add_trace(go.Bar(x=xs, y=t["하락"], name=f"-{thr:.0%} 하락", marker_color="#d62728",
+                         customdata=t["표본"], hovertemplate="%{x}<br>하락 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
+    fig.add_trace(go.Bar(x=xs, y=t["상승"], name=f"+{thr:.0%} 상승", marker_color="#2ca02c",
+                         customdata=t["표본"], hovertemplate="%{x}<br>상승 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
+    fig.add_hline(y=base["dn"], line_dash="dot", line_color="#d62728", opacity=0.6, annotation_text="평균 하락", annotation_position="top left")
+    fig.add_hline(y=base["up"], line_dash="dot", line_color="#2ca02c", opacity=0.6, annotation_text="평균 상승", annotation_position="bottom left")
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text=f"{horizon}거래일 내 확률", tickformat=".0%")
+    if d["bucket"]:
+        fig.add_vrect(x0=d["bucket"] - 1.5, x1=d["bucket"] - 0.5, fillcolor="gray", opacity=0.12, line_width=0,
+                      annotation_text="현재", annotation_position="top")
+    _style_chart_mobile(fig, title=f"{pick} 5분위별 이후 {horizon}거래일 하락·상승 확률")
+    st.plotly_chart(fig, width="stretch", key="chart_overheat_indicator", config=PLOTLY_CONFIG)
+
+    g = rep["grid"]
+    labels_dev = [f"괴리율 낮음(~33%)", "괴리율 중간", "괴리율 높음(67%~)"]
+    labels_flow = ["수급 냉각", "수급 중립", "수급 과열"]
+    grid_df = pd.DataFrame(
+        [[("N/A" if np.isnan(g["rate"][i, j]) else f"{g['rate'][i, j]:.0%}  (n={g['n'][i, j]:,})")
+          + (" ◀ 현재" if g["current"] == (i, j) else "") for j in range(3)] for i in range(3)],
+        index=labels_dev, columns=labels_flow)
+    st.markdown(f"**괴리율 × 수급 과열 — {horizon}거래일 내 -{thr:.0%} 하락 확률**")
+    st.dataframe(grid_df, width="stretch")
+    st.caption("괴리율이 높은데 개인이 몰려 사는 칸이 가장 위험하고, 괴리율이 중간 이상인데 수급이 냉각된 칸이 가장 안전했습니다. "
+               "괴리율이 아주 낮은 칸이 안전하지 않은 것은 하락장이 이어졌기 때문입니다.")
+    return rep
+
+
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
 @st.fragment
 def _render_tab_overheat():
@@ -2750,19 +2882,18 @@ def _render_tab_overheat():
     overheat_summary = "가격 과열도 백테스트 미실행"
 
     _subheader_with_help(
-        "가격 과열도 백테스트",
-        "이동평균 대비 괴리율 구간별로 이후 하락·상승 확률과 평균 수익이 어떻게 달라지는지 보는 통계입니다.\n\n"
-        "**읽는 법**: SK하이닉스 10년·21년 검증에서 괴리율이 극단(상위·하위 5%)일 때 하락 확률이 높아지긴 했지만 "
-        "**상승 확률도 같이 높아졌고**, 과열 구간 이후의 평균 수익은 오히려 높았습니다(아래 표의 상위 구간 행). "
-        "변동폭이 커진다는 뜻이지 '과열이면 떨어진다'는 방향 신호가 아닙니다. "
-        "괴리율을 변동성으로 나누면 효과가 사라졌습니다.\n\n"
-        "**점-시점 분위**: 각 날짜가 상위 N% 구간인지는 그날까지의 과거 분포만으로 판정합니다. 전체 구간 분포로 정하면 "
-        "미래 정보가 섞여 하락 효과가 부풀려집니다(그렇게 하면 상위 10%에서 유의해 보였다가, 점-시점으로 보면 사라졌습니다). "
-        "p값은 신호의 군집을 보존한 순열검정이며 하락 확률이 더 높다는 가설의 단측 검정입니다. 연속한 날짜를 독립 표본으로 "
-        "세는 z검정은 p를 크게 과소평가해 쓰지 않습니다.\n\n"
-        "**기본값(80일선·15일·10%)**은 예전에 168개 조합을 백테스트해 골랐지만, 해마다 훈련으로 고르고 다음 해에 평가하는 "
-        "워크포워드에서는 이점이 없었습니다(고른 설정 +1.7%p, 고정 기본값 -0.1%p). 아래 슬라이더로 바꿔 봐도 "
-        "'맞는 설정'이 따로 있는 것은 아닙니다. 매매 신호가 아닙니다.",
+        "가격 과열도 — 지금 하락·상승 확률",
+        "지표별로 **지금이 과거 분포의 어디쯤인지**, 그 위치에 있던 과거 날짜들에서 이후 하락·상승이 실제로 얼마나 있었는지를 "
+        "보여줍니다. 위쪽 확률 카드는 경향성이 가장 크게 나온 지표를 씁니다.\n\n"
+        "**무엇이 경향성이 큰가**(SK하이닉스 21년·10년 검증): 개인이 많이 사고 기관·외국인이 파는 **수급 과열**일수록 이후 하락 "
+        "확률이 단계적으로 올라갔습니다(순열검정 p<0.01). 기관이 20일간 사 모으는 중이면 상승 확률이 높았습니다. "
+        "**이동평균 괴리율 자체는 경향이 약하고 U자형**입니다 — 괴리율이 높다고 떨어지는 게 아니라 변동폭이 커질 뿐이고(상승 확률·이후 평균 수익도 같이 높음), "
+        "아주 낮다고 안전한 것도 아닙니다(하락장이 이어짐). 그래서 괴리율은 아래쪽에 따로 두었습니다. "
+        "외국인 보유율(수준·변화)은 검증했지만 예측력이 약해 뺐습니다.\n\n"
+        "**점-시점 분위**: 각 날짜의 위치는 그날 이전 분포만으로 정합니다(전체 분포를 쓰면 미래 정보가 섞여 효과가 부풀려집니다). "
+        "p값은 신호 군집을 보존한 정확 순열검정이며, 연속한 날짜를 독립 표본으로 세는 z검정은 p를 크게 과소평가해 쓰지 않습니다.\n\n"
+        "**한계**: 한 종목에 독립 사건이 수십 건이라 예측력은 확률이 몇 %p 움직이는 수준입니다. 개별 시점의 정답이 아니고 "
+        "매매 신호가 아닙니다. 다른 종목에서는 검증하지 않았습니다.",
         key="overheat",
     )
 
@@ -2777,180 +2908,160 @@ def _render_tab_overheat():
             key="overheat_horizon",
         )
         OVERHEAT_DRAWDOWN_THRESHOLD = param_col3.slider(
-            "하락 기준 (%)", min_value=3, max_value=20, value=int(OVERHEAT_DEFAULT_THRESHOLD * 100), step=1,
+            "하락·상승 기준 (%)", min_value=3, max_value=20, value=int(OVERHEAT_DEFAULT_THRESHOLD * 100), step=1,
             key="overheat_threshold",
         ) / 100
 
     try:
         _ov_t = time.monotonic()
-        overheat_hist = fetch_long_history_live(TICKER, years=10)
+        hist_full = fetch_long_history_live(TICKER, years=25)
         if _BOOT_PROFILE:
             print(f"[boot]     과열도: 장기 이력 fetch {time.monotonic() - _ov_t:.2f}s", flush=True)
-        if len(overheat_hist) < 330:
+        if len(hist_full) < 700:
             st.warning("백테스트에 충분한 과거 데이터가 없습니다.")
+            return
+        if len(hist_full) < 2000:
+            st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
+                       "결과가 21년·10년 기준과 다를 수 있습니다.]")
+        rep = _render_overheat_situation(hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+        overheat_hist = hist_full.tail(2520).reset_index(drop=True)      # 괴리율 구간 분석은 최근 10년
+
+        st.divider()
+        _subheader_with_help(
+            "이동평균 괴리율 구간 분석 (경향성 약함)",
+            "괴리율 구간별로 하락·상승 확률과 이후 평균 수익을 봅니다. 위에서 말했듯 괴리율은 U자형이라 '높을수록 하락 확률 증가'가 "
+            "성립하지 않습니다. 구간은 점-시점 분위로 판정한 최근 10년 결과입니다.",
+            key="overheat_dev",
+        )
+        overheat_results, overheat_results_low = _cached_overheat_results(
+            overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+        overheat_result = overheat_results[OVERHEAT_QUANTILES[0]]
+        if overheat_result["n"] < 30:
+            st.warning("백테스트에 충분한 표본이 없습니다.")
         else:
-            if len(overheat_hist) < 2000:
-                st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
-                           "10년 기준 결과와 다를 수 있습니다.]")
-            overheat_results, overheat_results_low = _cached_overheat_results(
-                overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
-            if _BOOT_PROFILE:
-                print(f"[boot]     과열도: 백테스트 8회 {time.monotonic() - _ov_t:.2f}s (fetch 포함 누적)", flush=True)
-            overheat_result = overheat_results[OVERHEAT_QUANTILES[0]]
-
-            if overheat_result["n"] < 30:
-                st.warning("백테스트에 충분한 표본이 없습니다.")
+            current_deviation = overheat_result["current_deviation"]
+            matched_quantile = None
+            for q in sorted(OVERHEAT_QUANTILES):
+                cutoff = overheat_results[q]["hi_cutoff"]
+                if cutoff is not None and current_deviation is not None and current_deviation >= cutoff:
+                    matched_quantile = q
+                    break
+            matched_quantile_low = None
+            for q in sorted(OVERHEAT_QUANTILES):
+                cutoff = overheat_results_low[q]["hi_cutoff"]
+                if cutoff is not None and current_deviation is not None and current_deviation <= cutoff:
+                    matched_quantile_low = q
+                    break
+            if matched_quantile is not None:
+                current_regime_label = f"상위 {matched_quantile:.0%} 구간(과열)"
+            elif matched_quantile_low is not None:
+                current_regime_label = f"하위 {matched_quantile_low:.0%} 구간(침체)"
             else:
-                current_deviation = overheat_result["current_deviation"]
-                matched_quantile = None
-                for q in sorted(OVERHEAT_QUANTILES):
-                    cutoff = overheat_results[q]["hi_cutoff"]
-                    if cutoff is not None and current_deviation is not None and current_deviation >= cutoff:
-                        matched_quantile = q
-                        break
+                current_regime_label = "평상시"
+            deviation_series = (overheat_hist["종가"] / overheat_hist["종가"].rolling(OVERHEAT_MA_WINDOW).mean() - 1).dropna()
+            current_rank = (
+                float((deviation_series < current_deviation).mean())
+                if len(deviation_series) > 0 and current_deviation is not None else None
+            )
+            st.caption(
+                f"현재 괴리율 {current_deviation:+.1%} — {current_regime_label}"
+                + (f" (최근 10년 분포의 {current_rank * 100:.0f}백분위)" if current_rank is not None else "")
+                + f" · 표본 {overheat_result['n']:,}일 · 기저 하락 확률 {overheat_result['base_rate']:.1%} · 기저 상승 확률 {overheat_result['base_up_rate']:.1%}"
+            )
 
-                matched_quantile_low = None
-                for q in sorted(OVERHEAT_QUANTILES):
-                    cutoff = overheat_results_low[q]["hi_cutoff"]
-                    if cutoff is not None and current_deviation is not None and current_deviation <= cutoff:
-                        matched_quantile_low = q
-                        break
+            def _row(label, r):
+                return {
+                    "과열 구간": label,
+                    "괴리율": r["hi_cutoff"],
+                    "표본 수": r["hi_n"],
+                    "하락 확률": r["hi_rate"],
+                    "p-value(하락)": r["p_value"],
+                    "상승 확률": r["hi_up_rate"],
+                    f"이후 {OVERHEAT_HORIZON}일 평균수익": r["hi_ret"],
+                }
 
-                if matched_quantile is not None:
-                    current_regime_label = f"상위 {matched_quantile:.0%} 구간(과열)"
-                    cur_r = overheat_results[matched_quantile]
-                    current_down_rate, current_up_rate = cur_r["hi_rate"], cur_r["hi_up_rate"]
-                elif matched_quantile_low is not None:
-                    current_regime_label = f"하위 {matched_quantile_low:.0%} 구간(침체)"
-                    cur_r = overheat_results_low[matched_quantile_low]
-                    current_down_rate, current_up_rate = cur_r["hi_rate"], cur_r["hi_up_rate"]
-                else:
-                    current_regime_label = "평상시"
-                    widest_q = max(OVERHEAT_QUANTILES)
-                    current_down_rate = overheat_results[widest_q]["rest_rate"]
-                    current_up_rate = overheat_results[widest_q]["rest_up_rate"]
+            breakdown_rows = [
+                _row(f"하위 {q:.0%}", overheat_results_low[q]) for q in sorted(OVERHEAT_QUANTILES)
+            ] + [
+                _row(f"상위 {q:.0%}", overheat_results[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)
+            ]
+            breakdown_df = pd.DataFrame(breakdown_rows).dropna(subset=["괴리율"]).sort_values("괴리율").reset_index(drop=True)
+            ret_col = f"이후 {OVERHEAT_HORIZON}일 평균수익"
 
-                deviation_series = (overheat_hist["종가"] / overheat_hist["종가"].rolling(OVERHEAT_MA_WINDOW).mean() - 1).dropna()
-                current_percentile = (
-                    float((deviation_series >= current_deviation).mean())
-                    if len(deviation_series) > 0 and current_deviation is not None
-                    else None
+            fig_breakdown = go.Figure()
+            fig_breakdown.add_trace(go.Scatter(
+                x=breakdown_df["괴리율"], y=breakdown_df["하락 확률"], name="하락 확률",
+                mode="lines+markers", line=dict(color="#d62728"), marker=dict(size=8),
+                customdata=breakdown_df[["과열 구간", "표본 수", "p-value(하락)"]],
+                hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · p-value %{customdata[2]:.2f}<extra></extra>",
+            ))
+            fig_breakdown.add_trace(go.Scatter(
+                x=breakdown_df["괴리율"], y=breakdown_df["상승 확률"], name="상승 확률",
+                mode="lines+markers", line=dict(color="#2ca02c"), marker=dict(size=8),
+                customdata=breakdown_df[["과열 구간", "표본 수", ret_col]],
+                hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>상승 확률 %{y:.1%}<br>이후 평균수익 %{customdata[2]:+.1%}<extra></extra>",
+            ))
+            fig_breakdown.add_hline(
+                y=overheat_result["base_rate"], line_dash="dash", line_color="#d62728", opacity=0.5,
+                annotation_text="기저 하락 확률", annotation_position="bottom right",
+            )
+            fig_breakdown.add_hline(
+                y=overheat_result["base_up_rate"], line_dash="dash", line_color="#2ca02c", opacity=0.5,
+                annotation_text="기저 상승 확률", annotation_position="top right",
+            )
+            if current_deviation is not None:
+                fig_breakdown.add_vline(
+                    x=current_deviation, line_dash="dot", line_color="gray",
+                    annotation_text="현재 괴리율", annotation_position="bottom",
                 )
+            fig_breakdown.update_xaxes(title_text="괴리율 경계", tickformat=".0%")
+            fig_breakdown.update_yaxes(title_text=f"{OVERHEAT_HORIZON}거래일 내 확률", tickformat=".0%")
+            _style_chart_mobile(fig_breakdown, title="괴리율 구간별 하락·상승 확률 (양끝에서 둘 다 커지면 변동폭 확대)")
+            st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config=PLOTLY_CONFIG)
 
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                metric_col1.metric(
-                    "현재 괴리율",
-                    f"{current_deviation:+.1%} (상위 {current_percentile:.0%})"
-                    if current_deviation is not None and current_percentile is not None else "N/A",
-                )
-                metric_col2.metric(
-                    f"현재 구간의 {OVERHEAT_HORIZON}거래일 내 하락 확률",
-                    f"{current_down_rate:.1%}" if current_down_rate is not None else "N/A",
-                )
-                metric_col3.metric(
-                    f"현재 구간의 {OVERHEAT_HORIZON}거래일 내 상승 확률",
-                    f"{current_up_rate:.1%}" if current_up_rate is not None else "N/A",
-                )
-                st.caption(
-                    f"현재 상태: {current_regime_label} · 표본 {overheat_result['n']:,}일 · "
-                    f"전체 기간 기저 하락 확률 {overheat_result['base_rate']:.1%} · 기저 상승 확률 {overheat_result['base_up_rate']:.1%}"
-                )
+            shown = breakdown_df.copy()
+            shown["괴리율"] = shown["괴리율"].map(lambda v: f"{v:+.1%}")
+            shown["표본 수"] = shown["표본 수"].map(lambda v: f"{v:,}일")
+            shown["하락 확률"] = shown["하락 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
+            shown["상승 확률"] = shown["상승 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
+            shown["p-value(하락)"] = shown["p-value(하락)"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+            shown[ret_col] = shown[ret_col].map(lambda v: f"{v:+.1%}" if pd.notna(v) else "N/A")
+            st.dataframe(shown, hide_index=True, width="stretch")
 
-                def _row(label, r):
-                    return {
-                        "과열 구간": label,
-                        "괴리율": r["hi_cutoff"],
-                        "표본 수": r["hi_n"],
-                        "하락 확률": r["hi_rate"],
-                        "p-value(하락)": r["p_value"],
-                        "상승 확률": r["hi_up_rate"],
-                        f"이후 {OVERHEAT_HORIZON}일 평균수익": r["hi_ret"],
-                    }
+            overheat_hist_ma = overheat_hist.copy()
+            overheat_hist_ma["MA"] = overheat_hist_ma["종가"].rolling(OVERHEAT_MA_WINDOW).mean()
+            overheat_hist_ma["괴리율"] = overheat_hist_ma["종가"] / overheat_hist_ma["MA"] - 1
+            overheat_chart_df = overheat_hist_ma.dropna(subset=["괴리율"])
 
-                breakdown_rows = [
-                    _row(f"하위 {q:.0%}", overheat_results_low[q]) for q in sorted(OVERHEAT_QUANTILES)
-                ] + [
-                    _row(f"상위 {q:.0%}", overheat_results[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)
-                ]
-                breakdown_df = pd.DataFrame(breakdown_rows).dropna(subset=["괴리율"]).sort_values("괴리율").reset_index(drop=True)
-                ret_col = f"이후 {OVERHEAT_HORIZON}일 평균수익"
-
-                fig_breakdown = go.Figure()
-                fig_breakdown.add_trace(go.Scatter(
-                    x=breakdown_df["괴리율"], y=breakdown_df["하락 확률"], name="하락 확률",
-                    mode="lines+markers", line=dict(color="#d62728"), marker=dict(size=8),
-                    customdata=breakdown_df[["과열 구간", "표본 수", "p-value(하락)"]],
-                    hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · p-value %{customdata[2]:.2f}<extra></extra>",
-                ))
-                fig_breakdown.add_trace(go.Scatter(
-                    x=breakdown_df["괴리율"], y=breakdown_df["상승 확률"], name="상승 확률",
-                    mode="lines+markers", line=dict(color="#2ca02c"), marker=dict(size=8),
-                    customdata=breakdown_df[["과열 구간", "표본 수", ret_col]],
-                    hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>상승 확률 %{y:.1%}<br>이후 평균수익 %{customdata[2]:+.1%}<extra></extra>",
-                ))
-                fig_breakdown.add_hline(
-                    y=overheat_result["base_rate"], line_dash="dash", line_color="#d62728", opacity=0.5,
-                    annotation_text="기저 하락 확률", annotation_position="bottom right",
-                )
-                fig_breakdown.add_hline(
-                    y=overheat_result["base_up_rate"], line_dash="dash", line_color="#2ca02c", opacity=0.5,
-                    annotation_text="기저 상승 확률", annotation_position="top right",
-                )
-                if current_deviation is not None:
-                    fig_breakdown.add_vline(
-                        x=current_deviation, line_dash="dot", line_color="gray",
-                        annotation_text="현재 괴리율", annotation_position="bottom",
+            fig_overheat = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_overheat.add_trace(
+                go.Scatter(x=overheat_chart_df["날짜"], y=overheat_chart_df["괴리율"], name=f"종가/{OVERHEAT_MA_WINDOW}일선 괴리율", line=dict(color="#1f77b4")),
+                secondary_y=False,
+            )
+            fig_overheat.add_trace(
+                go.Scatter(x=overheat_chart_df["날짜"], y=overheat_chart_df["종가"], name="종가", line=dict(color="#d62728")),
+                secondary_y=True,
+            )
+            fig_overheat.add_hline(y=0, line_dash="dash", line_color="gray", secondary_y=False)
+            if len(overheat_chart_df) > 0:
+                band_cutoffs = {q: float(overheat_chart_df["괴리율"].quantile(1 - q)) for q in OVERHEAT_QUANTILES}
+                for q in OVERHEAT_QUANTILES:
+                    fig_overheat.add_hline(
+                        y=band_cutoffs[q], line_dash="dot", line_color="orange", secondary_y=False,
+                        annotation_text=f"상위 {q:.0%}", annotation_position="top right",
                     )
-                fig_breakdown.update_xaxes(title_text="괴리율 경계", tickformat=".0%")
-                fig_breakdown.update_yaxes(title_text=f"{OVERHEAT_HORIZON}거래일 내 확률", tickformat=".0%")
-                _style_chart_mobile(fig_breakdown, title="괴리율 구간별 하락·상승 확률 (양끝에서 둘 다 커지면 변동폭 확대)")
-                st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config=PLOTLY_CONFIG)
+            _style_chart_mobile(fig_overheat, title=f"종가/{OVERHEAT_MA_WINDOW}일 이동평균 괴리율 vs 주가")
+            fig_overheat.update_yaxes(title_text="괴리율", tickformat=".0%", secondary_y=False)
+            fig_overheat.update_yaxes(title_text="종가(원)", type="log", secondary_y=True)
+            fig_overheat.update_xaxes(rangeslider_visible=True)
+            st.plotly_chart(fig_overheat, width="stretch", key="chart_overheat", config=PLOTLY_CONFIG)
+            st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다. 종가 축은 로그 눈금입니다.")
 
-                shown = breakdown_df.copy()
-                shown["괴리율"] = shown["괴리율"].map(lambda v: f"{v:+.1%}")
-                shown["표본 수"] = shown["표본 수"].map(lambda v: f"{v:,}일")
-                shown["하락 확률"] = shown["하락 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
-                shown["상승 확률"] = shown["상승 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
-                shown["p-value(하락)"] = shown["p-value(하락)"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
-                shown[ret_col] = shown[ret_col].map(lambda v: f"{v:+.1%}" if pd.notna(v) else "N/A")
-                st.dataframe(shown, hide_index=True, width="stretch")
+        overheat_summary = _cached_overheat_summary(
+            hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD, TICKER)
 
-                overheat_hist_ma = overheat_hist.copy()
-                overheat_hist_ma["MA"] = overheat_hist_ma["종가"].rolling(OVERHEAT_MA_WINDOW).mean()
-                overheat_hist_ma["괴리율"] = overheat_hist_ma["종가"] / overheat_hist_ma["MA"] - 1
-                overheat_chart_df = overheat_hist_ma.dropna(subset=["괴리율"])
-
-                fig_overheat = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_overheat.add_trace(
-                    go.Scatter(x=overheat_chart_df["날짜"], y=overheat_chart_df["괴리율"], name=f"종가/{OVERHEAT_MA_WINDOW}일선 괴리율", line=dict(color="#1f77b4")),
-                    secondary_y=False,
-                )
-                fig_overheat.add_trace(
-                    go.Scatter(x=overheat_chart_df["날짜"], y=overheat_chart_df["종가"], name="종가", line=dict(color="#d62728")),
-                    secondary_y=True,
-                )
-                fig_overheat.add_hline(y=0, line_dash="dash", line_color="gray", secondary_y=False)
-                if len(overheat_chart_df) > 0:
-                    band_cutoffs = {
-                        q: float(overheat_chart_df["괴리율"].quantile(1 - q)) for q in OVERHEAT_QUANTILES
-                    }
-                    for q in OVERHEAT_QUANTILES:
-                        fig_overheat.add_hline(
-                            y=band_cutoffs[q], line_dash="dot", line_color="orange", secondary_y=False,
-                            annotation_text=f"상위 {q:.0%}", annotation_position="top right",
-                        )
-                _style_chart_mobile(fig_overheat, title=f"종가/{OVERHEAT_MA_WINDOW}일 이동평균 괴리율 vs 주가")
-                fig_overheat.update_yaxes(title_text="괴리율", tickformat=".0%", secondary_y=False)
-                fig_overheat.update_yaxes(title_text="종가(원)", type="log", secondary_y=True)
-                fig_overheat.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_overheat, width="stretch", key="chart_overheat", config=PLOTLY_CONFIG)
-                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다. 종가 축은 로그 눈금입니다.")
-
-                overheat_summary = overheat_summary_text(
-                    overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD, ticker=TICKER)
-
-                st.divider()
-                _render_overheat_strategy(fetch_long_history_live(TICKER, years=25), OVERHEAT_MA_WINDOW)
+        st.divider()
+        _render_overheat_strategy(hist_full, OVERHEAT_MA_WINDOW)
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
 

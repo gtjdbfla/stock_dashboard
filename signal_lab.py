@@ -378,3 +378,199 @@ def run_ma_strategy(df: pd.DataFrame, ma_window: int, period_start, band: float 
     result["trades_per_year"] = len(trades) / result["years"] if result["years"] > 0 else None
     result["current_deviation"] = float(dev[-1]) if not np.isnan(dev[-1]) else None
     return result
+
+
+# ── 가격 과열도 탭: 지금 상황 + 지표별 경향성 ────────────────────────────────────
+
+def pit_percentile(x, min_periods: int = MIN_PIT) -> np.ndarray:
+    """각 값이 '그 이전' 과거 값들 중 몇 %보다 큰가(0~1). 과거가 min_periods개 미만이면 NaN."""
+    import bisect
+    x = np.asarray(x, dtype=float)
+    out = np.full(len(x), np.nan)
+    srt: list = []
+    for i, v in enumerate(x):
+        if np.isnan(v):
+            continue
+        if len(srt) >= min_periods:
+            out[i] = bisect.bisect_left(srt, v) / len(srt)
+        bisect.insort(srt, v)
+    return out
+
+
+def shift_corr_p(x, y, horizon: int):
+    """x(연속값)와 y(0/1)의 순위상관과, 모든 원형 이동(2·horizon 이상)을 다 해 본 정확 순열 p(양측).
+
+    FFT로 모든 이동의 상관을 한 번에 구한다 — 무작위 순열보다 빠르고 재현 가능하다.
+    이동할 때마다 짝이 맞는 구간이 달라지지만 정규화는 고정해 관측값과 같은 식으로 비교한다.
+    """
+    from scipy.stats import rankdata
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    vx, vy = ~np.isnan(x), ~np.isnan(y)
+    if (vx & vy).sum() < 100 or n < 8 * horizon:
+        return None, None
+
+    def z(a, v):
+        out = np.zeros(n)
+        r = rankdata(a[v])
+        out[v] = (r - r.mean()) / (r.std() + 1e-12)
+        return out
+
+    zx, zy = z(x, vx), z(y, vy)
+    norm = np.sqrt((zx ** 2).sum() * (zy ** 2).sum())
+    cc = np.fft.irfft(np.fft.rfft(zy) * np.conj(np.fft.rfft(zx)), n=n) / norm   # cc[k] = Σ zx[i]·zy[i+k]
+    obs = float(cc[0])
+    ks = np.arange(2 * horizon, n - 2 * horizon)
+    sims = cc[ks]
+    p = float((1 + (np.abs(sims) >= abs(obs)).sum()) / (1 + len(sims)))
+    return obs, p
+
+
+def wilson_ci(k: float, n: int, z: float = 1.96):
+    if n <= 0:
+        return None
+    ph = k / n
+    d = 1 + z * z / n
+    c = (ph + z * z / (2 * n)) / d
+    h = z * np.sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / d
+    return float(max(0.0, c - h)), float(min(1.0, c + h))
+
+
+def drop_incomplete_last_row(hist: pd.DataFrame, now=None) -> pd.DataFrame:
+    """오늘 행이 아직 덜 찼으면(장중이거나 수급이 0) 뺀다. 수급 지표는 하루가 덜 찬 값을 섞으면 틀어진다."""
+    import datetime as _dt
+    if hist.empty:
+        return hist
+    now = now or _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=9)))
+    last = hist.iloc[-1]
+    if pd.Timestamp(last["날짜"]).date() != now.date():
+        return hist
+    flows = [float(last.get(c) or 0) for c in ("기관", "외국인", "개인")]
+    if now.time() < _dt.time(15, 45) or not any(abs(v) > 0 for v in flows):
+        return hist.iloc[:-1].reset_index(drop=True)
+    return hist
+
+
+# 지표 정의: (키, 이름, 방향성 있음?, 설명). 방향성 없음 = 하락·상승 둘 다 커지는 변동폭 지표.
+INDICATORS = [
+    ("flow_heat", "수급 과열 점수", True, "개인 순매수 비중↑ · 기관·외국인 순매수 비중↓ 를 합친 점수(과거 백분위 평균)"),
+    ("retail", "개인 순매수 비중 (20일)", True, "20일간 개인 순매수 ÷ 거래량"),
+    ("inst_slope", "기관 20일 순매수 기울기", True, "기관 20일 누적 순매수의 기울기 ÷ 평균 거래량"),
+    ("inst", "기관 순매수 비중 (20일)", True, "20일간 기관 순매수 ÷ 거래량"),
+    ("frgn", "외국인 순매수 비중 (20일)", True, "20일간 외국인 순매수 ÷ 거래량"),
+    ("dev", "이동평균 괴리율", True, "종가 ÷ 이동평균 − 1"),
+    ("vol", "변동성 (20일)", False, "일간 수익률의 20일 표준편차 — 하락·상승 둘 다 커지는 변동폭 지표"),
+]
+
+
+def _bucket(pct: np.ndarray, k: int = 5) -> np.ndarray:
+    b = np.floor(pct * k) + 1
+    return np.where(np.isnan(pct), np.nan, np.clip(b, 1, k))
+
+
+def situation_report(hist: pd.DataFrame, ma_window: int = 80, horizon: int = 10, thr: float = 0.07) -> dict:
+    """가격 과열도 탭의 '지금 상황': 지표별로 지금이 과거 분포의 어디쯤이고, 그 위치에서 이후 하락·상승 확률이 얼마였나.
+
+    - 모든 분위는 점-시점이다(그날 이전 분포만 사용). 확률은 그 분위에 있던 모든 과거 날짜의 실제 비율이다.
+    - 경향성은 지표(백분위)와 이후 하락·상승 여부의 순위상관과 정확 순열 p다. 하락·상승 기준은 horizon일 안에
+      종가 대비 최대 낙폭 <= -thr / 최대 상승 >= +thr.
+    - 헤드라인: 하락 확률 = 수급 과열 점수(방향성 지표 중 하락과 가장 강한 경향), 상승 확률 = 기관이
+      20일간 순매수 우위일 때(조기신호 탭과 같은 기준 — 10년 검증 42% vs 23%).
+    """
+    h = hist.sort_values("날짜").reset_index(drop=True)
+    out = {"ok": False, "horizon": horizon, "thr": thr, "ma_window": ma_window, "n": len(h)}
+    if len(h) < MIN_PIT + 3 * horizon + 100:
+        return out
+    price = h["종가"].astype(float)
+    vol = h["거래량"].astype(float)
+    r = price.pct_change()
+
+    def share(col):
+        return (h[col].astype(float).rolling(20).sum() / vol.rolling(20).sum()).to_numpy()
+
+    f = flow_frame(h)
+    raw = {
+        "retail": share("개인"), "inst": share("기관"), "frgn": share("외국인"),
+        "inst_slope": f["inst_n"].to_numpy(),
+        "dev": (price / price.rolling(ma_window).mean() - 1).to_numpy(),
+        "vol": r.rolling(20).std().to_numpy(),
+    }
+    pct = {k: pit_percentile(v) for k, v in raw.items()}
+    heat = np.vstack([pct["retail"], 1 - pct["inst"], 1 - pct["frgn"]]).T
+    raw["flow_heat"] = np.where(np.isnan(heat).any(axis=1), np.nan, heat.mean(axis=1))
+    pct["flow_heat"] = pit_percentile(raw["flow_heat"])
+
+    dd, up, _ = forward_stats(price, horizon)
+    known = ~np.isnan(dd)
+    y_dn = np.where(known, (dd <= -thr).astype(float), np.nan)
+    y_up = np.where(known, (up >= thr).astype(float), np.nan)
+    out["base"] = {"dn": float(np.nanmean(y_dn)), "up": float(np.nanmean(y_up))}
+    out["asof"] = h["날짜"].iloc[-1]
+    out["start"] = h["날짜"].iloc[0]
+
+    indicators = []
+    for key, name, directional, desc in INDICATORS:
+        pc = pct[key]
+        b = _bucket(pc)
+        now_pct = float(pc[-1]) if not np.isnan(pc[-1]) else None
+        now_b = int(b[-1]) if not np.isnan(b[-1]) else None
+        rows = []
+        for q in range(1, 6):
+            m = (b == q) & known
+            nq = int(m.sum())
+            rows.append({"분위": q, "표본": nq,
+                         "하락": float(y_dn[m].mean()) if nq else None,
+                         "상승": float(y_up[m].mean()) if nq else None})
+        rho_dn, p_dn = shift_corr_p(pc, y_dn, horizon)
+        rho_up, p_up = shift_corr_p(pc, y_up, horizon)
+        indicators.append({
+            "key": key, "name": name, "directional": directional, "desc": desc,
+            "raw": float(raw[key][-1]) if not np.isnan(raw[key][-1]) else None,
+            "pct": now_pct, "bucket": now_b, "table": pd.DataFrame(rows),
+            "rho_dn": rho_dn, "p_dn": p_dn, "rho_up": rho_up, "p_up": p_up,
+            "strength": max(abs(rho_dn or 0), abs(rho_up or 0)),
+        })
+    indicators.sort(key=lambda d: d["strength"], reverse=True)
+    out["indicators"] = indicators
+    by_key = {d["key"]: d for d in indicators}
+
+    # 헤드라인: 하락 확률(수급 과열 점수 현재 분위)
+    heat_ind = by_key["flow_heat"]
+    if heat_ind["bucket"] is not None:
+        row = heat_ind["table"][heat_ind["table"]["분위"] == heat_ind["bucket"]].iloc[0]
+        k = row["하락"] * row["표본"]
+        out["headline_dn"] = {"rate": float(row["하락"]), "n": int(row["표본"]), "bucket": heat_ind["bucket"],
+                              "ci": wilson_ci(k, int(row["표본"])), "basis": "수급 과열 점수",
+                              "up_rate": float(row["상승"])}
+    # 헤드라인: 상승 확률(기관 20일 순매수 우위 여부)
+    inst_s = f["inst_slope"].to_numpy()
+    ok_s = ~np.isnan(inst_s)
+    if ok_s[-1]:
+        state = inst_s > 0
+        now_state = bool(state[-1])
+        m = (state == now_state) & ok_s & known
+        n_s = int(m.sum())
+        out["headline_up"] = {"rate": float(y_up[m].mean()), "n": n_s, "ci": wilson_ci(y_up[m].sum(), n_s),
+                              "state": "순매수 우위" if now_state else "순매도 우위", "basis": "기관 20일 기울기",
+                              "dn_rate": float(y_dn[m].mean())}
+
+    # 괴리율 × 수급 과열 점수 3x3
+    d_p, f_p = pct["dev"], pct["flow_heat"]
+    okg = ~np.isnan(d_p) & ~np.isnan(f_p) & known
+    tri = lambda a: np.clip(np.floor(a * 3), 0, 2)
+    Dt, Ft = tri(d_p), tri(f_p)
+    grid_rate = np.full((3, 3), np.nan)
+    grid_n = np.zeros((3, 3), dtype=int)
+    for i in range(3):
+        for j in range(3):
+            m = okg & (Dt == i) & (Ft == j)
+            grid_n[i, j] = int(m.sum())
+            if m.sum() >= 30:
+                grid_rate[i, j] = y_dn[m].mean()
+    cur = (None, None)
+    if not np.isnan(d_p[-1]) and not np.isnan(f_p[-1]):
+        cur = (int(tri(d_p)[-1]), int(tri(f_p)[-1]))
+    out["grid"] = {"rate": grid_rate, "n": grid_n, "current": cur}
+    out["ok"] = True
+    return out
