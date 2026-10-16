@@ -3026,8 +3026,9 @@ def _render_tab_overheat():
             key="overheat_ma_window",
         )
         OVERHEAT_HORIZON = param_col2.slider(
-            "예측 기간 (거래일)", min_value=5, max_value=40, value=OVERHEAT_DEFAULT_HORIZON, step=1,
+            "예측 기간 (거래일) — 괴리율 구간 분석용", min_value=5, max_value=40, value=OVERHEAT_DEFAULT_HORIZON, step=1,
             key="overheat_horizon",
+            help="'지금 상황'의 확률은 10거래일·±7%로 고정(검증 기준)이고, 이 슬라이더는 아래 괴리율 구간 분석에만 적용됩니다.",
         )
         OVERHEAT_DRAWDOWN_THRESHOLD = param_col3.slider(
             "하락·상승 기준 (%)", min_value=3, max_value=20, value=int(OVERHEAT_DEFAULT_THRESHOLD * 100), step=1,
@@ -3045,7 +3046,7 @@ def _render_tab_overheat():
         if len(hist_full) < 2000:
             st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
                        "결과가 21년·10년 기준과 다를 수 있습니다.]")
-        rep = _render_overheat_situation(hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+        rep = _render_overheat_situation(hist_full, OVERHEAT_MA_WINDOW, signal_lab.HORIZON, signal_lab.THRESHOLD)
         st.divider()
         _render_risk_rules_section(hist_full)
         # 괴리율 구간 분석도 위 '분석 기간' 선택을 따른다(둘이 다른 표본을 보면 숫자가 어긋난다).

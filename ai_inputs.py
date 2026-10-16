@@ -3413,9 +3413,9 @@ def build_price_context(ticker: str) -> dict:
 # 여기서는 탭과 무관하게 데이터만으로 만든다.
 
 OVERHEAT_DEFAULT_MA_WINDOW = 80
-# 2026-10-16: 조기신호·수급 지표 검증과 같은 10거래일·7%로 맞췄다(예전 15일·10%).
-OVERHEAT_DEFAULT_HORIZON = 10
-OVERHEAT_DEFAULT_THRESHOLD = 0.07
+# 괴리율 구간 분석의 옛 그래프 조건(80일선·15일·10%). 수급 지표의 '지금 상황'은 signal_lab.HORIZON/THRESHOLD(10일·7%)를 따로 쓴다.
+OVERHEAT_DEFAULT_HORIZON = 15
+OVERHEAT_DEFAULT_THRESHOLD = 0.10
 OVERHEAT_QUANTILES = [0.20, 0.15, 0.10, 0.05]
 
 
@@ -3432,18 +3432,19 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
         return "가격 과열도 백테스트 미실행 (과거 데이터 부족)"
     situation = ""
     try:
-        sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist).tail(2520), ma_window=ma, horizon=horizon, thr=threshold)
+        sh, sthr = signal_lab.HORIZON, signal_lab.THRESHOLD
+        sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist).tail(2520), ma_window=ma, horizon=sh, thr=sthr)
         if sit.get("ok"):
             hu = sit.get("headline_up")
             parts_s = []
             if hu:
                 lo, hi = hu["ci"]
-                parts_s.append(f"{hu['basis']} {hu['state']} → +{threshold:.0%} 상승 확률 {hu['rate']:.1%}"
+                parts_s.append(f"{hu['basis']} {hu['state']} → {sh}거래일 내 +{sthr:.0%} 상승 확률 {hu['rate']:.1%}"
                                f"(전체 평균 {sit['base']['up']:.1%}, 표본 {hu['n']:,}일, 95% {lo:.0%}~{hi:.0%})")
             vol_ind = next((d for d in sit["indicators"] if d["key"] == "vol"), None)
             if vol_ind and vol_ind["bucket"]:
                 row = vol_ind["table"][vol_ind["table"]["분위"] == vol_ind["bucket"]].iloc[0]
-                parts_s.append(f"변동성 {vol_ind['bucket']}/5분위 → 하락·상승 모두 커지는 구간(이 구간의 -{threshold:.0%} 하락 {row['하락']:.0%} / +{threshold:.0%} 상승 {row['상승']:.0%}, "
+                parts_s.append(f"변동성 {vol_ind['bucket']}/5분위 → 하락·상승 모두 커지는 구간(이 구간의 -{sthr:.0%} 하락 {row['하락']:.0%} / +{sthr:.0%} 상승 {row['상승']:.0%}, "
                                "방향 없음)")
             situation = (f"[지금 상황 — {sit['asof']:%Y-%m-%d} 확정 기준, 점-시점 분위] " + "; ".join(parts_s)
                          + ". 수급 과열 점수로 본 하락 확률은 매도 근거로 약해(신호 후 평균 수익이 오히려 양수, p=0.19) 쓰지 않는다. ")
