@@ -14,6 +14,7 @@
 | `daily_history.py` | 128 | 일별 이력 CSV 저장/로드. 네트워크 코드 없음(순환 방지) |
 | `hbm.py` | 약 700 | HBM 탭 데이터: 출처 수집·사실 추출·원문 검증·종합. streamlit 미import |
 | `signal_lab.py` | 약 330 | 수급 조기신호·괴리율·추세추종 전략의 **계산부**(순열검정 `perm_p`, 점-시점 분위 `pit_bucket`, `early_signal_report`, `run_overheat_pit`, `run_ma_strategy`). streamlit·네트워크 없음. 화면과 AI 재료가 이걸 공유 |
+| `signal_ledger.py` | 약 130 | 낙폭 관리 규칙 4개의 **전향 검증 장부**(`data/signal_ledger.csv`): 마감 뒤 하루 한 줄 기록, 수정·백필 금지, `evaluate`로 기록 비중의 실제 성적 계산. 수집기 '신호장부' 스레드가 돈다 |
 | `long_history.py` | 약 140 | 10년 이상 일별 이력 CSV(KIS 2004~). 저장·로드·액면분할 가드·수집기 `tick`. 네트워크는 `ai_inputs.fetch_kis_stock_daily_long` |
 | `contract_outlook.py` | 약 350 | DRAM 탭 고정가 전망: 수집·검증(`validate_forecast`)·분석(`latest_table`/`pace_change`/`build_index`). streamlit 미import |
 
