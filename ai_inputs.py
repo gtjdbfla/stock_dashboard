@@ -37,7 +37,9 @@ import disclosure
 import financial_digest
 import fnguide
 import futures_history
+import long_history
 import over_market as om
+import signal_lab
 
 
 DEFAULT_TICKER = "000660"
@@ -1590,6 +1592,88 @@ def fetch_foreign_desk(ticker: str) -> dict:
     if len(hhmmss) == 6:
         stamp = f"{hhmmss[:2]}:{hhmmss[2:4]}"
     return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
+
+
+def fetch_kis_stock_daily_long(ticker: str, since: dt.date) -> pd.DataFrame:
+    """KIS '종목별 투자자매매동향(일별)'(FHPTJ04160001)을 since까지 과거로 30행씩 넘겨 받는다.
+
+    2004-12부터 종목별 외국인·기관·개인 순매수 수량과 종가·거래량을 준다(실측: SK하이닉스 5,402행,
+    최근 1,215거래일은 네이버 이력과 일치). 당일 조회는 한국시간 15:40 이전에 TIME LIMIT 오류를 내므로
+    그땐 전일부터 시작한다. 상장 전 구간은 거래대금 0짜리 자리표시 행이라 걸러낸다.
+    """
+    token = _kis_get_token()
+    if not token:
+        raise RuntimeError("KIS 토큰 없음")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET, "tr_id": "FHPTJ04160001", "custtype": "P",
+    }
+
+    def page(cursor: dt.date) -> list:
+        r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily",
+                         headers=headers, timeout=15,
+                         params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
+                                 "FID_INPUT_DATE_1": cursor.strftime("%Y%m%d"),
+                                 "FID_ORG_ADJ_PRC": "", "FID_ETC_CLS_CODE": ""})
+        r.raise_for_status()
+        j = r.json()
+        if j.get("rt_cd") != "0":
+            raise RuntimeError(j.get("msg1") or "KIS 오류")
+        return j.get("output2") or j.get("output") or []
+
+    today = dt.datetime.now(om.KST).date()
+    cursor = today
+    frames: list[pd.DataFrame] = []
+    while cursor > since:
+        try:
+            rows = page(cursor)
+        except Exception as exc:
+            if "TIME LIMIT" in str(exc) and cursor == today:
+                cursor -= dt.timedelta(days=1)
+                continue
+            time.sleep(2)
+            try:
+                rows = page(cursor)
+            except Exception:
+                if frames:           # 상장 이전은 500을 내기도 한다 — 거기까지를 이력으로 본다
+                    break
+                raise
+        if not rows:
+            break
+        df = pd.DataFrame(rows)
+        frames.append(df)
+        oldest = dt.datetime.strptime(df["stck_bsop_date"].min(), "%Y%m%d").date()
+        if oldest >= cursor:
+            break
+        cursor = oldest - dt.timedelta(days=1)
+        time.sleep(0.2)
+    if not frames:
+        return pd.DataFrame(columns=TREND_COLUMNS)
+    df = pd.concat(frames).drop_duplicates("stck_bsop_date").reset_index(drop=True)
+    num = lambda c: pd.to_numeric(df[c], errors="coerce")
+    out = pd.DataFrame({
+        "날짜": pd.to_datetime(df["stck_bsop_date"]), "종가": num("stck_clpr"), "거래량": num("acml_vol"),
+        "기관": num("orgn_ntby_qty"), "외국인": num("frgn_ntby_qty"), "개인": num("prsn_ntby_qty"),
+        "거래대금": num("acml_tr_pbmn"),
+    })
+    out = out[(out["거래대금"] > 0) & (out["날짜"].dt.date >= since)].drop(columns="거래대금")
+    return out.sort_values("날짜").reset_index(drop=True)
+
+
+def fetch_long_history_live(ticker: str, years: float = 10) -> pd.DataFrame:
+    """장기 이력 파일(KIS) + 최근 며칠 실시간 덧씌우기. 파일이 아직 없으면 700거래일 이력으로 대신한다.
+
+    일부러 캐시하지 않는 함수다 — 파일 읽기는 수 ms이고, 캐시(fetch_backtest_history는 24시간)에 걸면
+    장기 파일이 생기기 전에 받은 700일짜리가 하루 내내 남는다.
+    """
+    base = long_history.load(ticker, int(years * 252))
+    if base is None:
+        return fetch_backtest_history_live(ticker, target_days=700)
+    latest = fetch_latest_bars(ticker)
+    if latest.empty:
+        return base
+    merged = pd.concat([base, latest], ignore_index=True).drop_duplicates(subset="날짜", keep="last")
+    return merged.sort_values("날짜").reset_index(drop=True)
 
 
 def fetch_investor_estimate(ticker: str) -> dict:

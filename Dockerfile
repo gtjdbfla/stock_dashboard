@@ -19,6 +19,8 @@ COPY ai_inputs.py .
 COPY ai_report.py .
 COPY daily_history.py .
 COPY futures_history.py .
+COPY long_history.py .
+COPY signal_lab.py .
 COPY analyst_digest.py .
 COPY analyst_targets.py .
 COPY disclosure.py .
