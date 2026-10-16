@@ -2683,57 +2683,46 @@ def build_capex_summary() -> str:
 
 
 def build_early_signal_summary(ticker: str) -> str:
-    """하락·상승 조기신호. 탭에는 있는데 프롬프트에는 빠져 있던 값이다.
+    """수급 조기신호(기관 20일 누적 순매수 기울기). 하락·상승 조기신호 탭과 같은 함수·같은 이력을 쓴다.
 
-    두 탭과 같은 함수·같은 상수를 써서 화면과 AI가 다른 숫자를 보는 일이 없게 한다.
+    2026-10-16 SK하이닉스 10년·21년 재검증으로 신호를 바꿨다: 옛 하락 신호(외국인 순매도 + 거래량 증가)는
+    예측력이 없었고(AUC≈0.50), 옛 상승 신호(기관 매수 + 개인 매도 + 거래량)는 기관 기울기 하나보다 약했다.
     """
-    if ticker != DEFAULT_TICKER:      # 이 두 지표는 SK하이닉스에서만 검증됐다
+    if ticker != DEFAULT_TICKER:      # 이 지표는 SK하이닉스에서만 검증됐다
         return ""
     try:
-        hist = fetch_backtest_history_live(ticker, target_days=700)
+        hist = fetch_long_history_live(ticker, years=10)
+        rep = signal_lab.early_signal_report(hist)
     except Exception:
         return ""
-    if len(hist) < 40:
+    if not rep.get("ok"):
         return ""
+    cur, base, h, thr = rep["current"], rep["base"], rep["horizon"], rep["threshold"]
+    up_rule, dn_rule = rep["rules"][0], rep["rules"][3]
 
-    lines = []
-    try:
-        foreign_slope = _rolling_slope(hist["외국인"], DECLINE_PATTERN_WINDOW)
-        vol_ratio = hist["거래량"] / hist["거래량"].rolling(DECLINE_PATTERN_VOL_WINDOW).mean()
-        bt = run_boolean_pattern_backtest(
-            hist["종가"], hist["날짜"], (foreign_slope < 0) & (vol_ratio > 1.0),
-            DECLINE_HORIZON, drawdown_threshold=DECLINE_DRAWDOWN_THRESHOLD)
-        matched = bool(bt["current_match"])
-        down = bt["match_down_rate"] if matched else bt["rest_down_rate"]
-        lines.append(
-            f"- 하락 조기신호(외국인 순매도 + 거래량 증가): 현재 "
-            f"{'조건 충족' if matched else '조건 미충족'} "
-            f"(외국인 {DECLINE_PATTERN_WINDOW}일 기울기 {float(foreign_slope.dropna().iloc[-1]):,.0f}, "
-            f"거래량 {float(vol_ratio.dropna().iloc[-1]):.2f}배). "
-            f"이 상태의 과거 {DECLINE_HORIZON}거래일 내 "
-            f"{DECLINE_DRAWDOWN_THRESHOLD:.0%} 하락 확률 "
-            + (f"{down:.1%}" if down is not None else "N/A"))
-    except Exception:
-        pass
+    def rate(rule, key):
+        d = rule[key]
+        return d["sig"] if rule["now"] else d["rest"]
 
-    try:
-        inst_slope = _rolling_slope(hist["기관"], RALLY_PATTERN_WINDOW)
-        retail_slope = _rolling_slope(hist["개인"], RALLY_PATTERN_WINDOW)
-        vol_ratio = hist["거래량"] / hist["거래량"].rolling(RALLY_PATTERN_VOL_WINDOW).mean()
-        bt = run_boolean_pattern_backtest(
-            hist["종가"], hist["날짜"],
-            (inst_slope > 0) & (retail_slope < 0) & (vol_ratio > 1.0),
-            RALLY_HORIZON, drawdown_threshold=RALLY_DRAWDOWN_THRESHOLD)
-        matched = bool(bt["current_match"])
-        up = bt["match_up_rate"] if matched else bt["rest_up_rate"]
-        lines.append(
-            f"- 상승 조기신호(기관 순매수 + 개인 순매도 + 거래량 증가): 현재 "
-            f"{'조건 충족' if matched else '조건 미충족'}. "
-            f"이 상태의 과거 {RALLY_HORIZON}거래일 내 상승 확률 "
-            + (f"{up:.1%}" if up is not None else "N/A")
-            + " (앞반기에서는 방향이 뒤집혀 신뢰도가 낮은 지표다)")
-    except Exception:
-        pass
+    def cell(d):
+        if d["sig"] is None:
+            return "N/A"
+        p = "" if d["p"] is None else f", 순열검정 p={d['p']:.2f}"
+        return f"{d['sig']:.0%} vs 아닐 때 {d['rest']:.0%}{p}"
+
+    q = cur["bucket"]
+    side = "순매수 우위" if cur["inst_slope"] > 0 else "순매도 우위"
+    lines = [
+        f"- 수급 조기신호({rep['start']:%Y-%m}~{rep['end']:%Y-%m} {rep['n']}거래일, 기관 {signal_lab.SIGNAL_WINDOW}일 누적 순매수 기울기 기준): "
+        f"현재 기관은 **{side}**(기울기 {cur['inst_slope']:,.0f}주/일"
+        + (f", 과거 분포 {q}/5분위" if q else "") + ")이다. "
+        f"현재 상태에서 과거 {h}거래일 내 +{thr:.0%} 상승 확률 {rate(up_rule, 'up'):.1%}, "
+        f"-{thr:.0%} 하락 확률 {rate(dn_rule, 'dn'):.1%} (전체 평균 상승 {base['up']:.1%} / 하락 {base['dn']:.1%}).",
+        f"- 근거: 기관 기울기>0이면 {h}거래일 내 +{thr:.0%} 상승 {cell(up_rule['up'])}; "
+        f"기관 기울기<0이면 변동성 대비 큰 하락 {cell(dn_rule['dnz'])}. "
+        "백테스트 기반 참고치이며 확률이 몇 %p 움직이는 정도라 단독 근거로 쓰지 마라. "
+        "(옛 '외국인 순매도 + 거래량 증가' 하락 신호는 10년·21년 검증에서 예측력이 없어 폐기했다.)",
+    ]
     return "\n".join(lines)
 
 
@@ -3121,7 +3110,7 @@ def generate_ai_analysis(
 [가격 과열도 백테스트 — 과거 통계 참고용, 매매 신호 아님]
 {_tab_summary(overheat_summary, "가격 과열도")}
 
-[하락 · 상승 조기신호 — 과거 통계 참고용, 매매 신호 아님]
+[수급 조기신호(기관 순매수 기울기) — 과거 통계 참고용, 매매 신호 아님]
 {early_signal_md if early_signal_md else "(해당 없음)"}
 
 [정량 신호 — 매매신호 · 통합신호 · 선물경보. 모두 과거 통계 백테스트 참고용, 매수·매도 지시 아님]
@@ -3231,7 +3220,7 @@ def generate_ai_analysis(
 - 빅테크 Capex: 최근 분기와 전년 동기 대비 방향 + HBM 수요 의미 (중장기 배경이지 오늘 등락 원인 아님)
 - DRAM 고정가 전망: **두 문장**으로. ① [고정가 전망]의 분기별 QoQ 범위로 방향과 증가 속도(둔화/가속)·직전 발표 대비 상향/하향을 발표일과 함께 (전망임을 밝힘). ② 같은 섹션의 '현물가 실제 변화 vs 고정가 전망' 줄로 완결 분기의 현물가 변화율이 전망 범위와 어떻게 비교되는지(예: 범용 품목은 비슷, 서버용은 크게 웃돎)와 '현물가 모멘텀' 줄의 최근 4주 방향 — 품목별로 갈리면 갈린다고 써라. 두 번째 문장을 빼지 마라
 - HBM 펀더멘털: [HBM 펀더멘털]의 사실만으로 가격·공급 환경의 방향과 마이크론 CMBU 추이를 숫자와 **사실 날짜**로 (중장기 배경, 오늘 등락 원인 아님)
-- 하락·상승 조기신호: 충족 여부와 확률 ("백테스트 기반 참고치" 필수)
+- 수급 조기신호: 기관 순매수 우위/열위 여부와 그 상태의 상승·하락 확률 ("백테스트 기반 참고치" 필수, 확률이 몇 %p 움직이는 정도라는 점을 흐리지 말 것)
 - 다가오는 실적 발표: 며칠 뒤 무엇 (결과 예측 금지)
 - 목표주가 방향: 상향/하향 (기록 없으면 없다고)
 - 차입공매도 비중: 현재 수준과 1년 평균 대비 위치, 최근 방향
@@ -3390,30 +3379,24 @@ OVERHEAT_DEFAULT_THRESHOLD = 0.10
 OVERHEAT_QUANTILES = [0.20, 0.15, 0.10, 0.05]
 
 
-def build_overheat_summary(ticker: str) -> str:
-    """가격 과열도 백테스트 요약.
+def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: float) -> str:
+    """가격 과열도 백테스트 요약문. 화면 탭과 AI 재료가 같은 문장을 쓴다(조건만 호출자가 정한다).
 
-    화면에는 이 조건을 바꾸는 슬라이더가 있지만, 그건 사람이 이것저것 눌러 보라고 둔
-    것이다. AI에 넘기는 재료는 기준이 매번 달라지면 안 되므로 기본값만 쓴다.
+    점-시점 분위(그날까지의 과거 분포로만 구간 판정)와 순열검정 p값을 쓴다. 2026-10-16 10년·21년
+    재검증 결과: 과열(상위) 구간은 하락 확률만이 아니라 상승 확률과 이후 평균수익도 같이 높았고
+    (변동폭 확대), 점-시점으로 보면 하락 확률 차이도 유의하지 않았다. 그래서 '과열이 심할수록 하락
+    확률이 높아짐'이라고 쓰지 않는다.
     """
-    ma, horizon = OVERHEAT_DEFAULT_MA_WINDOW, OVERHEAT_DEFAULT_HORIZON
-    threshold = OVERHEAT_DEFAULT_THRESHOLD
-    hist = fetch_backtest_history_live(ticker, target_days=700)
-    if len(hist) < 80:
+    if len(hist) < 330:
         return "가격 과열도 백테스트 미실행 (과거 데이터 부족)"
-
-    high = {q: run_overheat_backtest(hist, "종가", ma, horizon, quantile=q,
-                                     drawdown_threshold=threshold, side="high")
-            for q in OVERHEAT_QUANTILES}
-    low = {q: run_overheat_backtest(hist, "종가", ma, horizon, quantile=q,
-                                    drawdown_threshold=threshold, side="low")
-           for q in OVERHEAT_QUANTILES}
+    kw = dict(drawdown_threshold=threshold)
+    high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="high", **kw) for q in OVERHEAT_QUANTILES}
+    low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="low", **kw) for q in OVERHEAT_QUANTILES}
     result = high[OVERHEAT_QUANTILES[0]]
     if result["n"] < 30:
         return "가격 과열도 백테스트 미실행 (표본 부족)"
 
     deviation = result["current_deviation"]
-    # 현재 괴리율이 어느 구간에 드는지. 위(과열)부터 보고, 아니면 아래(침체)를 본다.
     label = "평상시"
     for q in sorted(OVERHEAT_QUANTILES):
         cutoff = high[q]["hi_cutoff"]
@@ -3427,25 +3410,36 @@ def build_overheat_summary(ticker: str) -> str:
                 label = f"하위 {q:.0%} 구간(침체)"
                 break
 
-    # 화면 표와 같은 차례로 적는다: 하위는 낮은 분위부터, 상위는 넓은 분위부터.
-    # 침체 쪽을 빼면 지금처럼 하위 구간에 들어와 있을 때 근거가 통째로 사라진다.
-    parts = []
-    for q in sorted(OVERHEAT_QUANTILES):
-        rate = low[q]["hi_rate"]
-        parts.append(f"하위 {q:.0%}: " + (f"{rate:.1%}" if rate is not None else "N/A"))
-    for q in sorted(OVERHEAT_QUANTILES, reverse=True):
-        rate = high[q]["hi_rate"]
-        parts.append(f"상위 {q:.0%}: " + (f"{rate:.1%}" if rate is not None else "N/A"))
+    def part(tag, r):
+        if r["hi_rate"] is None:
+            return f"{tag}: N/A"
+        p = "" if r["p_value"] is None else f", 하락 p={r['p_value']:.2f}"
+        return (f"{tag}: 하락 {r['hi_rate']:.0%}·상승 {r['hi_up_rate']:.0%}·"
+                f"이후 {horizon}일 평균수익 {r['hi_ret']:+.1%}{p}")
 
+    parts = [part(f"하위 {q:.0%}", low[q]) for q in sorted(OVERHEAT_QUANTILES)]
+    parts += [part(f"상위 {q:.0%}", high[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)]
     return (
-        f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, "
-        f"기저 하락 확률 {result['base_rate']:.1%}): "
-        f"괴리율 구간별 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률"
-        f"({', '.join(parts)})은 과열이 심할수록 높아짐. "
+        f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, 점-시점 분위: 각 날짜의 구간을 그날까지의 과거 "
+        f"분포로만 판정): 전체 기준 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률 {result['base_rate']:.1%}, "
+        f"상승 확률 {result['base_up_rate']:.1%}. 구간별 — {'; '.join(parts)}. "
+        "해석: 괴리율이 극단(상위·하위)일수록 하락만이 아니라 상승 확률도 같이 커진다 — 변동폭 확대이지 방향 신호가 "
+        "아니며, 과열 구간 이후의 평균수익은 오히려 높았다. 하락 확률 차이는 대부분 유의하지 않다(p 표기). "
         f"현재 상태: {label}"
         + (f" (괴리율 {deviation:+.1%})" if deviation is not None else "")
         + ". (통계 참고용, 매매 신호 아님)"
     )
+
+
+def build_overheat_summary(ticker: str) -> str:
+    """가격 과열도 백테스트 요약.
+
+    화면에는 이 조건을 바꾸는 슬라이더가 있지만, 그건 사람이 이것저것 눌러 보라고 둔
+    것이다. AI에 넘기는 재료는 기준이 매번 달라지면 안 되므로 기본값만 쓴다.
+    """
+    hist = fetch_long_history_live(ticker, years=10)
+    return overheat_summary_text(hist, OVERHEAT_DEFAULT_MA_WINDOW, OVERHEAT_DEFAULT_HORIZON,
+                                 OVERHEAT_DEFAULT_THRESHOLD)
 
 
 def build_dram_summary() -> str:

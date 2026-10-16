@@ -26,7 +26,7 @@ SOURCE_FIELDS = [
     ("오늘 장중 흐름", "intraday"),
     ("정규장 밖 움직임 (프리장·애프터장)", "over_market"),
     ("코스피 시장 전체 수급", "market_flow"),
-    ("하락·상승 조기신호", "early_signal"),
+    ("수급 조기신호 (기관 순매수 기울기)", "early_signal"),
     ("정량 신호 (매매·통합·선물)", "quant_signal"),
     ("가격 과열도 백테스트", "overheat"),
     ("DRAM 현물가", "dram"),

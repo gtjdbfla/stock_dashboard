@@ -339,6 +339,7 @@ REFRESH_HOURS = [int(h) for h in os.environ.get(
     "AI_ANALYSIS_REFRESH_HOURS", "8,9,10,11,12,13,14,15,16,17,18,19,20").split(",") if h.strip()]
 
 _last_slot: dt.datetime | None = None
+_slot_restored = False
 
 
 def _last_passed_slot(hours: list[int], now: dt.datetime) -> dt.datetime | None:
@@ -355,9 +356,22 @@ def tick(now: dt.datetime, ticker: str, stock_name: str, log=print) -> None:
     주말에도 돈다. 금요일 장이 끝난 뒤에도 미국 증시·DRAM 시세·공시는 계속 바뀌고,
     월요일 아침에 열었을 때 지난 금요일 분석이 떠 있으면 그게 더 헷갈린다.
     """
-    global _last_slot
+    global _last_slot, _slot_restored
     slot = _last_passed_slot(REFRESH_HOURS, now)
-    if slot is None or slot == _last_slot:
+    if slot is None:
+        return
+    if not _slot_restored:
+        # 컨테이너를 다시 띄울 때마다 이번 시각분을 처음부터 또 만들면 모델 쿼터(모델당 하루 20회쯤)가 배포 횟수만큼
+        # 샌다. 저장된 분석이 이미 이번 시각 이후에 만들어졌다면 그걸로 이번 시각분을 끝난 것으로 본다.
+        _slot_restored = True
+        try:
+            saved = ai_analysis.load(ticker)
+            made = dt.datetime.strptime(str(saved.get("time")), "%Y-%m-%d %H:%M").replace(tzinfo=slot.tzinfo)
+            if made >= slot:
+                _last_slot = slot
+        except Exception:
+            pass
+    if slot == _last_slot:
         return
     # 먼저 표시해 둔다. 생성이 실패해도 같은 시각을 매 순회마다 다시 시도하지 않는다
     # (한 번에 30~100초가 걸려서, 실패를 반복하면 수집기의 시세 기록이 밀린다).

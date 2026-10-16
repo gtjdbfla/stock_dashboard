@@ -28,6 +28,7 @@ import disclosure
 import financial_digest
 import fnguide
 import hbm
+import signal_lab
 import over_market as om
 from bs4 import BeautifulSoup
 from google import genai
@@ -59,6 +60,7 @@ from ai_inputs import (
     OVERHEAT_DEFAULT_MA_WINDOW,
     OVERHEAT_DEFAULT_THRESHOLD,
     OVERHEAT_QUANTILES,
+    overheat_summary_text,
     POSITIVE_KEYWORDS,
     RALLY_DRAWDOWN_THRESHOLD,
     RALLY_HORIZON,
@@ -80,6 +82,7 @@ from ai_inputs import (
     fetch_analyst_reports,
     fetch_backtest_history,
     fetch_backtest_history_live,
+    fetch_long_history_live,
     fetch_bigtech_capex,
     fetch_community_posts,
     fetch_current_price,
@@ -104,9 +107,7 @@ from ai_inputs import (
     forward_max_drawdown,
     forward_max_gain,
     load_over_market_ticks,
-    run_boolean_pattern_backtest,
     run_futures_decline_backtest,
-    run_overheat_backtest,
     two_proportion_ztest,
 )
 # 밑줄로 시작하는 이름은 from ... import *가 가져오지 않는다. 화면이 쓰는 것만 따로.
@@ -239,8 +240,8 @@ ALL_TAB_LABELS = [
     "가격 과열도",
     "선물 경보",
     "통합 신호",
-    "하락 조기신호",
-    "상승 조기신호",
+    "수급 약화 경고",
+    "수급 강세 신호",
     "DRAM 시세",
     "HBM",
     "빅테크 Capex",
@@ -772,7 +773,7 @@ with st.sidebar:
     # 디시 갤러리(0.9초)를 훑어서 콜드 로딩의 4분의 1쯤을 차지했다.
     # 여론 자체는 AI 분석에 build_community_summary()로 계속 들어간다.
     DEFAULT_HIDDEN_TAB_LABELS = {"매매 신호", "선물 경보", "통합 신호",
-                                 "하락 조기신호", "상승 조기신호", "커뮤니티"}
+                                 "수급 약화 경고", "수급 강세 신호", "커뮤니티"}
     with st.expander("표시할 탭 선택"):
         visible_tab_labels = [
             label for label in ALL_TAB_LABELS
@@ -806,64 +807,6 @@ st.title(STOCK_NAME)
 
 
 
-
-
-
-
-
-def run_overheat_threshold_strategy(
-    df_with_deviation: pd.DataFrame, period_start: pd.Timestamp,
-) -> dict:
-    """괴리율이 0% 이상이면 보유하고, 0% 밑으로 내려가면 전량 매도했다가 다시 0% 이상으로
-    올라오면 재매수하는 전략을 period_start 이후 구간에서 시뮬레이션하고 buy & hold와 비교한다.
-    (= 주가가 이동평균선 위에 있을 때만 보유하는 추세추종 전략)
-    이동평균/괴리율은 전체 이력 기준으로 계산된 값을 그대로 사용해 lookback 손실이 없다."""
-    test_df = df_with_deviation[df_with_deviation["날짜"] >= period_start].dropna(subset=["괴리율"]).reset_index(drop=True)
-    result = {
-        "n_days": len(test_df), "trades": [], "cum_return": None, "buy_hold_return": None,
-        "still_open": False, "unrealized_return": None, "equity_curve": None,
-        "period_start": None, "period_end": None,
-    }
-    if test_df.empty:
-        return result
-
-    result["period_start"] = test_df.iloc[0]["날짜"]
-    result["period_end"] = test_df.iloc[-1]["날짜"]
-    result["buy_hold_return"] = float(test_df.iloc[-1]["종가"] / test_df.iloc[0]["종가"] - 1)
-
-    position = None
-    trades = []
-    equity = []
-    equity_base = 1.0
-    for _, row in test_df.iterrows():
-        date, price, deviation = row["날짜"], row["종가"], row["괴리율"]
-        if position is None:
-            equity.append({"날짜": date, "자산가치": equity_base})
-            if deviation >= 0:
-                position = {"buy_date": date, "buy_price": price}
-        else:
-            mark = equity_base * (price / position["buy_price"])
-            equity.append({"날짜": date, "자산가치": mark})
-            if deviation < 0:
-                equity_base = mark
-                trades.append({
-                    "buy_date": position["buy_date"], "sell_date": date,
-                    "buy_price": position["buy_price"], "sell_price": price,
-                    "ret": price / position["buy_price"] - 1,
-                })
-                position = None
-
-    result["trades"] = trades
-    result["still_open"] = position is not None
-    cum_return = 1.0
-    for t in trades:
-        cum_return *= (1 + t["ret"])
-    if position is not None:
-        result["unrealized_return"] = float(test_df.iloc[-1]["종가"] / position["buy_price"] - 1)
-        cum_return *= (1 + result["unrealized_return"])
-    result["cum_return"] = float(cum_return - 1) if trades or position is not None else None
-    result["equity_curve"] = pd.DataFrame(equity)
-    return result
 
 
 
@@ -2185,7 +2128,7 @@ BIGTECH_CAPEX_REFRESH_HOURS = [16]
 # 선물·통합 신호 계열 탭이 쓰는 데이터. 코스피200 선물 이력은 페이지마다 다음 조회 날짜가
 # 앞 응답에서 나와서 병렬로 못 받고, 700일을 채우는 데 8초 넘게 걸린다.
 # 이 탭들은 기본으로 꺼져 있으므로, 켜져 있을 때만 미리 데워둔다.
-_FUTURES_TAB_LABELS = {"선물 경보", "통합 신호", "하락 조기신호", "상승 조기신호", "매매 신호"}
+_FUTURES_TAB_LABELS = {"선물 경보", "통합 신호", "수급 약화 경고", "수급 강세 신호", "매매 신호"}
 
 
 def _refresh_market_data_caches() -> None:
@@ -2787,6 +2730,16 @@ def _render_tab_supply():
 # 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
 # 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_overheat_results(hist: pd.DataFrame, ma: int, horizon: int, thr: float) -> tuple[dict, dict]:
+    """점-시점 분위 + 순열검정이라 8번 합쳐 1초쯤 걸린다. 같은 이력·조건이면 15분간 재사용한다."""
+    high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="high")
+            for q in OVERHEAT_QUANTILES}
+    low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, drawdown_threshold=thr, side="low")
+           for q in OVERHEAT_QUANTILES}
+    return high, low
+
+
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
 @st.fragment
 def _render_tab_overheat():
@@ -2798,9 +2751,18 @@ def _render_tab_overheat():
 
     _subheader_with_help(
         "가격 과열도 백테스트",
-        "이동평균 대비 괴리율 구간별로 향후 하락 확률이 어떻게 달라지는지 보는 통계입니다. "
-        "기본값은 168개 조합을 백테스트해 고른 값입니다.\n\n"
-        "상승 확률은 괴리율과 관계가 없어(U자형) 표시하지 않습니다. 매매 신호가 아닙니다.",
+        "이동평균 대비 괴리율 구간별로 이후 하락·상승 확률과 평균 수익이 어떻게 달라지는지 보는 통계입니다.\n\n"
+        "**읽는 법**: SK하이닉스 10년·21년 검증에서 괴리율이 극단(상위·하위 5%)일 때 하락 확률이 높아지긴 했지만 "
+        "**상승 확률도 같이 높아졌고**, 과열 구간 이후의 평균 수익은 오히려 높았습니다(10년: 상위 구간 상승 60~64% vs "
+        "30%, 15일 평균 +6.5% vs +2.1%). 변동폭이 커진다는 뜻이지 '과열이면 떨어진다'는 방향 신호가 아닙니다. "
+        "괴리율을 변동성으로 나누면 효과가 사라졌습니다.\n\n"
+        "**점-시점 분위**: 각 날짜가 상위 N% 구간인지는 그날까지의 과거 분포만으로 판정합니다. 전체 구간 분포로 정하면 "
+        "미래 정보가 섞여 하락 효과가 부풀려집니다(그렇게 하면 상위 10%에서 유의해 보였다가, 점-시점으로 보면 사라졌습니다). "
+        "p값은 신호의 군집을 보존한 순열검정이며 하락 확률이 더 높다는 가설의 단측 검정입니다. 연속한 날짜를 독립 표본으로 "
+        "세는 z검정은 p를 크게 과소평가해 쓰지 않습니다.\n\n"
+        "**기본값(80일선·15일·10%)**은 예전에 168개 조합을 백테스트해 골랐지만, 해마다 훈련으로 고르고 다음 해에 평가하는 "
+        "워크포워드에서는 이점이 없었습니다(고른 설정 +1.7%p, 고정 기본값 -0.1%p). 아래 슬라이더로 바꿔 봐도 "
+        "'맞는 설정'이 따로 있는 것은 아닙니다. 매매 신호가 아닙니다.",
         key="overheat",
     )
 
@@ -2821,26 +2783,17 @@ def _render_tab_overheat():
 
     try:
         _ov_t = time.monotonic()
-        overheat_hist = fetch_backtest_history_live(TICKER, target_days=700)
+        overheat_hist = fetch_long_history_live(TICKER, years=10)
         if _BOOT_PROFILE:
-            print(f"[boot]     과열도: 700일 이력 fetch {time.monotonic() - _ov_t:.2f}s", flush=True)
-        if len(overheat_hist) < 80:
+            print(f"[boot]     과열도: 장기 이력 fetch {time.monotonic() - _ov_t:.2f}s", flush=True)
+        if len(overheat_hist) < 330:
             st.warning("백테스트에 충분한 과거 데이터가 없습니다.")
         else:
-            overheat_results = {
-                q: run_overheat_backtest(
-                    overheat_hist, "종가", OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON,
-                    quantile=q, drawdown_threshold=OVERHEAT_DRAWDOWN_THRESHOLD, side="high",
-                )
-                for q in OVERHEAT_QUANTILES
-            }
-            overheat_results_low = {
-                q: run_overheat_backtest(
-                    overheat_hist, "종가", OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON,
-                    quantile=q, drawdown_threshold=OVERHEAT_DRAWDOWN_THRESHOLD, side="low",
-                )
-                for q in OVERHEAT_QUANTILES
-            }
+            if len(overheat_hist) < 2000:
+                st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
+                           "10년 기준 결과와 다를 수 있습니다.]")
+            overheat_results, overheat_results_low = _cached_overheat_results(
+                overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
             if _BOOT_PROFILE:
                 print(f"[boot]     과열도: 백테스트 8회 {time.monotonic() - _ov_t:.2f}s (fetch 포함 누적)", flush=True)
             overheat_result = overheat_results[OVERHEAT_QUANTILES[0]]
@@ -2865,14 +2818,17 @@ def _render_tab_overheat():
 
                 if matched_quantile is not None:
                     current_regime_label = f"상위 {matched_quantile:.0%} 구간(과열)"
-                    current_down_rate = overheat_results[matched_quantile]["hi_rate"]
+                    cur_r = overheat_results[matched_quantile]
+                    current_down_rate, current_up_rate = cur_r["hi_rate"], cur_r["hi_up_rate"]
                 elif matched_quantile_low is not None:
                     current_regime_label = f"하위 {matched_quantile_low:.0%} 구간(침체)"
-                    current_down_rate = overheat_results_low[matched_quantile_low]["hi_rate"]
+                    cur_r = overheat_results_low[matched_quantile_low]
+                    current_down_rate, current_up_rate = cur_r["hi_rate"], cur_r["hi_up_rate"]
                 else:
                     current_regime_label = "평상시"
                     widest_q = max(OVERHEAT_QUANTILES)
                     current_down_rate = overheat_results[widest_q]["rest_rate"]
+                    current_up_rate = overheat_results[widest_q]["rest_up_rate"]
 
                 deviation_series = (overheat_hist["종가"] / overheat_hist["종가"].rolling(OVERHEAT_MA_WINDOW).mean() - 1).dropna()
                 current_percentile = (
@@ -2881,7 +2837,7 @@ def _render_tab_overheat():
                     else None
                 )
 
-                metric_col1, metric_col2 = st.columns(2)
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
                 metric_col1.metric(
                     "현재 괴리율",
                     f"{current_deviation:+.1%} (상위 {current_percentile:.0%})"
@@ -2891,52 +2847,73 @@ def _render_tab_overheat():
                     f"현재 구간의 {OVERHEAT_HORIZON}거래일 내 하락 확률",
                     f"{current_down_rate:.1%}" if current_down_rate is not None else "N/A",
                 )
+                metric_col3.metric(
+                    f"현재 구간의 {OVERHEAT_HORIZON}거래일 내 상승 확률",
+                    f"{current_up_rate:.1%}" if current_up_rate is not None else "N/A",
+                )
                 st.caption(
-                    f"현재 상태: {current_regime_label} · 표본 {overheat_result['n']}일 · "
-                    f"전체 기간 기저 하락 확률 {overheat_result['base_rate']:.1%}"
+                    f"현재 상태: {current_regime_label} · 표본 {overheat_result['n']:,}일 · "
+                    f"전체 기간 기저 하락 확률 {overheat_result['base_rate']:.1%} · 기저 상승 확률 {overheat_result['base_up_rate']:.1%}"
                 )
 
+                def _row(label, r):
+                    return {
+                        "과열 구간": label,
+                        "괴리율": r["hi_cutoff"],
+                        "표본 수": r["hi_n"],
+                        "하락 확률": r["hi_rate"],
+                        "p-value(하락)": r["p_value"],
+                        "상승 확률": r["hi_up_rate"],
+                        f"이후 {OVERHEAT_HORIZON}일 평균수익": r["hi_ret"],
+                    }
+
                 breakdown_rows = [
-                    {
-                        "과열 구간": f"하위 {q:.0%}",
-                        "괴리율": overheat_results_low[q]["hi_cutoff"],
-                        "표본 수": overheat_results_low[q]["hi_n"],
-                        "하락 확률": overheat_results_low[q]["hi_rate"],
-                        "p-value(하락)": overheat_results_low[q]["p_value"],
-                    }
-                    for q in sorted(OVERHEAT_QUANTILES)
+                    _row(f"하위 {q:.0%}", overheat_results_low[q]) for q in sorted(OVERHEAT_QUANTILES)
                 ] + [
-                    {
-                        "과열 구간": f"상위 {q:.0%}",
-                        "괴리율": overheat_results[q]["hi_cutoff"],
-                        "표본 수": overheat_results[q]["hi_n"],
-                        "하락 확률": overheat_results[q]["hi_rate"],
-                        "p-value(하락)": overheat_results[q]["p_value"],
-                    }
-                    for q in sorted(OVERHEAT_QUANTILES, reverse=True)
+                    _row(f"상위 {q:.0%}", overheat_results[q]) for q in sorted(OVERHEAT_QUANTILES, reverse=True)
                 ]
                 breakdown_df = pd.DataFrame(breakdown_rows).dropna(subset=["괴리율"]).sort_values("괴리율").reset_index(drop=True)
+                ret_col = f"이후 {OVERHEAT_HORIZON}일 평균수익"
 
                 fig_breakdown = go.Figure()
                 fig_breakdown.add_trace(go.Scatter(
                     x=breakdown_df["괴리율"], y=breakdown_df["하락 확률"], name="하락 확률",
                     mode="lines+markers", line=dict(color="#d62728"), marker=dict(size=8),
                     customdata=breakdown_df[["과열 구간", "표본 수", "p-value(하락)"]],
-                    hovertemplate="%{customdata[0]} (괴리율 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · p-value %{customdata[2]:.4f}<extra></extra>",
+                    hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>하락 확률 %{y:.1%}<br>표본 %{customdata[1]}일 · p-value %{customdata[2]:.2f}<extra></extra>",
+                ))
+                fig_breakdown.add_trace(go.Scatter(
+                    x=breakdown_df["괴리율"], y=breakdown_df["상승 확률"], name="상승 확률",
+                    mode="lines+markers", line=dict(color="#2ca02c"), marker=dict(size=8),
+                    customdata=breakdown_df[["과열 구간", "표본 수", ret_col]],
+                    hovertemplate="%{customdata[0]} (경계 %{x:.1%})<br>상승 확률 %{y:.1%}<br>이후 평균수익 %{customdata[2]:+.1%}<extra></extra>",
                 ))
                 fig_breakdown.add_hline(
                     y=overheat_result["base_rate"], line_dash="dash", line_color="#d62728", opacity=0.5,
                     annotation_text="기저 하락 확률", annotation_position="bottom right",
+                )
+                fig_breakdown.add_hline(
+                    y=overheat_result["base_up_rate"], line_dash="dash", line_color="#2ca02c", opacity=0.5,
+                    annotation_text="기저 상승 확률", annotation_position="top right",
                 )
                 if current_deviation is not None:
                     fig_breakdown.add_vline(
                         x=current_deviation, line_dash="dot", line_color="gray",
                         annotation_text="현재 괴리율", annotation_position="bottom",
                     )
-                fig_breakdown.update_xaxes(title_text="괴리율", tickformat=".0%")
+                fig_breakdown.update_xaxes(title_text="괴리율 경계", tickformat=".0%")
                 fig_breakdown.update_yaxes(title_text=f"{OVERHEAT_HORIZON}거래일 내 확률", tickformat=".0%")
-                _style_chart_mobile(fig_breakdown)
+                _style_chart_mobile(fig_breakdown, title="괴리율 구간별 하락·상승 확률 (양끝에서 둘 다 커지면 변동폭 확대)")
                 st.plotly_chart(fig_breakdown, width="stretch", key="chart_overheat_breakdown", config=PLOTLY_CONFIG)
+
+                shown = breakdown_df.copy()
+                shown["괴리율"] = shown["괴리율"].map(lambda v: f"{v:+.1%}")
+                shown["표본 수"] = shown["표본 수"].map(lambda v: f"{v:,}일")
+                shown["하락 확률"] = shown["하락 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
+                shown["상승 확률"] = shown["상승 확률"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "N/A")
+                shown["p-value(하락)"] = shown["p-value(하락)"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+                shown[ret_col] = shown[ret_col].map(lambda v: f"{v:+.1%}" if pd.notna(v) else "N/A")
+                st.dataframe(shown, hide_index=True, width="stretch")
 
                 overheat_hist_ma = overheat_hist.copy()
                 overheat_hist_ma["MA"] = overheat_hist_ma["종가"].rolling(OVERHEAT_MA_WINDOW).mean()
@@ -2964,100 +2941,84 @@ def _render_tab_overheat():
                         )
                 _style_chart_mobile(fig_overheat, title=f"종가/{OVERHEAT_MA_WINDOW}일 이동평균 괴리율 vs 주가")
                 fig_overheat.update_yaxes(title_text="괴리율", tickformat=".0%", secondary_y=False)
-                fig_overheat.update_yaxes(title_text="종가(원)", secondary_y=True)
+                fig_overheat.update_yaxes(title_text="종가(원)", type="log", secondary_y=True)
                 fig_overheat.update_xaxes(rangeslider_visible=True)
                 st.plotly_chart(fig_overheat, width="stretch", key="chart_overheat", config=PLOTLY_CONFIG)
-                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
+                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다. 종가 축은 로그 눈금입니다.")
 
-                down_summary_parts = [
-                    f"{row['과열 구간']}: {row['하락 확률']:.1%}" if pd.notna(row["하락 확률"]) else f"{row['과열 구간']}: N/A"
-                    for row in breakdown_rows
-                ]
-                overheat_summary = (
-                    f"가격 과열도 백테스트({OVERHEAT_MA_WINDOW}일선 괴리율, 표본 {overheat_result['n']}일, "
-                    f"기저 하락 확률 {overheat_result['base_rate']:.1%}): "
-                    f"괴리율 구간별 {OVERHEAT_HORIZON}거래일 내 {OVERHEAT_DRAWDOWN_THRESHOLD:.0%} 이상 하락 확률"
-                    f"({', '.join(down_summary_parts)})은 과열이 심할수록 높아짐. "
-                    f"현재 상태: {current_regime_label} (괴리율 {current_deviation:+.1%}). (통계 참고용, 매매 신호 아님)"
-                )
+                overheat_summary = overheat_summary_text(
+                    overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
 
                 st.divider()
-                _subheader_with_help(
-                    "이동평균선 추세추종 전략 백테스트 (참고용)",
-                    f"괴리율이 0% 이상(= 주가가 {OVERHEAT_MA_WINDOW}일 이동평균선 위)이면 보유하고, "
-                    "0% 밑으로 내려가면 전량 매도했다가 다시 0% 이상으로 올라오면 재매수하는 전략입니다. "
-                    "거래비용·세금·슬리피지는 반영되지 않아 실제 수익률은 이보다 낮습니다. 매매 신호가 아닙니다.",
-                    key="strategy",
-                )
-                strategy_months = st.slider(
-                    "백테스트 기간 (최근 N개월)", min_value=1, max_value=24, value=6, step=1,
-                    key="overheat_strategy_months",
-                )
-                period_start = overheat_hist_ma["날짜"].max() - pd.Timedelta(days=strategy_months * 30.44)
-                _strat_t = time.monotonic()
-                strategy_result = run_overheat_threshold_strategy(overheat_hist_ma, period_start)
-                if _BOOT_PROFILE:
-                    print(f"[boot]     과열도: 추세추종 백테스트 {time.monotonic() - _strat_t:.2f}s", flush=True)
-
-                if strategy_result["n_days"] < 10 or strategy_result["buy_hold_return"] is None:
-                    st.warning("선택한 기간에 데이터가 부족합니다.")
-                else:
-                    scol1, scol2, scol3 = st.columns(3)
-                    scol1.metric(
-                        "buy & hold 수익률",
-                        f"{strategy_result['buy_hold_return']:+.1%}",
-                    )
-                    if strategy_result["cum_return"] is not None:
-                        delta = strategy_result["cum_return"] - strategy_result["buy_hold_return"]
-                        scol2.metric(
-                            "전략 누적 수익률", f"{strategy_result['cum_return']:+.1%}",
-                            delta=f"{delta:+.1%} vs buy&hold",
-                        )
-                    else:
-                        scol2.metric("전략 누적 수익률", "거래 없음")
-                    scol3.metric("거래 횟수", f"{len(strategy_result['trades'])}회")
-
-                    st.caption(
-                        f"기간: {strategy_result['period_start'].date()} – {strategy_result['period_end'].date()}"
-                        + (
-                            f" (마지막 매수 포지션 미청산, 평가손익 {strategy_result['unrealized_return']:+.1%} 포함)"
-                            if strategy_result["still_open"] and strategy_result["unrealized_return"] is not None
-                            else ""
-                        )
-                    )
-
-                    if strategy_result["trades"]:
-                        trades_df = pd.DataFrame(strategy_result["trades"])
-                        trades_df_display = trades_df.assign(
-                            매수일=trades_df["buy_date"].dt.strftime("%Y-%m-%d"),
-                            매도일=trades_df["sell_date"].dt.strftime("%Y-%m-%d"),
-                            매수가=trades_df["buy_price"].map(lambda v: f"{v:,.0f}"),
-                            매도가=trades_df["sell_price"].map(lambda v: f"{v:,.0f}"),
-                            수익률=trades_df["ret"].map(lambda v: f"{v:+.1%}"),
-                        )[["매수일", "매수가", "매도일", "매도가", "수익률"]]
-                        st.table(trades_df_display, width="stretch", hide_index=True)
-
-                    equity_curve = strategy_result["equity_curve"]
-                    if equity_curve is not None and not equity_curve.empty:
-                        buy_hold_curve = overheat_hist_ma[
-                            overheat_hist_ma["날짜"] >= period_start
-                        ].reset_index(drop=True)
-                        fig_strategy = go.Figure()
-                        fig_strategy.add_trace(go.Scatter(
-                            x=equity_curve["날짜"], y=(equity_curve["자산가치"] - 1) * 100,
-                            name="전략", line=dict(color="#2ca02c"),
-                        ))
-                        if not buy_hold_curve.empty:
-                            bh_base = buy_hold_curve.iloc[0]["종가"]
-                            fig_strategy.add_trace(go.Scatter(
-                                x=buy_hold_curve["날짜"], y=(buy_hold_curve["종가"] / bh_base - 1) * 100,
-                                name="buy & hold", line=dict(color="#888888", dash="dot"),
-                            ))
-                        _style_chart_mobile(fig_strategy, title="전략 vs buy & hold 누적 수익률 (%)")
-                        fig_strategy.update_yaxes(title_text="누적 수익률 (%)")
-                        st.plotly_chart(fig_strategy, width="stretch", key="chart_overheat_strategy", config=PLOTLY_CONFIG)
+                _render_overheat_strategy(fetch_long_history_live(TICKER, years=25), OVERHEAT_MA_WINDOW)
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
+
+
+def _render_overheat_strategy(hist: pd.DataFrame, ma_window: int) -> None:
+    """이동평균 추세추종 전략 백테스트. 옛 화면은 당일 종가 판정·당일 체결·비용 0%·최근 6개월이라 낙관적이었다."""
+    _subheader_with_help(
+        "이동평균 추세추종 전략 백테스트 (참고용)",
+        f"주가가 {ma_window}일 이동평균선 위(괴리율 ≥ +밴드)로 올라오면 사고, 아래(< -밴드)로 내려가면 파는 전략입니다. "
+        "**밴드**는 이동평균선 근처에서 사고팔기를 반복하는 휩쏘를 줄입니다 — 80일선에서 ±3%를 넣으면 21년 중 "
+        "5개 하위기간 모두에서 샤프가 좋아졌고(21년 0.65→0.84, 10년 0.88→1.10) 연 거래가 6.3회에서 1.8회로 줄었습니다. "
+        "120일·200일선에서는 개선이 불안정해 80일선 전제로만 말할 수 있습니다.\n\n"
+        "**현실성**: 체결은 기본적으로 신호 다음 날 종가, 왕복 비용 0.3%(매도세·수수료·슬리피지)를 뺍니다. "
+        "옛 화면은 당일 종가에 체결하고 비용이 0이어서 실제보다 좋게 나왔습니다. 세금·환율 영향은 여전히 빠져 있습니다.\n\n"
+        "**결과 해석**: 10년에서는 단순 보유와 연 수익이 같고(둘 다 약 41%) 최대 낙폭만 조금 줄었습니다(-48% vs -57%). "
+        "21년에서는 낙폭이 크게 줄지만(-53% vs -85%) 샤프는 비슷합니다. 하락장이 길었던 구간(2005~09, 2020~22)에서만 "
+        "단순 보유를 이겼고 상승장에서는 졌습니다. 낙폭 방어 수단이지 수익을 늘리는 수단은 아닙니다. 매매 신호가 아닙니다.",
+        key="strategy",
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    years_opt = c1.selectbox("백테스트 기간", ["최근 1년", "최근 3년", "최근 5년", "최근 10년", "전체"], index=3,
+                             key="overheat_strategy_years")
+    band_pct = c2.slider("밴드 (±%)", min_value=0, max_value=6, value=3, step=1, key="overheat_strategy_band")
+    lag_opt = c3.selectbox("체결 시점", ["다음 날 종가 (권장)", "신호 당일 종가 (옛 방식)"], index=0,
+                           key="overheat_strategy_lag")
+    cost_pct = c4.slider("왕복 비용 (%)", min_value=0.0, max_value=1.0, value=0.3, step=0.1, key="overheat_strategy_cost")
+    years = {"최근 1년": 1, "최근 3년": 3, "최근 5년": 5, "최근 10년": 10}.get(years_opt)
+    last_date = hist["날짜"].max()
+    period_start = hist["날짜"].min() if years is None else last_date - pd.Timedelta(days=years * 365.25)
+    res = signal_lab.run_ma_strategy(
+        hist, ma_window, period_start, band=band_pct / 100, lag=0 if lag_opt.startswith("신호") else 1,
+        cost=cost_pct / 100)
+    if res["strategy"] is None or res["n_days"] < 30:
+        st.warning("선택한 기간에 데이터가 부족합니다.")
+        return
+    s, b = res["strategy"], res["buy_hold"]
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("연 수익률(CAGR) 전략 / 보유", f"{s['cagr']:+.1%} / {b['cagr']:+.1%}")
+    sc2.metric("최대 낙폭 전략 / 보유", f"{s['mdd']:.0%} / {b['mdd']:.0%}")
+    sc3.metric("샤프 전략 / 보유", f"{s['sharpe']:.2f} / {b['sharpe']:.2f}")
+    sc4.metric("거래 횟수", f"{len(res['trades'])}회", delta=f"연 {res['trades_per_year']:.1f}회", delta_color="off")
+    dev_now = res["current_deviation"]
+    state_txt = f"현재 상태: **{res['state']}** (괴리율 {dev_now:+.1%}, 밴드 ±{band_pct}%)" if dev_now is not None else f"현재 상태: **{res['state']}**"
+    if res["pending"]:
+        kind, when = res["pending"]
+        state_txt += f" · {pd.Timestamp(when):%Y-%m-%d} 신호로 다음 거래일 종가에 {'매수' if kind == 'buy' else '매도'} 예정"
+    st.markdown(state_txt)
+    st.caption(
+        f"기간: {res['period_start']:%Y-%m-%d} – {res['period_end']:%Y-%m-%d} ({res['years']:.1f}년)"
+        + (f" · 마지막 매수 포지션 미청산, 평가손익 {res['unrealized_return']:+.1%} 포함" if res["still_open"] and res["unrealized_return"] is not None else "")
+    )
+    if res["trades"]:
+        trades_df = pd.DataFrame(res["trades"])
+        show = trades_df.assign(
+            매수일=trades_df["buy_date"].dt.strftime("%Y-%m-%d"), 매도일=trades_df["sell_date"].dt.strftime("%Y-%m-%d"),
+            매수가=trades_df["buy_price"].map(lambda v: f"{v:,.0f}"), 매도가=trades_df["sell_price"].map(lambda v: f"{v:,.0f}"),
+            수익률=trades_df["ret"].map(lambda v: f"{v:+.1%}"),
+        )[["매수일", "매수가", "매도일", "매도가", "수익률"]]
+        with st.expander(f"거래 내역 ({len(show)}건, 비용 반영)"):
+            st.dataframe(show, hide_index=True, width="stretch")
+    eq, bh = res["equity_curve"], res["bh_curve"]
+    fig_strategy = go.Figure()
+    fig_strategy.add_trace(go.Scatter(x=eq["날짜"], y=eq["자산가치"], name="전략", line=dict(color="#2ca02c")))
+    fig_strategy.add_trace(go.Scatter(x=bh["날짜"], y=bh["자산가치"], name="buy & hold", line=dict(color="#888888", dash="dot")))
+    _style_chart_mobile(fig_strategy, title="전략 vs buy & hold 자산가치 (시작=1, 로그 눈금)")
+    fig_strategy.update_yaxes(title_text="자산가치(배)", type="log")
+    st.plotly_chart(fig_strategy, width="stretch", key="chart_overheat_strategy", config=PLOTLY_CONFIG)
+
 
 # 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
@@ -3577,318 +3538,180 @@ def _render_tab_signal():
         st.error(f"매매 신호 계산에 실패했습니다: {e}")
 
 
-# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
-# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
-# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_early_report(hist: pd.DataFrame) -> dict:
+    """순열검정이 들어 있어 0.4초쯤 걸린다. 같은 이력으로는 15분간 다시 계산하지 않는다."""
+    return signal_lab.early_signal_report(hist)
+
+
+def _pv_text(p) -> str:
+    return "-" if p is None else ("<0.01" if p < 0.01 else f"{p:.2f}")
+
+
+def _rate_cell(d: dict) -> str:
+    if d["sig"] is None or d["rest"] is None:
+        return "N/A"
+    return f"{d['sig']:.0%} vs {d['rest']:.0%} (p={_pv_text(d['p'])})"
+
+
+_FLOW_SIGNAL_COMMON_LIMITS = (
+    "**한계**: 한 종목에 독립 사건이 수십 건뿐이라 확률이 몇 %p 움직이는 정도이고, 개별 시점의 정답은 주지 못합니다. "
+    "기울기 창은 20~40일만 유효했고 5·10일은 효과가 없었습니다. 조건을 더 찾아 다듬는 것은 과적합이라 하지 않습니다"
+    "(13개 변수 조합을 훈련으로 고르고 다음 해에 평가했더니 이점이 사라졌습니다). 매매 신호가 아닙니다."
+)
+
+
+def _render_flow_signal_tab(mode: str) -> None:
+    """수급 강세 신호(mode='up') / 수급 약화 경고(mode='down'). 둘 다 기관 20일 누적 순매수 기울기를 본다.
+
+    2026-10-16 SK하이닉스 10년·21년 검증: 옛 하락 신호(외국인 순매도 + 거래량 증가)는 예측력이 없었고
+    (AUC≈0.50), 옛 상승 신호(기관 매수 + 개인 매도 + 거래량)는 기관 기울기 하나보다 약했다.
+    """
+    up = mode == "up"
+    if up:
+        _subheader_with_help(
+            "수급 강세 신호 (SK하이닉스 전용, 참고용)",
+            "**기관 20일 누적 순매수 기울기**가 플러스(기관이 20일 동안 사 모으는 중)인지 봅니다. "
+            "SK하이닉스 10년(2016-10~) 검증에서 기울기>0일 때 이후 10거래일 안에 +7% 이상 오른 비율이 "
+            "42%로 아닐 때(23%)보다 높았고(순열검정 p<0.01), 11개 해 중 9개에서 같은 방향이었습니다. "
+            "가격이 60일선 위든 아래든 유지돼 단순한 추세 편승은 아니었습니다.\n\n"
+            "**옛 신호와 달라진 점**: '개인 순매도'는 기관과 겹쳐 정보를 깎았고 '거래량 증가'는 방향 정보가 없어 뺐습니다"
+            "(표의 '참고' 행에서 옛 신호의 성적을 볼 수 있습니다). 외국인 기울기는 21년 내내 예측력이 없었습니다.\n\n"
+            + _FLOW_SIGNAL_COMMON_LIMITS,
+            key="rally",
+        )
+    else:
+        _subheader_with_help(
+            "수급 약화 경고 (SK하이닉스 전용, 참고용)",
+            "**기관 20일 누적 순매수 기울기**가 마이너스(기관이 20일 동안 팔고 있음)인지 봅니다. 10년 검증에서 "
+            "변동성 대비 큰 하락(이후 10거래일 내 낙폭이 일간 변동성×√10 이상)이 23% vs 14%(순열검정 p=0.01), "
+            "고정 -7% 하락도 25% vs 18%(p=0.04)로 높았습니다. 5년만 봤을 때는 약했던 근거가 10년에서 확인됐습니다.\n\n"
+            "**옛 하락 신호(외국인 순매도 + 거래량 증가)는 폐기했습니다.** 10년·21년 모두 예측력이 없었고(AUC≈0.50), "
+            "거래량 증가는 하락이 아니라 변동폭 확대 신호였습니다(상승 확률도 같이 높아짐). 표의 '참고' 행에 성적을 남겼습니다. "
+            "큰 하락을 정확히 예고하는 신호가 아니라 '수급이 약해진 상태'를 알리는 경고입니다.\n\n"
+            + _FLOW_SIGNAL_COMMON_LIMITS,
+            key="decline",
+        )
+    if TICKER != DEFAULT_TICKER:
+        st.caption("이 지표는 SK하이닉스에서만 검증되어 SK하이닉스에서만 표시됩니다 (다른 종목에는 일반화되지 않는 것으로 자체 검증됨).")
+        return
+    try:
+        hist = fetch_long_history_live(TICKER, years=10)
+        if len(hist) < 400:
+            st.warning("데이터가 부족합니다.")
+            return
+        rep = _cached_early_report(hist)
+        if not rep.get("ok"):
+            st.warning("백테스트에 충분한 표본이 없습니다.")
+            return
+        if rep["n"] < 2000:
+            st.caption(":orange[장기 이력 파일(KIS)이 아직 없어 최근 700거래일로 계산했습니다 — 10년 기준 결과와 다를 수 있습니다.]")
+
+        cur, base, h, thr = rep["current"], rep["base"], rep["horizon"], rep["threshold"]
+        rules = rep["rules"]
+        main = rules[0] if up else rules[3]
+        now_flag = main["now"]
+        cur_up = main["up"]["sig"] if now_flag else main["up"]["rest"]
+        cur_dn = main["dn"]["sig"] if now_flag else main["dn"]["rest"]
+        inst_buying = cur["inst_slope"] > 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"기관 {signal_lab.SIGNAL_WINDOW}일 누적 순매수 기울기", f"{cur['inst_slope']:,.0f}주/일",
+                  delta="순매수 우위" if inst_buying else "순매도 우위",
+                  delta_color="normal" if inst_buying else "inverse")
+        m2.metric("과거 분포 속 위치", f"{cur['bucket']}/5분위" if cur["bucket"] else "N/A",
+                  help="오늘 이전의 기관 기울기 분포만으로 정한 5분위입니다(1=가장 매도 우위, 5=가장 매수 우위).")
+        m3.metric(f"현재 상태의 {h}거래일 내 +{thr:.0%} 상승 확률", f"{cur_up:.1%}" if cur_up is not None else "N/A",
+                  delta=f"전체 평균 {base['up']:.1%}", delta_color="off")
+        m4.metric(f"현재 상태의 {h}거래일 내 -{thr:.0%} 하락 확률", f"{cur_dn:.1%}" if cur_dn is not None else "N/A",
+                  delta=f"전체 평균 {base['dn']:.1%}", delta_color="off")
+
+        if up:
+            if now_flag:
+                st.success("기관이 최근 20일 동안 순매수 우위입니다. 과거에 이 상태에서 상승 확률이 높았지만, "
+                           "확정적 신호가 아니라 참고용입니다.")
+            else:
+                st.info("현재는 기관이 순매도 우위라 수급 강세 조건에 해당하지 않습니다. (참고용)")
+        else:
+            if now_flag:
+                st.warning("기관이 최근 20일 동안 순매도 우위입니다. 과거에 이 상태에서 큰 하락 확률이 높았지만, "
+                           "확정적 신호가 아니라 참고용입니다.")
+            else:
+                st.info("현재는 기관이 순매수 우위라 수급 약화 경고에 해당하지 않습니다. (참고용)")
+        st.caption(
+            f"표본 {rep['n']:,}거래일 ({rep['start']:%Y-%m-%d} ~ {rep['end']:%Y-%m-%d}). "
+            "p값은 신호의 군집을 보존한 원형 이동 순열검정이며, 가설 방향(상승 신호는 상승↑·하락↓)의 단측 검정입니다."
+        )
+
+        table_rows = []
+        for r in rules:
+            if r["expect"] != mode:
+                continue
+            rc = r.get("recent") or {}
+            table_rows.append({
+                "조건": ("★ " if r is main else "") + r["name"],
+                "구분": "권장" if r["kind"] != "참고" else "참고(무효)",
+                "신호일(사건)": f"{r['n_days']:,}일 ({r['n_events']})",
+                f"+{thr:.0%} 상승": _rate_cell(r["up"]),
+                f"-{thr:.0%} 하락": _rate_cell(r["dn"]),
+                "변동성 대비 큰 하락": _rate_cell(r["dnz"]),
+                "최근 5년 p": _pv_text(rc.get("p")) if rc else "-",
+            })
+        st.markdown("**조건별 검증 (신호일 vs 나머지 날)**")
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+
+        q = rep["quintiles"]
+        st.markdown("**기관 기울기 5분위별 이후 성적** (각 날짜의 분위를 그날까지의 과거 분포로만 정함)")
+        q_show = q.assign(
+            분위=q["분위"].map(lambda v: f"{v}분위" + (" (최대 매도)" if v == 1 else " (최대 매수)" if v == 5 else "")),
+            표본=q["표본"].map(lambda v: f"{v:,}일"),
+            상승=q["상승"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "N/A"),
+            하락=q["하락"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "N/A"),
+            변동성대비하락=q["변동성대비하락"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "N/A"),
+            평균수익=q["평균수익"].map(lambda v: f"{v:+.1%}" if pd.notna(v) else "N/A"),
+        ).rename(columns={"상승": f"+{thr:.0%} 상승", "하락": f"-{thr:.0%} 하락", "평균수익": f"{h}일 평균수익"})
+        st.dataframe(q_show, hide_index=True, width="stretch")
+
+        fig_q = go.Figure()
+        fig_q.add_trace(go.Bar(x=q["분위"].map(lambda v: f"{v}분위"), y=q["상승"], name=f"+{thr:.0%} 상승", marker_color="#2ca02c"))
+        fig_q.add_trace(go.Bar(x=q["분위"].map(lambda v: f"{v}분위"), y=q["하락"], name=f"-{thr:.0%} 하락", marker_color="#d62728"))
+        fig_q.add_hline(y=base["up"], line_dash="dot", line_color="#2ca02c", opacity=0.6,
+                        annotation_text="평균 상승 확률", annotation_position="top left")
+        fig_q.add_hline(y=base["dn"], line_dash="dot", line_color="#d62728", opacity=0.6,
+                        annotation_text="평균 하락 확률", annotation_position="bottom left")
+        fig_q.update_layout(barmode="group")
+        fig_q.update_yaxes(title_text=f"{h}거래일 내 확률", tickformat=".0%")
+        _style_chart_mobile(fig_q, title="기관 기울기 분위별 상승·하락 확률")
+        st.plotly_chart(fig_q, width="stretch", key=f"chart_flow_quintile_{mode}", config=PLOTLY_CONFIG)
+
+        frame = rep["frame"]
+        fig_f = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_f.add_trace(go.Scatter(x=frame["날짜"], y=frame["inst_slope"], name="기관 순매수 기울기", line=dict(color="#1f77b4")),
+                        secondary_y=False)
+        fig_f.add_trace(go.Scatter(x=frame["날짜"], y=frame["종가"], name="종가", line=dict(color="#d62728")),
+                        secondary_y=True)
+        fig_f.add_hline(y=0, line_dash="dash", line_color="gray", secondary_y=False)
+        _style_chart_mobile(fig_f, title=f"기관 {signal_lab.SIGNAL_WINDOW}일 누적 순매수 기울기 vs 주가")
+        fig_f.update_yaxes(title_text="기울기(주/일)", secondary_y=False)
+        fig_f.update_yaxes(title_text="종가(원)", type="log", secondary_y=True)
+        fig_f.update_xaxes(rangeslider_visible=True)
+        st.plotly_chart(fig_f, width="stretch", key=f"chart_flow_slope_{mode}", config=PLOTLY_CONFIG)
+        st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다. 종가 축은 로그 눈금입니다(10년간 주가가 크게 올라 선형으로는 과거가 눌립니다).")
+    except Exception as e:
+        st.error(f"수급 조기신호 조회에 실패했습니다: {e}")
+
+
+# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯을 건드리면 이 탭만 다시 그린다.
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
 @st.fragment
 def _render_tab_decline():
-    _subheader_with_help(
-        "큰폭 하락 조기 신호 (SK하이닉스 전용, 참고용)",
-        "과거 큰폭 하락 8건에서 뽑은 조건(외국인 순매도 + 거래량 증가)이 "
-        f"향후 {DECLINE_HORIZON}거래일 내 {DECLINE_DRAWDOWN_THRESHOLD:.0%} 하락 확률을 높이는지 본 백테스트입니다"
-        " (38.0% vs 24.2%, p=0.001).\n\n"
-        "앞/뒤 절반 검증에서도 방향은 일관됐습니다. 다른 종목에는 일반화되지 않습니다. 매매 신호가 아닙니다.",
-        key="decline",
-    )
-    if TICKER != DEFAULT_TICKER:
-        st.caption("이 지표는 SK하이닉스에서만 검증되어 SK하이닉스에서만 표시됩니다 (다른 종목에는 일반화되지 않는 것으로 자체 검증됨).")
-    else:
-        try:
-            decline_hist = fetch_backtest_history_live(TICKER, target_days=700)
-            if len(decline_hist) < 40:
-                st.warning("데이터가 부족합니다.")
-            else:
-                foreign_slope = _rolling_slope(decline_hist["외국인"], DECLINE_PATTERN_WINDOW)
-                volume_avg = decline_hist["거래량"].rolling(DECLINE_PATTERN_VOL_WINDOW).mean()
-                volume_ratio = decline_hist["거래량"] / volume_avg
-                decline_pattern = (foreign_slope < 0) & (volume_ratio > 1.0)
+    _render_flow_signal_tab("down")
 
-                decline_backtest = run_boolean_pattern_backtest(
-                    decline_hist["종가"], decline_hist["날짜"], decline_pattern,
-                    DECLINE_HORIZON, drawdown_threshold=DECLINE_DRAWDOWN_THRESHOLD,
-                )
 
-                current_foreign_slope = float(foreign_slope.dropna().iloc[-1])
-                current_volume_ratio = float(volume_ratio.dropna().iloc[-1])
-                foreign_selling = current_foreign_slope < 0
-                volume_spike = current_volume_ratio > 1.0
-                pattern_now = bool(decline_backtest["current_match"])
-                if pattern_now:
-                    current_down_rate = decline_backtest["match_down_rate"]
-                    current_up_rate = decline_backtest["match_up_rate"]
-                else:
-                    current_down_rate = decline_backtest["rest_down_rate"]
-                    current_up_rate = decline_backtest["rest_up_rate"]
-
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-                metric_col1.metric(
-                    f"외국인 {DECLINE_PATTERN_WINDOW}일 누적 순매수 기울기",
-                    f"{current_foreign_slope:,.0f}",
-                    delta="순매도 우위" if foreign_selling else "순매수 우위",
-                    delta_color="inverse" if foreign_selling else "normal",
-                )
-                metric_col2.metric(
-                    f"거래량 / 직전 {DECLINE_PATTERN_VOL_WINDOW}일 평균",
-                    f"{current_volume_ratio:.2f}배",
-                    delta="평균 이상" if volume_spike else "평균 이하",
-                    delta_color="inverse" if volume_spike else "normal",
-                )
-                metric_col3.metric(
-                    f"현재 상태의 {DECLINE_HORIZON}거래일 내 하락 확률",
-                    f"{current_down_rate:.1%}" if current_down_rate is not None else "N/A",
-                )
-                metric_col4.metric(
-                    f"현재 상태의 {DECLINE_HORIZON}거래일 내 상승 확률",
-                    f"{current_up_rate:.1%}" if current_up_rate is not None else "N/A",
-                )
-
-                if pattern_now:
-                    st.warning(
-                        "현재 외국인 순매도 + 거래량 증가가 동시에 나타나고 있습니다. "
-                        "과거 큰폭 하락 초기와 유사한 패턴이지만, 확정적 신호가 아니라 참고용입니다."
-                    )
-                else:
-                    st.info("현재는 과거 큰폭 하락 초기 패턴(외국인 순매도 + 거래량 증가 동시 발생)과 일치하지 않습니다. (참고용)")
-
-                decline_breakdown_rows = [
-                    {
-                        "조건": "패턴 일치 (순매도+거래량 급증)",
-                        "표본 수": decline_backtest["match_n"],
-                        "하락 확률": decline_backtest["match_down_rate"],
-                        "p-value(하락)": decline_backtest["down_p_value"],
-                        "상승 확률": decline_backtest["match_up_rate"],
-                        "p-value(상승)": decline_backtest["up_p_value"],
-                    },
-                    {
-                        "조건": "패턴 불일치",
-                        "표본 수": decline_backtest["rest_n"],
-                        "하락 확률": decline_backtest["rest_down_rate"],
-                        "p-value(하락)": decline_backtest["down_p_value"],
-                        "상승 확률": decline_backtest["rest_up_rate"],
-                        "p-value(상승)": decline_backtest["up_p_value"],
-                    },
-                ]
-                decline_breakdown_df = pd.DataFrame(decline_breakdown_rows)
-                decline_breakdown_display = decline_breakdown_df.copy()
-                decline_breakdown_display["표본 수"] = decline_breakdown_display["표본 수"].map(lambda v: f"{v}일")
-                for col in ["하락 확률", "상승 확률"]:
-                    decline_breakdown_display[col] = decline_breakdown_display[col].map(
-                        lambda v: f"{v:.1%}" if pd.notna(v) else "N/A"
-                    )
-                for col in ["p-value(하락)", "p-value(상승)"]:
-                    decline_breakdown_display[col] = decline_breakdown_display[col].map(
-                        lambda v: f"{v:.4f}" if pd.notna(v) else "N/A"
-                    )
-                st.table(decline_breakdown_display, width="stretch", hide_index=True)
-
-                decline_chart_df = pd.DataFrame(
-                    {
-                        "날짜": decline_hist["날짜"],
-                        "외국인기울기": foreign_slope,
-                        "거래량비율": volume_ratio,
-                        "종가": decline_hist["종가"],
-                    }
-                )
-
-                fig_decline_foreign = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_decline_foreign.add_trace(
-                    go.Scatter(x=decline_chart_df["날짜"], y=decline_chart_df["외국인기울기"], name="외국인 순매수 기울기", line=dict(color="#1f77b4")),
-                    secondary_y=False,
-                )
-                fig_decline_foreign.add_trace(
-                    go.Scatter(x=decline_chart_df["날짜"], y=decline_chart_df["종가"], name="종가", line=dict(color="#d62728")),
-                    secondary_y=True,
-                )
-                fig_decline_foreign.add_hline(y=0, line_dash="dash", line_color="gray", secondary_y=False)
-                _style_chart_mobile(fig_decline_foreign, title=f"외국인 {DECLINE_PATTERN_WINDOW}일 누적 순매수 기울기 vs 주가")
-                fig_decline_foreign.update_yaxes(title_text="기울기", secondary_y=False)
-                fig_decline_foreign.update_yaxes(title_text="종가(원)", secondary_y=True)
-                fig_decline_foreign.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_decline_foreign, width="stretch", key="chart_decline_foreign", config=PLOTLY_CONFIG)
-
-                fig_decline_volume = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_decline_volume.add_trace(
-                    go.Scatter(x=decline_chart_df["날짜"], y=decline_chart_df["거래량비율"], name="거래량/20일평균", line=dict(color="#1f77b4")),
-                    secondary_y=False,
-                )
-                fig_decline_volume.add_trace(
-                    go.Scatter(x=decline_chart_df["날짜"], y=decline_chart_df["종가"], name="종가", line=dict(color="#d62728")),
-                    secondary_y=True,
-                )
-                fig_decline_volume.add_hline(y=1.0, line_dash="dash", line_color="gray", secondary_y=False)
-                _style_chart_mobile(fig_decline_volume, title=f"거래량 / 직전 {DECLINE_PATTERN_VOL_WINDOW}일 평균 vs 주가")
-                fig_decline_volume.update_yaxes(title_text="거래량비율(배)", secondary_y=False)
-                fig_decline_volume.update_yaxes(title_text="종가(원)", secondary_y=True)
-                fig_decline_volume.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_decline_volume, width="stretch", key="chart_decline_volume", config=PLOTLY_CONFIG)
-                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
-        except Exception as e:
-            st.error(f"조기 신호 조회에 실패했습니다: {e}")
-
-# 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
-# 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
-# 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
-# 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
 @st.fragment
 def _render_tab_rally():
-    _subheader_with_help(
-        "큰폭 상승 조기 신호 (SK하이닉스 전용, 참고용)",
-        "과거 큰폭 상승 16건에서 뽑은 조건(기관 순매수 + 개인 순매도 + 거래량 증가)이 "
-        f"향후 {RALLY_HORIZON}거래일 확률을 바꾸는지 본 백테스트입니다.\n\n"
-        "**신뢰도가 낮습니다.** 앞/뒤 절반으로 나누면 뒷반기에서만 나타나 시기에 치우친 결과일 수 있고, "
-        "다른 종목에는 일반화되지 않습니다. 매매 신호가 아닙니다.",
-        key="rally",
-    )
-    if TICKER != DEFAULT_TICKER:
-        st.caption("이 지표는 SK하이닉스에서만 검증되어 SK하이닉스에서만 표시됩니다 (다른 종목에는 일반화되지 않는 것으로 자체 검증됨).")
-    else:
-        try:
-            rally_hist = fetch_backtest_history_live(TICKER, target_days=700)
-            if len(rally_hist) < 40:
-                st.warning("데이터가 부족합니다.")
-            else:
-                inst_slope = _rolling_slope(rally_hist["기관"], RALLY_PATTERN_WINDOW)
-                retail_slope = _rolling_slope(rally_hist["개인"], RALLY_PATTERN_WINDOW)
-                volume_avg = rally_hist["거래량"].rolling(RALLY_PATTERN_VOL_WINDOW).mean()
-                volume_ratio = rally_hist["거래량"] / volume_avg
-                rally_pattern = (inst_slope > 0) & (retail_slope < 0) & (volume_ratio > 1.0)
+    _render_flow_signal_tab("up")
 
-                rally_backtest = run_boolean_pattern_backtest(
-                    rally_hist["종가"], rally_hist["날짜"], rally_pattern,
-                    RALLY_HORIZON, drawdown_threshold=RALLY_DRAWDOWN_THRESHOLD,
-                )
-
-                current_inst_slope = float(inst_slope.dropna().iloc[-1])
-                current_retail_slope = float(retail_slope.dropna().iloc[-1])
-                current_volume_ratio = float(volume_ratio.dropna().iloc[-1])
-                inst_buying = current_inst_slope > 0
-                retail_selling = current_retail_slope < 0
-                volume_spike = current_volume_ratio > 1.0
-                rally_pattern_now = bool(rally_backtest["current_match"])
-                if rally_pattern_now:
-                    rally_current_down_rate = rally_backtest["match_down_rate"]
-                    rally_current_up_rate = rally_backtest["match_up_rate"]
-                else:
-                    rally_current_down_rate = rally_backtest["rest_down_rate"]
-                    rally_current_up_rate = rally_backtest["rest_up_rate"]
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric(
-                    f"기관 {RALLY_PATTERN_WINDOW}일 누적 순매수 기울기",
-                    f"{current_inst_slope:,.0f}",
-                    delta="순매수 우위" if inst_buying else "순매도 우위",
-                    delta_color="normal" if inst_buying else "inverse",
-                )
-                col2.metric(
-                    f"개인 {RALLY_PATTERN_WINDOW}일 누적 순매수 기울기",
-                    f"{current_retail_slope:,.0f}",
-                    delta="순매도 우위" if retail_selling else "순매수 우위",
-                    delta_color="normal" if retail_selling else "inverse",
-                )
-                col3.metric(
-                    f"거래량 / 직전 {RALLY_PATTERN_VOL_WINDOW}일 평균",
-                    f"{current_volume_ratio:.2f}배",
-                    delta="평균 이상" if volume_spike else "평균 이하",
-                    delta_color="normal" if volume_spike else "inverse",
-                )
-                metric_col4, metric_col5 = st.columns(2)
-                metric_col4.metric(
-                    f"현재 상태의 {RALLY_HORIZON}거래일 내 하락 확률",
-                    f"{rally_current_down_rate:.1%}" if rally_current_down_rate is not None else "N/A",
-                )
-                metric_col5.metric(
-                    f"현재 상태의 {RALLY_HORIZON}거래일 내 상승 확률",
-                    f"{rally_current_up_rate:.1%}" if rally_current_up_rate is not None else "N/A",
-                )
-
-                if rally_pattern_now:
-                    st.success(
-                        "현재 기관 순매수 + 개인 순매도 + 거래량 증가가 동시에 나타나고 있습니다. "
-                        "과거 큰폭 상승 초기와 유사한 패턴이지만, 확정적 신호가 아니라 참고용입니다."
-                    )
-                else:
-                    st.info("현재는 과거 큰폭 상승 초기 패턴(기관 순매수 + 개인 순매도 + 거래량 증가 동시 발생)과 일치하지 않습니다. (참고용)")
-
-                rally_breakdown_rows = [
-                    {
-                        "조건": "패턴 일치 (기관매수+개인매도+거래량 급증)",
-                        "표본 수": rally_backtest["match_n"],
-                        "하락 확률": rally_backtest["match_down_rate"],
-                        "p-value(하락)": rally_backtest["down_p_value"],
-                        "상승 확률": rally_backtest["match_up_rate"],
-                        "p-value(상승)": rally_backtest["up_p_value"],
-                    },
-                    {
-                        "조건": "패턴 불일치",
-                        "표본 수": rally_backtest["rest_n"],
-                        "하락 확률": rally_backtest["rest_down_rate"],
-                        "p-value(하락)": rally_backtest["down_p_value"],
-                        "상승 확률": rally_backtest["rest_up_rate"],
-                        "p-value(상승)": rally_backtest["up_p_value"],
-                    },
-                ]
-                rally_breakdown_df = pd.DataFrame(rally_breakdown_rows)
-                rally_breakdown_display = rally_breakdown_df.copy()
-                rally_breakdown_display["표본 수"] = rally_breakdown_display["표본 수"].map(lambda v: f"{v}일")
-                for col in ["하락 확률", "상승 확률"]:
-                    rally_breakdown_display[col] = rally_breakdown_display[col].map(
-                        lambda v: f"{v:.1%}" if pd.notna(v) else "N/A"
-                    )
-                for col in ["p-value(하락)", "p-value(상승)"]:
-                    rally_breakdown_display[col] = rally_breakdown_display[col].map(
-                        lambda v: f"{v:.4f}" if pd.notna(v) else "N/A"
-                    )
-                st.table(rally_breakdown_display, width="stretch", hide_index=True)
-
-                rally_chart_df = pd.DataFrame(
-                    {
-                        "날짜": rally_hist["날짜"],
-                        "기관기울기": inst_slope,
-                        "개인기울기": retail_slope,
-                        "거래량비율": volume_ratio,
-                        "종가": rally_hist["종가"],
-                    }
-                )
-
-                fig_rally_flow = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_rally_flow.add_trace(
-                    go.Scatter(x=rally_chart_df["날짜"], y=rally_chart_df["기관기울기"], name="기관 순매수 기울기", line=dict(color="#1f77b4")),
-                    secondary_y=False,
-                )
-                fig_rally_flow.add_trace(
-                    go.Scatter(x=rally_chart_df["날짜"], y=rally_chart_df["개인기울기"], name="개인 순매수 기울기", line=dict(color="#2ca02c")),
-                    secondary_y=False,
-                )
-                fig_rally_flow.add_trace(
-                    go.Scatter(x=rally_chart_df["날짜"], y=rally_chart_df["종가"], name="종가", line=dict(color="#d62728")),
-                    secondary_y=True,
-                )
-                fig_rally_flow.add_hline(y=0, line_dash="dash", line_color="gray", secondary_y=False)
-                _style_chart_mobile(fig_rally_flow, title=f"기관/개인 {RALLY_PATTERN_WINDOW}일 누적 순매수 기울기 vs 주가")
-                fig_rally_flow.update_yaxes(title_text="기울기", secondary_y=False)
-                fig_rally_flow.update_yaxes(title_text="종가(원)", secondary_y=True)
-                fig_rally_flow.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_rally_flow, width="stretch", key="chart_rally_flow", config=PLOTLY_CONFIG)
-
-                fig_rally_volume = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_rally_volume.add_trace(
-                    go.Scatter(x=rally_chart_df["날짜"], y=rally_chart_df["거래량비율"], name="거래량/20일평균", line=dict(color="#1f77b4")),
-                    secondary_y=False,
-                )
-                fig_rally_volume.add_trace(
-                    go.Scatter(x=rally_chart_df["날짜"], y=rally_chart_df["종가"], name="종가", line=dict(color="#d62728")),
-                    secondary_y=True,
-                )
-                fig_rally_volume.add_hline(y=1.0, line_dash="dash", line_color="gray", secondary_y=False)
-                _style_chart_mobile(fig_rally_volume, title=f"거래량 / 직전 {RALLY_PATTERN_VOL_WINDOW}일 평균 vs 주가")
-                fig_rally_volume.update_yaxes(title_text="거래량비율(배)", secondary_y=False)
-                fig_rally_volume.update_yaxes(title_text="종가(원)", secondary_y=True)
-                fig_rally_volume.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig_rally_volume, width="stretch", key="chart_rally_volume", config=PLOTLY_CONFIG)
-                st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다.")
-        except Exception as e:
-            st.error(f"조기 신호 조회에 실패했습니다: {e}")
 
 # 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시
@@ -5396,8 +5219,8 @@ _TAB_RENDERERS = {
     "가격 과열도": _render_tab_overheat,
     "선물 경보": _render_tab_futures,
     "통합 신호": _render_tab_composite,
-    "하락 조기신호": _render_tab_decline,
-    "상승 조기신호": _render_tab_rally,
+    "수급 약화 경고": _render_tab_decline,
+    "수급 강세 신호": _render_tab_rally,
     "DRAM 시세": _render_tab_dram,
     "HBM": _render_tab_hbm,
     "빅테크 Capex": _render_tab_capex,

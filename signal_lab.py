@@ -140,7 +140,7 @@ def make_labels(f: pd.DataFrame, horizon: int = HORIZON, thr: float = THRESHOLD)
 
 def _rule_row(name, kind, expect, sig, L, horizon, recent_mask=None):
     sig = np.asarray(sig, dtype=bool)
-    row = {"name": name, "kind": kind, "expect": expect, "now": bool(sig[-1]) if len(sig) else False,
+    row = {"name": name, "kind": kind, "expect": ("up" if expect == "up" else "down"), "now": bool(sig[-1]) if len(sig) else False,
            "n_days": int(sig.sum()), "n_events": episodes(sig)}
     for lab in ("up", "dn", "dnz"):
         y = L[lab].to_numpy()
