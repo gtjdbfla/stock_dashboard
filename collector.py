@@ -22,6 +22,7 @@ import contract_outlook
 import futures_history
 import hbm
 import long_history
+import signal_ledger
 import over_market as om
 
 # 로그 한 줄 때문에 수집기가 죽는 일이 없게 한다.
@@ -68,6 +69,7 @@ _jobs = {
     "고정가수집": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_CONTRACT_STALL_LIMIT_SEC", "3600"))},
     # KIS 페이지를 180장쯤 넘겨 받는 첫 생성이 1~2분 걸린다. 메인 루프에서 돌리면 그동안 시세 기록이 멈춘다.
     "장기이력": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_LONG_HISTORY_STALL_LIMIT_SEC", "1800"))},
+    "신호장부": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_LEDGER_STALL_LIMIT_SEC", "900"))},
 }
 
 
@@ -181,6 +183,9 @@ def main() -> None:
         # 10년 이상 장기 이력(KIS). 조기신호·괴리율 백테스트가 읽는다. 첫 생성이 길어 별도 스레드로 돌린다.
         # (종목마다 따로 _tick_async를 부르면 앞 스레드가 아직 살아 있어 뒤 종목이 계속 건너뛰어진다.)
         _tick_async("장기이력", lambda: [long_history.tick(now, t, log=log) for t in (DIGEST_TICKER, "005930")])
+
+        # 낙폭 관리 규칙의 전향 검증 장부(마감 뒤 하루 한 줄, 수정·백필 금지 — signal_ledger 모듈 설명 참고).
+        _tick_async("신호장부", lambda: signal_ledger.tick(now, log=log))
 
         # 코스피200 선물 외국인 순매수 이력 파일. 옛 소스가 통째로 없어져서(HTTP 410)
         # 하루치씩만 주는 새 API로 갈아탔다 - 파일이 없는 최초 1회는 700일을 하루씩

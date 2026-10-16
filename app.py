@@ -29,6 +29,7 @@ import financial_digest
 import fnguide
 import hbm
 import signal_lab
+import signal_ledger
 import over_market as om
 from bs4 import BeautifulSoup
 from google import genai
@@ -2775,8 +2776,20 @@ def _rho_text(rho, p) -> str:
     return f"{rho:+.2f} (p{_pv_text(p) if _pv_text(p).startswith('<') else '=' + _pv_text(p)})"
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_us_daily(symbol: str) -> pd.DataFrame:
+    return ai_inputs.fetch_us_daily(symbol)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_risk_report(hist: pd.DataFrame, sox: pd.DataFrame) -> dict:
+    rep = signal_lab.risk_rules_report(hist, sox)
+    rep.pop("weights", None)               # 캐시에 큰 배열을 들고 있지 않는다
+    return rep
+
+
 def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon: int, thr: float) -> dict | None:
-    """'지금 상황': 경향성이 가장 크게 나온 지표로 지금의 하락·상승 확률을 보여준다."""
+    """'지금 상황': 상승 확률(기관 수급)·변동성(위험 크기)·괴리율. 하락 확률 지표는 매도 근거로 약해 상세 expander로 내렸다."""
     years_opt = st.radio("분석 기간", ["전체 (약 21년)", "최근 10년"], horizontal=True, key="overheat_situation_period",
                          help="길수록 표본이 많아 확률이 안정적입니다. 10년으로 줄여도 방향은 같지만 지표 순위가 조금 바뀝니다.")
     hist_c = signal_lab.drop_incomplete_last_row(hist_full)
@@ -2788,88 +2801,187 @@ def _render_overheat_situation(hist_full: pd.DataFrame, ma_window: int, horizon:
         return None
     base = rep["base"]
     st.markdown(f"#### 지금 상황 — {rep['asof']:%Y-%m-%d} 확정 종가·수급 기준")
-    hd, hu = rep.get("headline_dn"), rep.get("headline_up")
+    hu = rep.get("headline_up")
+    vol_ind = next((d for d in rep["indicators"] if d["key"] == "vol"), None)
     c1, c2, c3 = st.columns(3)
-    if hd:
-        lo, hi = hd["ci"] if hd["ci"] else (None, None)
-        c1.metric(f"{horizon}거래일 내 -{thr:.0%} 하락 확률", f"{hd['rate']:.1%}",
-                  delta=f"평균 {base['dn']:.1%} 대비 {hd['rate'] - base['dn']:+.1%}p", delta_color="inverse",
-                  help=f"근거: {hd['basis']}가 과거 분포의 {hd['bucket']}/5분위일 때의 실제 비율입니다 "
-                       f"(표본 {hd['n']:,}일, 95% 구간 {lo:.0%}~{hi:.0%}). 하락과 가장 강한 경향을 보인 방향성 지표입니다.")
     if hu:
         lo, hi = hu["ci"] if hu["ci"] else (None, None)
-        c2.metric(f"{horizon}거래일 내 +{thr:.0%} 상승 확률", f"{hu['rate']:.1%}",
+        c1.metric(f"{horizon}거래일 내 +{thr:.0%} 상승 확률", f"{hu['rate']:.1%}",
                   delta=f"평균 {base['up']:.1%} 대비 {hu['rate'] - base['up']:+.1%}p", delta_color="normal",
                   help=f"근거: 기관이 20일간 {hu['state']}일 때의 실제 비율입니다(표본 {hu['n']:,}일, 95% 구간 {lo:.0%}~{hi:.0%}). "
-                       f"같은 상태에서 하락 확률은 {hu['dn_rate']:.1%}였습니다.")
-    dev_ind = next((d for d in rep["indicators"] if d["key"] == "dev"), None)
+                       f"같은 상태에서 하락 확률은 {hu['dn_rate']:.1%}였습니다. 신호 다음 날 매수 시 이후 10일 평균 수익은 +2.7%로 전체 평균(+1.2%)보다 높았습니다.")
+    if vol_ind and vol_ind["bucket"]:
+        row = vol_ind["table"][vol_ind["table"]["분위"] == vol_ind["bucket"]].iloc[0]
+        c2.metric("변동성 (20일) 위치", f"{vol_ind['bucket']}/5분위",
+                  help=f"일간 수익률 20일 표준편차 {vol_ind['raw']:.1%}. 이 위치에서 {horizon}거래일 내 -{thr:.0%} 하락 {row['하락']:.0%} / "
+                       f"+{thr:.0%} 상승 {row['상승']:.0%}입니다. **방향이 아니라 움직임의 크기**를 알려줍니다(둘 다 커짐). 비중 조절 참고용입니다.")
+        c2.caption(f"하락 {row['하락']:.0%} · 상승 {row['상승']:.0%} (방향 없음)")
     cur_dev = hist_full["종가"].iloc[-1] / hist_full["종가"].rolling(ma_window).mean().iloc[-1] - 1
     c3.metric(f"현재 괴리율 ({ma_window}일선, 장중 포함)", f"{cur_dev:+.1%}",
-              help="마지막 종가(장중이면 현재가) 기준입니다. 아래 지표 표의 괴리율 행은 확정 종가 기준이라 장중에는 조금 다를 수 있습니다.")
-    if hd and hu:
-        st.caption(
-            f"하락 확률은 **{hd['basis']}** {hd['bucket']}/5분위({_pct_pos_text(next(d for d in rep['indicators'] if d['key']=='flow_heat')['pct'])}), "
-            f"상승 확률은 **기관 20일 {hu['state']}** 기준입니다. 확률은 같은 상태였던 과거 날짜의 실제 비율이며, "
-            "아래 표처럼 지표마다 가리키는 방향이 다를 수 있습니다. 예측력은 몇 %p 수준이라 확정적 신호가 아닙니다."
-        )
+              help="마지막 종가(장중이면 현재가) 기준입니다. 괴리율은 U자형이라 높고 낮음이 방향을 알려주지 않습니다.")
+    st.caption(
+        "하락 확률 카드는 뺐습니다: 수급 과열 점수가 높은 날 팔아도 이후 10일 평균 수익이 +0.6%(전체 +1.3%)로 안 떨어졌고 "
+        "차이도 유의하지 않았습니다(p=0.19). 상승 확률은 확률이 평균보다 몇 %p 높은 수준이라 확정적 신호가 아닙니다."
+    )
 
-    st.markdown("**지표별 경향성 (경향이 강한 순)**")
-    rows = []
-    for d in rep["indicators"]:
-        tbl = d["table"]
-        cur = tbl[tbl["분위"] == d["bucket"]].iloc[0] if d["bucket"] else None
-        note = "" if d["directional"] else "방향 없음 — 하락·상승 둘 다 커짐"
-        if d["key"] == "dev":
-            note = "U자형 — 양 끝에서 하락·상승 모두 커짐"
-        rows.append({
-            "지표": d["name"],
-            "현재 값": _fmt_indicator_value(d["key"], d["raw"]),
-            "현재 위치": f"{d['bucket']}/5분위" if d["bucket"] else "N/A",
-            f"이 위치의 하락 확률": f"{cur['하락']:.0%}" if cur is not None else "N/A",
-            f"이 위치의 상승 확률": f"{cur['상승']:.0%}" if cur is not None else "N/A",
-            "하락 경향 (순위상관, p)": _rho_text(d["rho_dn"], d["p_dn"]),
-            "상승 경향 (순위상관, p)": _rho_text(d["rho_up"], d["p_up"]),
-            "비고": note,
-        })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("순위상관 + = 지표가 클수록 확률 증가. p는 신호 군집을 보존한 정확 순열검정(양측). "
-               "지표 값이 클수록 하락 확률이 늘어나는 경향이 가장 뚜렷한 것은 수급 과열 점수·개인 순매수 비중이고, "
-               "상승은 기관 쪽입니다. 변동성은 방향이 없습니다.")
+    with st.expander("지표별 경향성 상세 (참고 — 하락 확률 지표는 매도 근거로 약함)"):
+        rows = []
+        for d in rep["indicators"]:
+            tbl = d["table"]
+            cur = tbl[tbl["분위"] == d["bucket"]].iloc[0] if d["bucket"] else None
+            note = "" if d["directional"] else "방향 없음 — 하락·상승 둘 다 커짐"
+            if d["key"] == "dev":
+                note = "U자형 — 양 끝에서 하락·상승 모두 커짐"
+            if d["key"] == "flow_heat":
+                note = "하락과 경향은 뚜렷하나 매도 성과는 미미(위 설명)"
+            rows.append({
+                "지표": d["name"],
+                "현재 값": _fmt_indicator_value(d["key"], d["raw"]),
+                "현재 위치": f"{d['bucket']}/5분위" if d["bucket"] else "N/A",
+                "이 위치의 하락 확률": f"{cur['하락']:.0%}" if cur is not None else "N/A",
+                "이 위치의 상승 확률": f"{cur['상승']:.0%}" if cur is not None else "N/A",
+                "하락 경향 (순위상관, p)": _rho_text(d["rho_dn"], d["p_dn"]),
+                "상승 경향 (순위상관, p)": _rho_text(d["rho_up"], d["p_up"]),
+                "비고": note,
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("순위상관 + = 지표가 클수록 확률 증가. p는 신호 군집을 보존한 정확 순열검정(양측).")
 
-    names = [d["name"] for d in rep["indicators"]]
-    default_ix = names.index("수급 과열 점수") if "수급 과열 점수" in names else 0
-    pick = st.selectbox("5분위별 확률 보기", names, index=default_ix, key="overheat_indicator_pick")
-    d = next(x for x in rep["indicators"] if x["name"] == pick)
-    t = d["table"]
-    st.caption(d["desc"] + " · 분위는 각 날짜 이전의 분포로만 정했습니다(1=가장 낮음, 5=가장 높음).")
-    fig = go.Figure()
-    xs = [f"{q}분위" for q in t["분위"]]
-    fig.add_trace(go.Bar(x=xs, y=t["하락"], name=f"-{thr:.0%} 하락", marker_color="#d62728",
-                         customdata=t["표본"], hovertemplate="%{x}<br>하락 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
-    fig.add_trace(go.Bar(x=xs, y=t["상승"], name=f"+{thr:.0%} 상승", marker_color="#2ca02c",
-                         customdata=t["표본"], hovertemplate="%{x}<br>상승 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
-    fig.add_hline(y=base["dn"], line_dash="dot", line_color="#d62728", opacity=0.6, annotation_text="평균 하락", annotation_position="top left")
-    fig.add_hline(y=base["up"], line_dash="dot", line_color="#2ca02c", opacity=0.6, annotation_text="평균 상승", annotation_position="bottom left")
-    fig.update_layout(barmode="group")
-    fig.update_yaxes(title_text=f"{horizon}거래일 내 확률", tickformat=".0%")
-    if d["bucket"]:
-        fig.add_vrect(x0=d["bucket"] - 1.5, x1=d["bucket"] - 0.5, fillcolor="gray", opacity=0.12, line_width=0,
-                      annotation_text="현재", annotation_position="top")
-    _style_chart_mobile(fig, title=f"{pick} 5분위별 이후 {horizon}거래일 하락·상승 확률")
-    st.plotly_chart(fig, width="stretch", key="chart_overheat_indicator", config=PLOTLY_CONFIG)
+        names = [d["name"] for d in rep["indicators"]]
+        default_ix = names.index("기관 20일 순매수 기울기") if "기관 20일 순매수 기울기" in names else 0
+        pick = st.selectbox("5분위별 확률 보기", names, index=default_ix, key="overheat_indicator_pick")
+        d = next(x for x in rep["indicators"] if x["name"] == pick)
+        t = d["table"]
+        st.caption(d["desc"] + " · 분위는 각 날짜 이전의 분포로만 정했습니다(1=가장 낮음, 5=가장 높음).")
+        fig = go.Figure()
+        xs = [f"{q}분위" for q in t["분위"]]
+        fig.add_trace(go.Bar(x=xs, y=t["하락"], name=f"-{thr:.0%} 하락", marker_color="#d62728",
+                             customdata=t["표본"], hovertemplate="%{x}<br>하락 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
+        fig.add_trace(go.Bar(x=xs, y=t["상승"], name=f"+{thr:.0%} 상승", marker_color="#2ca02c",
+                             customdata=t["표본"], hovertemplate="%{x}<br>상승 확률 %{y:.1%}<br>표본 %{customdata:,}일<extra></extra>"))
+        fig.add_hline(y=base["dn"], line_dash="dot", line_color="#d62728", opacity=0.6, annotation_text="평균 하락", annotation_position="top left")
+        fig.add_hline(y=base["up"], line_dash="dot", line_color="#2ca02c", opacity=0.6, annotation_text="평균 상승", annotation_position="bottom left")
+        fig.update_layout(barmode="group")
+        fig.update_yaxes(title_text=f"{horizon}거래일 내 확률", tickformat=".0%")
+        if d["bucket"]:
+            fig.add_vrect(x0=d["bucket"] - 1.5, x1=d["bucket"] - 0.5, fillcolor="gray", opacity=0.12, line_width=0,
+                          annotation_text="현재", annotation_position="top")
+        _style_chart_mobile(fig, title=f"{pick} 5분위별 이후 {horizon}거래일 하락·상승 확률")
+        st.plotly_chart(fig, width="stretch", key="chart_overheat_indicator", config=PLOTLY_CONFIG)
 
-    g = rep["grid"]
-    labels_dev = [f"괴리율 낮음(~33%)", "괴리율 중간", "괴리율 높음(67%~)"]
-    labels_flow = ["수급 냉각", "수급 중립", "수급 과열"]
-    grid_df = pd.DataFrame(
-        [[("N/A" if np.isnan(g["rate"][i, j]) else f"{g['rate'][i, j]:.0%}  (n={g['n'][i, j]:,})")
-          + (" ◀ 현재" if g["current"] == (i, j) else "") for j in range(3)] for i in range(3)],
-        index=labels_dev, columns=labels_flow)
-    st.markdown(f"**괴리율 × 수급 과열 — {horizon}거래일 내 -{thr:.0%} 하락 확률**")
-    st.dataframe(grid_df, width="stretch")
-    st.caption("괴리율이 높은데 개인이 몰려 사는 칸이 가장 위험하고, 괴리율이 중간 이상인데 수급이 냉각된 칸이 가장 안전했습니다. "
-               "괴리율이 아주 낮은 칸이 안전하지 않은 것은 하락장이 이어졌기 때문입니다.")
+        g = rep["grid"]
+        labels_dev = ["괴리율 낮음(~33%)", "괴리율 중간", "괴리율 높음(67%~)"]
+        labels_flow = ["수급 냉각", "수급 중립", "수급 과열"]
+        grid_df = pd.DataFrame(
+            [[("N/A" if np.isnan(g["rate"][i, j]) else f"{g['rate'][i, j]:.0%}  (n={g['n'][i, j]:,})")
+              + (" ◀ 현재" if g["current"] == (i, j) else "") for j in range(3)] for i in range(3)],
+            index=labels_dev, columns=labels_flow)
+        st.markdown(f"**괴리율 × 수급 과열 — {horizon}거래일 내 -{thr:.0%} 하락 확률**")
+        st.dataframe(grid_df, width="stretch")
     return rep
+
+
+def _rule_state_text(w) -> str:
+    if w is None:
+        return "N/A"
+    return "보유" if w >= 0.999 else ("현금" if w <= 0.001 else f"비중 {w:.0%}")
+
+
+def _render_risk_rules_section(hist_full: pd.DataFrame) -> None:
+    """낙폭 관리 규칙 4개의 현재 상태와 과거 성적. SK하이닉스에서만 보여준다(다른 종목에서 재현되지 않았다)."""
+    _subheader_with_help(
+        "낙폭 관리 규칙 (SK하이닉스 한정 · 참고)",
+        "2026-10-16에 후보 32개(가격 추세·수급·외국인 보유율·코스피·SOX·마이크론·환율·변동성·조합)를 사전에 정한 기준으로 평가해 "
+        "SK하이닉스에서 통과한 규칙 4개입니다. 기준: ① 켜진 날 다음 20일 수익이 꺼진 날보다 높고 p<0.05 ② 켜졌을 때만 보유한 샤프가 "
+        "21년·10년 모두 단순 보유보다 높음 ③ 4개 하위기간 중 3개 이상에서 승. 체결은 신호 다음 날 종가, 편도 비용 0.15%.\n\n"
+        "**중요한 한계**: 같은 규칙을 삼성전자에 옮기면 4개 모두 단순 보유보다 못했고, 국내 대형주 26종목에서는 샤프가 좋아진 종목이 "
+        "12~27%뿐이었으며 마이크론에서도 효과가 없었습니다. 하이닉스는 이 탐색이 시작된 종목이라 선택 편향이 있습니다. "
+        "최대 낙폭이 줄어든 것은 시장에 덜 들어가 있었기 때문이기도 합니다. **수익을 늘리는 신호가 아니라 낙폭을 줄이는 위험 관리 참고**이고, "
+        "아래 '전향 검증 장부'에서 앞으로의 실제 결과를 기록해 판정합니다.",
+        key="risk_rules",
+    )
+    if TICKER != DEFAULT_TICKER:
+        st.caption("이 규칙은 SK하이닉스에서만 골랐고 다른 종목에서는 재현되지 않아 SK하이닉스에서만 표시합니다.")
+        return
+    try:
+        sox = _cached_us_daily("%5ESOX")
+    except Exception as exc:
+        sox = None
+        st.caption(f":orange[SOX 시세를 받지 못해 C2 규칙은 건너뜁니다 ({type(exc).__name__}).]")
+    rep = _cached_risk_report(signal_lab.drop_incomplete_last_row(hist_full).reset_index(drop=True),
+                              sox if sox is not None else pd.DataFrame(columns=["날짜", "close"]))
+    if not rep.get("ok"):
+        st.caption("규칙을 계산할 이력이 부족합니다.")
+        return
+    bh_a, bh_t = rep["bh_all"], rep["bh_ten"]
+    rows = []
+    for r in rep["rules"]:
+        a, t = r["all"], r["ten"]
+        rows.append({
+            "규칙": f"{r['key']} {r['name']}",
+            f"지금 상태 ({rep['asof']:%m-%d} 종가)": _rule_state_text(r["weight_now"]),
+            "샤프 21년": f"{a['sharpe']:.2f}" if a else "N/A",
+            "샤프 10년": f"{t['sharpe']:.2f}" if t else "N/A",
+            "최대낙폭 21년": f"{a['mdd']:.0%}" if a else "N/A",
+            "최대낙폭 10년": f"{t['mdd']:.0%}" if t else "N/A",
+            "시장 노출(21년)": f"{a['exposure']:.0%}" if a else "N/A",
+            "규칙 설명": r["desc"],
+        })
+    rows.append({
+        "규칙": "단순 보유 (비교 기준)", f"지금 상태 ({rep['asof']:%m-%d} 종가)": "보유",
+        "샤프 21년": f"{bh_a['sharpe']:.2f}", "샤프 10년": f"{bh_t['sharpe']:.2f}",
+        "최대낙폭 21년": f"{bh_a['mdd']:.0%}", "최대낙폭 10년": f"{bh_t['mdd']:.0%}", "시장 노출(21년)": "100%", "규칙 설명": "",
+    })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    states = [r["weight_now"] for r in rep["rules"] if r["weight_now"] is not None]
+    if states and (max(states) >= 0.999) and (min(states) <= 0.001):
+        st.info("규칙들이 서로 다른 상태를 가리킵니다(예: 기관 수급·SOX는 보유, 80일선 밴드는 현금). 규칙마다 보는 것이 달라서 생기는 일이며, "
+                "어느 쪽이 맞는지는 아래 전향 검증 장부로 앞으로 확인합니다.")
+    st.caption("샤프·최대낙폭은 위 가정(다음 날 종가 체결, 편도 0.15%)의 과거 결과이며 미래를 보장하지 않습니다.")
+
+
+def _render_ledger_section() -> None:
+    """전향 검증 장부: 수집기가 마감 뒤 규칙 비중을 한 줄씩 기록한다. 수정·백필 금지(signal_ledger 모듈 설명)."""
+    _subheader_with_help(
+        "전향 검증 장부 (실제 기록)",
+        "낙폭 관리 규칙 4개는 과거 데이터에서 골라서, 과거 백테스트는 더 이상 증거가 못 됩니다. 그래서 **매일 장 마감 뒤 규칙의 목표 비중을 "
+        "한 줄씩 기록**하고 있습니다. 한 번 기록한 줄은 고치지 않고 과거를 채워 넣지도 않습니다. 성적은 기록된 비중을 다음 날 종가에 "
+        "체결했다고 가정(편도 0.15%)해 단순 보유와 비교합니다. 규칙은 바꾸지 않습니다(바꾸려면 새 장부로 시작). "
+        f"**기록이 {signal_ledger.MIN_DAYS_TO_JUDGE}거래일(약 6개월) 쌓이기 전에는 판단을 보류**합니다.",
+        key="ledger",
+    )
+    if TICKER != DEFAULT_TICKER:
+        st.caption("장부는 SK하이닉스만 기록합니다.")
+        return
+    led = signal_ledger.load()
+    if led.empty:
+        st.caption("아직 기록이 없습니다. 오늘 장 마감 후(16:30 이후 확정 수급이 들어오면) 첫 줄이 기록됩니다.")
+        return
+    ev = signal_ledger.evaluate(led)
+    n = len(led)
+    st.markdown(f"**기록 {n}거래일** — {led['날짜'].iloc[0]:%Y-%m-%d} ~ {led['날짜'].iloc[-1]:%Y-%m-%d}")
+    if n < signal_ledger.MIN_DAYS_TO_JUDGE:
+        st.info(f"판단하기엔 이릅니다 — {signal_ledger.MIN_DAYS_TO_JUDGE}거래일이 필요한데 지금 {n}일째입니다. "
+                "그 전의 수익률은 우연의 영향이 커서 규칙의 우열로 읽지 마세요.")
+    last = led.iloc[-1]
+    names = {"C2": "C2 기관 우위 + SOX 200일선", "P6": "P6 80일선 ±3% 밴드", "R3": "R3 변동성 목표 × 기관", "R2": "R2 변동성 목표"}
+    if ev.get("ok"):
+        rows = []
+        bh = ev["buy_hold"]
+        rows.append({"규칙": "단순 보유", "마지막 기록 비중": "100%", "기록 이후 누적 수익": f"{bh['total']:+.1%}", "최대낙폭": f"{bh['mdd']:.1%}", "시장 노출": "100%"})
+        for k, nm in names.items():
+            r = ev["rules"].get(k)
+            if r:
+                rows.append({"규칙": nm, "마지막 기록 비중": f"{last[f'비중_{k}']:.0%}", "기록 이후 누적 수익": f"{r['total']:+.1%}",
+                             "최대낙폭": f"{r['mdd']:.1%}", "시장 노출": f"{r['exposure']:.0%}"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("누적 수익은 기록 3번째 날부터(첫 신호의 체결 다음 날) 계산합니다. 단순 보유도 같은 구간으로 비교합니다.")
+    else:
+        st.caption("성적은 기록이 5일 이상 쌓이면 계산합니다.")
+    with st.expander("최근 기록 보기"):
+        show = led.tail(20).copy()
+        show["날짜"] = show["날짜"].dt.strftime("%Y-%m-%d")
+        st.dataframe(show.iloc[::-1], hide_index=True, width="stretch")
 
 
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
@@ -2883,20 +2995,23 @@ def _render_tab_overheat():
 
     _subheader_with_help(
         "가격 과열도 — 지금 하락·상승 확률",
-        "지표별로 **지금이 과거 분포의 어디쯤인지**, 그 위치에 있던 과거 날짜들에서 이후 하락·상승이 실제로 얼마나 있었는지를 "
-        "보여줍니다. 위쪽 확률 카드는 경향성이 가장 크게 나온 지표를 씁니다.\n\n"
-        "**무엇이 경향성이 큰가**(SK하이닉스 21년·10년 검증): 개인이 많이 사고 기관·외국인이 파는 **수급 과열**일수록 이후 하락 "
-        "확률이 단계적으로 올라갔습니다(순열검정 p<0.01). 기관이 20일간 사 모으는 중이면 상승 확률이 높았습니다. "
-        "**이동평균 괴리율 자체는 경향이 약하고 U자형**입니다 — 괴리율이 높다고 떨어지는 게 아니라 변동폭이 커질 뿐이고(상승 확률·이후 평균 수익도 같이 높음), "
-        "아주 낮다고 안전한 것도 아닙니다(하락장이 이어짐). 그래서 괴리율은 아래쪽에 따로 두었습니다. "
+        "**지금 상황**에서는 기관 수급으로 본 상승 확률, 변동성 위치(움직임의 크기), 괴리율을 보여줍니다. 확률은 같은 상태였던 과거 날짜들에서 "
+        "이후 하락·상승이 실제로 얼마나 있었는지의 비율입니다.\n\n"
+        "**무엇이 남았나**(SK하이닉스 21년·10년 검증): 기관이 20일간 사 모으는 중이면 상승 확률이 높았고 신호 다음 날 매수한 수익도 "
+        "전체 평균보다 높았습니다. 반면 **하락 확률 쪽은 매도 근거로 약했습니다** — 개인 매수 과열·수급 과열 점수가 높은 날 팔아도 이후 평균 수익이 "
+        "마이너스로 돌아서지 않았습니다(p=0.19). **이동평균 괴리율은 U자형**이라 높다고 떨어지는 게 아니라 변동폭이 커질 뿐입니다. "
         "외국인 보유율(수준·변화)은 검증했지만 예측력이 약해 뺐습니다.\n\n"
         "**점-시점 분위**: 각 날짜의 위치는 그날 이전 분포만으로 정합니다(전체 분포를 쓰면 미래 정보가 섞여 효과가 부풀려집니다). "
         "p값은 신호 군집을 보존한 정확 순열검정이며, 연속한 날짜를 독립 표본으로 세는 z검정은 p를 크게 과소평가해 쓰지 않습니다.\n\n"
         "**한계**: 한 종목에 독립 사건이 수십 건이라 예측력은 확률이 몇 %p 움직이는 수준입니다. 개별 시점의 정답이 아니고 "
-        "매매 신호가 아닙니다. 다른 종목에서는 검증하지 않았습니다.",
+        "매매 신호가 아닙니다. 삼성전자 등 다른 종목에서는 같은 방식이 재현되지 않았습니다.",
         key="overheat",
     )
 
+    st.warning(
+        "**SK하이닉스 한정 · 참고용.** 이 탭의 지표와 규칙은 SK하이닉스 과거 데이터에서 찾은 것이고, 삼성전자·국내 대형주·마이크론에 "
+        "같은 방식을 적용하면 대부분 재현되지 않았습니다. 확률은 평균보다 몇 %p 높고 낮은 수준이며 매매 신호가 아닙니다."
+    )
     with st.expander("백테스트 조건 조정"):
         param_col1, param_col2, param_col3 = st.columns(3)
         OVERHEAT_MA_WINDOW = param_col1.slider(
@@ -2924,6 +3039,8 @@ def _render_tab_overheat():
             st.caption(":orange[장기 이력 파일(KIS)이 없는 종목이거나 아직 만드는 중이라 최근 700거래일로 계산했습니다 — "
                        "결과가 21년·10년 기준과 다를 수 있습니다.]")
         rep = _render_overheat_situation(hist_full, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+        st.divider()
+        _render_risk_rules_section(hist_full)
         # 괴리율 구간 분석도 위 '분석 기간' 선택을 따른다(둘이 다른 표본을 보면 숫자가 어긋난다).
         recent_only = str(st.session_state.get("overheat_situation_period", "")).startswith("최근")
         period_label = "최근 10년" if recent_only else "전체 약 21년"
@@ -3065,6 +3182,8 @@ def _render_tab_overheat():
 
         st.divider()
         _render_overheat_strategy(hist_full, OVERHEAT_MA_WINDOW)
+        st.divider()
+        _render_ledger_section()
     except Exception as e:
         st.error(f"가격 과열도 백테스트에 실패했습니다: {e}")
 

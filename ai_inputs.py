@@ -1594,6 +1594,33 @@ def fetch_foreign_desk(ticker: str) -> dict:
     return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
 
 
+_US_DAILY_CACHE: dict = {}
+
+
+def fetch_us_daily(symbol: str, ttl: int = 6 * 3600) -> pd.DataFrame:
+    """야후 일봉 전체 이력(날짜, close). 수집기와 화면이 같이 쓴다(streamlit 없이 모듈 안에서 6시간 캐시).
+
+    함정: range=max는 종목에 따라 월봉이 내려온다 → period1=0 + interval=1d로 받는다.
+    날짜는 거래소 현지 날짜다(gmtoffset을 더해 자정으로 맞춘다).
+    """
+    hit = _US_DAILY_CACHE.get(symbol)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    r = requests.get(YAHOO_CHART_URL.format(symbol=symbol), timeout=20, headers={"User-Agent": "Mozilla/5.0"},
+                     params={"period1": 0, "period2": int(time.time()) + 86400, "interval": "1d"})
+    r.raise_for_status()
+    res = r.json()["chart"]["result"][0]
+    ts = pd.to_datetime(res["timestamp"], unit="s")
+    quote = res["indicators"]["quote"][0]["close"]
+    adj = (res["indicators"].get("adjclose") or [{}])[0].get("adjclose") or quote
+    df = pd.DataFrame({"ts": ts, "close": adj}).dropna()
+    off = res.get("meta", {}).get("gmtoffset", 0)
+    df["날짜"] = (df["ts"] + pd.to_timedelta(off, unit="s")).dt.normalize()
+    df = df.drop_duplicates("날짜", keep="last")[["날짜", "close"]].reset_index(drop=True)
+    _US_DAILY_CACHE[symbol] = (time.time(), df)
+    return df
+
+
 def fetch_kis_stock_daily_long(ticker: str, since: dt.date) -> pd.DataFrame:
     """KIS '종목별 투자자매매동향(일별)'(FHPTJ04160001)을 since까지 과거로 30행씩 넘겨 받는다.
 
@@ -3407,25 +3434,37 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
     try:
         sit = signal_lab.situation_report(signal_lab.drop_incomplete_last_row(hist), ma_window=ma, horizon=horizon, thr=threshold)
         if sit.get("ok"):
+            hu = sit.get("headline_up")
             parts_s = []
-            hd, hu = sit.get("headline_dn"), sit.get("headline_up")
-            if hd:
-                lo, hi = hd["ci"]
-                parts_s.append(f"{hd['basis']} {hd['bucket']}/5분위 → {horizon}거래일 내 -{threshold:.0%} 하락 확률 "
-                               f"{hd['rate']:.1%}(전체 평균 {sit['base']['dn']:.1%}, 표본 {hd['n']:,}일, 95% {lo:.0%}~{hi:.0%})")
             if hu:
                 lo, hi = hu["ci"]
                 parts_s.append(f"{hu['basis']} {hu['state']} → +{threshold:.0%} 상승 확률 {hu['rate']:.1%}"
                                f"(전체 평균 {sit['base']['up']:.1%}, 표본 {hu['n']:,}일, 95% {lo:.0%}~{hi:.0%})")
-            strong = [d for d in sit["indicators"] if d["directional"] and d["key"] != "dev"][:3]
-            tends = "; ".join(
-                f"{d['name']} 하락 경향 ρ={d['rho_dn']:+.2f}(p={d['p_dn']:.2f}), 상승 경향 ρ={d['rho_up']:+.2f}(p={d['p_up']:.2f})"
-                for d in strong if d["rho_dn"] is not None and d["rho_up"] is not None)
+            vol_ind = next((d for d in sit["indicators"] if d["key"] == "vol"), None)
+            if vol_ind and vol_ind["bucket"]:
+                row = vol_ind["table"][vol_ind["table"]["분위"] == vol_ind["bucket"]].iloc[0]
+                parts_s.append(f"변동성 {vol_ind['bucket']}/5분위 → 하락·상승 모두 커지는 구간(이 구간의 -{threshold:.0%} 하락 {row['하락']:.0%} / +{threshold:.0%} 상승 {row['상승']:.0%}, "
+                               "방향 없음)")
             situation = (f"[지금 상황 — {sit['asof']:%Y-%m-%d} 확정 기준, 점-시점 분위] " + "; ".join(parts_s)
-                         + f". 경향이 강한 지표: {tends}. 지표 값이 클수록 확률이 늘어나는 경향은 수급 과열 점수·개인 순매수 비중(하락)과 "
-                           "기관 순매수(상승)에서만 뚜렷했고 이동평균 괴리율은 U자형이라 약하다. 예측력은 몇 %p 수준이다. ")
+                         + ". 수급 과열 점수로 본 하락 확률은 매도 근거로 약해(신호 후 평균 수익이 오히려 양수, p=0.19) 쓰지 않는다. ")
     except Exception:
         situation = ""
+    rules_txt = ""
+    if ticker == DEFAULT_TICKER:
+        try:
+            sox = fetch_us_daily("%5ESOX")
+            rr = signal_lab.risk_rules_report(signal_lab.drop_incomplete_last_row(hist), sox)
+            if rr.get("ok"):
+                st_ = []
+                for r in rr["rules"]:
+                    w = r["weight_now"]
+                    st_.append(f"{r['key']} {r['name']}: " + ("N/A" if w is None else ("보유" if w >= 0.999 else ("현금" if w <= 0.001 else f"비중 {w:.0%}"))))
+                rules_txt = ("[낙폭 관리 규칙 현재 상태 — SK하이닉스 한정, 다른 종목에서는 재현되지 않았고 전향 검증 중] "
+                             + "; ".join(st_) + ". 과거 21년 샤프 0.65~0.93(보유 0.62), 최대 낙폭 -34%~-64%(보유 -85%). "
+                             "수익을 늘리는 신호가 아니라 낙폭을 줄이는 위험 관리 참고이며 단독 근거로 쓰지 마라. ")
+        except Exception:
+            rules_txt = ""
+    situation = situation + rules_txt
     kw = dict(drawdown_threshold=threshold)
     high = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="high", **kw) for q in OVERHEAT_QUANTILES}
     low = {q: signal_lab.run_overheat_pit(hist, "종가", ma, horizon, quantile=q, side="low", **kw) for q in OVERHEAT_QUANTILES}

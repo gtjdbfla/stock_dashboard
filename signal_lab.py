@@ -574,3 +574,111 @@ def situation_report(hist: pd.DataFrame, ma_window: int = 80, horizon: int = 10,
     out["grid"] = {"rate": grid_rate, "n": grid_n, "current": cur}
     out["ok"] = True
     return out
+
+
+# ── 낙폭 관리 규칙(SK하이닉스 한정) ─────────────────────────────────────────────
+# 2026-10-16 사전 등록 후보 32개를 같은 기준으로 평가해 하이닉스에서 통과한 4개. 같은 규칙을 삼성전자·국내 대형주
+# 26종목·마이크론에 옮기면 대부분 보유보다 못했으므로 '하이닉스에서만 통한 참고'로만 쓴다(CONTEXT.md §5).
+# 규칙은 여기서 고정한다 — 결과를 본 뒤 조건을 바꾸지 말 것(전향 검증 장부가 이 정의를 그대로 기록한다).
+
+RISK_RULES = [
+    ("C2", "기관 20일 순매수 우위 + SOX가 200일선 위",
+     "기관 20일 누적 순매수 기울기>0 이고 필라델피아 반도체지수(SOX) 전날 종가가 200일선 위일 때만 보유"),
+    ("P6", "80일선 ±3% 밴드 추세추종",
+     "종가가 80일선 대비 +3% 이상으로 올라오면 보유, -3% 아래로 내려가면 현금(밴드 안에서는 직전 상태 유지)"),
+    ("R3", "변동성 목표 비중 × 기관 순매수 우위",
+     "기관 20일 순매수 우위일 때만, 비중 = min(1, 과거 20일 변동성 중앙값 ÷ 최근 20일 변동성)"),
+    ("R2", "변동성 목표 비중",
+     "항상 보유하되 비중 = min(1, 과거 20일 변동성 중앙값 ÷ 최근 20일 변동성) — 변동성이 커지면 비중을 줄임"),
+]
+RISK_COST = 0.0015          # 편도 비용 0.15% (왕복 0.3%)
+
+
+def align_prev(dates: pd.Series, ext: pd.DataFrame, col: str = "close") -> pd.Series:
+    """미국·환율 시세를 한국 날짜에 붙인다. **한국 날짜보다 앞선 날**의 값만 쓴다(한국 종가 시점에 이미 끝난 값)."""
+    e = ext[["날짜", col]].copy()
+    e["날짜"] = pd.to_datetime(e["날짜"]).astype("datetime64[ns]")
+    e = e.sort_values("날짜").rename(columns={"날짜": "_d"})
+    left = pd.DataFrame({"날짜": pd.to_datetime(pd.Series(dates)).astype("datetime64[ns]").to_numpy()})
+    m = pd.merge_asof(left, e, left_on="날짜", right_on="_d", allow_exact_matches=False, direction="backward")
+    return m[col].astype(float).reset_index(drop=True)
+
+
+def _band_state(dev: np.ndarray, b: float) -> np.ndarray:
+    s = np.zeros(len(dev))
+    cur = False
+    for i, v in enumerate(dev):
+        if np.isnan(v):
+            continue
+        if not cur and v >= b:
+            cur = True
+        elif cur and v < -b:
+            cur = False
+        s[i] = 1.0 if cur else 0.0
+    return s
+
+
+def risk_rule_weights(h: pd.DataFrame, sox: pd.DataFrame | None) -> dict:
+    """날짜별 목표 비중(0~1). 신호는 그날 종가 기준이고 체결은 다음 날 종가다."""
+    h = h.sort_values("날짜").reset_index(drop=True)
+    price = h["종가"].astype(float)
+    inst_pos = (np.nan_to_num(rolling_slope(h["기관"].astype(float), SIGNAL_WINDOW)) > 0).astype(float)
+    r20 = price.pct_change().rolling(20).std()
+    med = r20.expanding(250).median().shift(1)
+    wvt = np.clip(np.nan_to_num((med / r20).to_numpy()), 0, 1)
+    dev80 = (price / price.rolling(80).mean() - 1).to_numpy()
+    out = {"P6": _band_state(dev80, 0.03), "R3": wvt * inst_pos, "R2": wvt}
+    info = {"inst_slope": rolling_slope(h["기관"].astype(float), SIGNAL_WINDOW), "dev80": dev80,
+            "sig20": r20.to_numpy(), "wvt": wvt}
+    if sox is not None and len(sox) > 250:
+        s = align_prev(h["날짜"], sox)
+        ma200 = s.rolling(200).mean()
+        sox_up = np.nan_to_num((s - ma200).to_numpy()) > 0
+        out["C2"] = (inst_pos.astype(bool) & sox_up).astype(float)
+        info.update({"sox_prev": s.to_numpy(), "sox_ma200": ma200.to_numpy()})
+    return {"weights": out, "info": info}
+
+
+def _weights_perf(price: np.ndarray, w: np.ndarray, mask: np.ndarray, lag: int = 1, cost: float = RISK_COST) -> dict:
+    n = len(price)
+    ret = np.r_[0.0, price[1:] / price[:-1] - 1]
+    pos = np.zeros(n)
+    pos[1 + lag:] = np.asarray(w, float)[: n - 1 - lag]
+    turn = np.abs(np.diff(pos, prepend=0))
+    r = (pos * ret - cost * turn)[mask]
+    if len(r) < 60:
+        return {}
+    eq = np.cumprod(1 + r)
+    yrs = len(r) / TRADING_DAYS
+    sd = r.std()
+    return {"cagr": float(eq[-1] ** (1 / yrs) - 1), "mdd": float((eq / np.maximum.accumulate(eq) - 1).min()),
+            "sharpe": float(r.mean() / sd * np.sqrt(TRADING_DAYS)) if sd > 0 else None,
+            "exposure": float(pos[mask].mean())}
+
+
+def risk_rules_report(hist: pd.DataFrame, sox: pd.DataFrame | None, start="2006-06-01") -> dict:
+    """규칙별 현재 상태(오늘 종가 기준 목표 비중)와 21년·10년 성적. 비교 기준은 단순 보유(같은 체결·비용 가정)."""
+    h = hist.sort_values("날짜").reset_index(drop=True)
+    out = {"ok": False}
+    if len(h) < 1500:
+        return out
+    rw = risk_rule_weights(h, sox)
+    price = h["종가"].astype(float).to_numpy()
+    d = pd.to_datetime(h["날짜"])
+    m_all = np.asarray(d >= pd.Timestamp(start))
+    m_10 = np.asarray(d >= pd.Timestamp("2016-10-14"))
+    bh_all = _weights_perf(price, np.ones(len(h)), m_all)
+    bh_10 = _weights_perf(price, np.ones(len(h)), m_10)
+    rules = []
+    for key, name, desc in RISK_RULES:
+        w = rw["weights"].get(key)
+        row = {"key": key, "name": name, "desc": desc, "weight_now": None, "all": {}, "ten": {}}
+        if w is not None:
+            row["weight_now"] = float(w[-1])
+            row["all"] = _weights_perf(price, w, m_all)
+            row["ten"] = _weights_perf(price, w, m_10)
+        rules.append(row)
+    out.update({"ok": True, "asof": h["날짜"].iloc[-1], "rules": rules, "bh_all": bh_all, "bh_ten": bh_10,
+                "info": {k: (float(v[-1]) if len(v) and not np.isnan(v[-1]) else None) for k, v in rw["info"].items()},
+                "weights": rw["weights"]})
+    return out
