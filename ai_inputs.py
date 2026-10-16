@@ -2707,7 +2707,7 @@ def build_early_signal_summary(ticker: str) -> str:
     def cell(d):
         if d["sig"] is None:
             return "N/A"
-        p = "" if d["p"] is None else f", 순열검정 p={d['p']:.2f}"
+        p = "" if d["p"] is None else (", 순열검정 p<0.01" if d["p"] < 0.01 else f", 순열검정 p={d['p']:.2f}")
         return f"{d['sig']:.0%} vs 아닐 때 {d['rest']:.0%}{p}"
 
     q = cur["bucket"]
@@ -3379,7 +3379,8 @@ OVERHEAT_DEFAULT_THRESHOLD = 0.10
 OVERHEAT_QUANTILES = [0.20, 0.15, 0.10, 0.05]
 
 
-def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: float) -> str:
+def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: float,
+                          ticker: str | None = None) -> str:
     """가격 과열도 백테스트 요약문. 화면 탭과 AI 재료가 같은 문장을 쓴다(조건만 호출자가 정한다).
 
     점-시점 분위(그날까지의 과거 분포로만 구간 판정)와 순열검정 p값을 쓴다. 2026-10-16 10년·21년
@@ -3423,9 +3424,11 @@ def overheat_summary_text(hist: pd.DataFrame, ma: int, horizon: int, threshold: 
         f"가격 과열도 백테스트({ma}일선 괴리율, 표본 {result['n']}일, 점-시점 분위: 각 날짜의 구간을 그날까지의 과거 "
         f"분포로만 판정): 전체 기준 {horizon}거래일 내 {threshold:.0%} 이상 하락 확률 {result['base_rate']:.1%}, "
         f"상승 확률 {result['base_up_rate']:.1%}. 구간별 — {'; '.join(parts)}. "
-        "해석: 괴리율이 극단(상위·하위)일수록 하락만이 아니라 상승 확률도 같이 커진다 — 변동폭 확대이지 방향 신호가 "
-        "아니며, 과열 구간 이후의 평균수익은 오히려 높았다. 하락 확률 차이는 대부분 유의하지 않다(p 표기). "
-        f"현재 상태: {label}"
+        + ("해석(SK하이닉스 10년·21년 검증): 상위(과열) 구간은 하락 확률 차이가 유의하지 않고 상승 확률과 이후 평균수익이 "
+           "오히려 높았다 — 변동폭 확대이지 하락 방향 신호가 아니다. 하위(침체) 구간은 반등(상승 확률·평균수익↑)이 많았다. "
+           if ticker == DEFAULT_TICKER else
+           "해석: 구간별 수치를 있는 그대로 읽되 '과열이면 하락'으로 단정하지 마라(하락 확률 차이의 유의성은 p 표기). ")
+        + f"현재 상태: {label}"
         + (f" (괴리율 {deviation:+.1%})" if deviation is not None else "")
         + ". (통계 참고용, 매매 신호 아님)"
     )
@@ -3439,7 +3442,7 @@ def build_overheat_summary(ticker: str) -> str:
     """
     hist = fetch_long_history_live(ticker, years=10)
     return overheat_summary_text(hist, OVERHEAT_DEFAULT_MA_WINDOW, OVERHEAT_DEFAULT_HORIZON,
-                                 OVERHEAT_DEFAULT_THRESHOLD)
+                                 OVERHEAT_DEFAULT_THRESHOLD, ticker=ticker)
 
 
 def build_dram_summary() -> str:

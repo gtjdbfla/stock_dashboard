@@ -2753,8 +2753,8 @@ def _render_tab_overheat():
         "가격 과열도 백테스트",
         "이동평균 대비 괴리율 구간별로 이후 하락·상승 확률과 평균 수익이 어떻게 달라지는지 보는 통계입니다.\n\n"
         "**읽는 법**: SK하이닉스 10년·21년 검증에서 괴리율이 극단(상위·하위 5%)일 때 하락 확률이 높아지긴 했지만 "
-        "**상승 확률도 같이 높아졌고**, 과열 구간 이후의 평균 수익은 오히려 높았습니다(10년: 상위 구간 상승 60~64% vs "
-        "30%, 15일 평균 +6.5% vs +2.1%). 변동폭이 커진다는 뜻이지 '과열이면 떨어진다'는 방향 신호가 아닙니다. "
+        "**상승 확률도 같이 높아졌고**, 과열 구간 이후의 평균 수익은 오히려 높았습니다(아래 표의 상위 구간 행). "
+        "변동폭이 커진다는 뜻이지 '과열이면 떨어진다'는 방향 신호가 아닙니다. "
         "괴리율을 변동성으로 나누면 효과가 사라졌습니다.\n\n"
         "**점-시점 분위**: 각 날짜가 상위 N% 구간인지는 그날까지의 과거 분포만으로 판정합니다. 전체 구간 분포로 정하면 "
         "미래 정보가 섞여 하락 효과가 부풀려집니다(그렇게 하면 상위 10%에서 유의해 보였다가, 점-시점으로 보면 사라졌습니다). "
@@ -2947,7 +2947,7 @@ def _render_tab_overheat():
                 st.caption("차트 하단 슬라이더를 드래그하면 보고 싶은 기간만 확대해서 볼 수 있습니다. 종가 축은 로그 눈금입니다.")
 
                 overheat_summary = overheat_summary_text(
-                    overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD)
+                    overheat_hist, OVERHEAT_MA_WINDOW, OVERHEAT_HORIZON, OVERHEAT_DRAWDOWN_THRESHOLD, ticker=TICKER)
 
                 st.divider()
                 _render_overheat_strategy(fetch_long_history_live(TICKER, years=25), OVERHEAT_MA_WINDOW)
@@ -3551,7 +3551,8 @@ def _pv_text(p) -> str:
 def _rate_cell(d: dict) -> str:
     if d["sig"] is None or d["rest"] is None:
         return "N/A"
-    return f"{d['sig']:.0%} vs {d['rest']:.0%} (p={_pv_text(d['p'])})"
+    pt = _pv_text(d["p"])
+    return f"{d['sig']:.0%} vs {d['rest']:.0%} (p{pt if pt.startswith('<') else '=' + pt})"
 
 
 _FLOW_SIGNAL_COMMON_LIMITS = (

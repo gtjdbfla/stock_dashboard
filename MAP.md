@@ -13,6 +13,8 @@
 | `ai_report.py` | 356 | 재료를 모아 프롬프트에 태우고 저장 |
 | `daily_history.py` | 128 | 일별 이력 CSV 저장/로드. 네트워크 코드 없음(순환 방지) |
 | `hbm.py` | 약 700 | HBM 탭 데이터: 출처 수집·사실 추출·원문 검증·종합. streamlit 미import |
+| `signal_lab.py` | 약 330 | 수급 조기신호·괴리율·추세추종 전략의 **계산부**(순열검정 `perm_p`, 점-시점 분위 `pit_bucket`, `early_signal_report`, `run_overheat_pit`, `run_ma_strategy`). streamlit·네트워크 없음. 화면과 AI 재료가 이걸 공유 |
+| `long_history.py` | 약 140 | 10년 이상 일별 이력 CSV(KIS 2004~). 저장·로드·액면분할 가드·수집기 `tick`. 네트워크는 `ai_inputs.fetch_kis_stock_daily_long` |
 | `contract_outlook.py` | 약 350 | DRAM 탭 고정가 전망: 수집·검증(`validate_forecast`)·분석(`latest_table`/`pace_change`/`build_index`). streamlit 미import |
 
 ---
@@ -26,7 +28,7 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 
 **시세·수급** `fetch_current_price` 321 · `fetch_intraday_price` 325 · `fetch_investor_netbuy` 366 **(오래된 것부터 온다 — 최신순 아님)** · `fetch_daily_ohlcv` 391 · `fetch_stock_snapshot` 698 · `fetch_market_flow` 936 · `fetch_foreign_desk` 963 · `fetch_foreign_hold_ratio` 1753
 
-**백테스트** `fetch_backtest_history` 437 **(파일 우선 — daily_history. 없거나 낡을 때만 `_fetch_backtest_history_web`)** · `fetch_backtest_history_live` 484 · `run_overheat_backtest` 528 · `run_boolean_pattern_backtest` 600
+**백테스트** `fetch_backtest_history` 437 **(파일 우선 — daily_history. 없거나 낡을 때만 `_fetch_backtest_history_web`)** · `fetch_backtest_history_live` 484 · `run_overheat_backtest` 528 **(화면·AI는 이제 `signal_lab.run_overheat_pit`을 쓴다 — 점-시점 분위·순열 p. 옛 함수는 선물/통합 탭용으로만 남음)** · `run_boolean_pattern_backtest` 600 **(조기신호는 `signal_lab.early_signal_report`로 교체)** · `fetch_long_history_live`(장기 이력 파일 + 최근 며칠 덧씌우기, 캐시 없음) · `fetch_kis_stock_daily_long`
 
 **뉴스·공시·리포트** `fetch_news_with_summary` 885 · `fetch_disclosures` 1049 **(목록+오늘 본문만. 그 앞 15건은 `disclosure.py` 정리본 담당)** · `fetch_sector_news` 1212 · `fetch_trendforce_news` 1256 · `fetch_analyst_reports` 1291 · `fetch_community_posts` 1349 · `fetch_dc_gallery_posts` 1378
 
@@ -81,12 +83,12 @@ streamlit을 import하지 않는다. 그래서 수집기가 화면 없이 그대
 | 탭 | 줄 |
 |---|---|
 | 수급 현황 | `_render_tab_supply` 2436 |
-| 가격 과열도 | `_render_tab_overheat` 2546 |
+| 가격 과열도 | `_render_tab_overheat` 2745 (+ 추세추종 전략 `_render_overheat_strategy`) |
 | 선물 경보 | `_render_tab_futures` 2808 |
 | 통합 신호 | `_render_tab_composite` 2984 |
 | 매매 신호 | `_render_tab_signal` 3130 |
-| 하락 조기신호 | `_render_tab_decline` 3311 |
-| 상승 조기신호 | `_render_tab_rally` 3455 |
+| 수급 약화 경고 (옛 하락 조기신호) | `_render_tab_decline` → `_render_flow_signal_tab("down")` 3565 |
+| 수급 강세 신호 (옛 상승 조기신호) | `_render_tab_rally` → `_render_flow_signal_tab("up")` — 둘 다 기관 20일 기울기. 전략은 `_render_overheat_strategy` 2958 |
 | DRAM 시세 | `_render_tab_dram` — **안쪽 탭 3개**: `_render_dram_spot_tab`(현물가) · `_render_dram_contract_tab`(고정가 전망) · `_render_dram_compare_tab`(현물가 vs 고정가). 안쪽 탭마다 `try/except`로 격리 |
 | HBM | `_render_tab_hbm` (`grep -n '^def _render_tab_hbm' app.py`) — 파일만 읽는다. 데이터는 `hbm.py`가 수집기에서 채운다 |
 | 빅테크 Capex | `_render_tab_capex` 3730 |
