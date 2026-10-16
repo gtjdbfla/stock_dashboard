@@ -3651,7 +3651,7 @@ def _render_flow_signal_tab(mode: str) -> None:
             rc = r.get("recent") or {}
             table_rows.append({
                 "조건": ("★ " if r is main else "") + r["name"],
-                "구분": "권장" if r["kind"] != "참고" else "참고(무효)",
+                "구분": "권장" if r["kind"] != "참고" else "참고(옛 신호)",
                 "신호일(사건)": f"{r['n_days']:,}일 ({r['n_events']})",
                 f"+{thr:.0%} 상승": _rate_cell(r["up"]),
                 f"-{thr:.0%} 하락": _rate_cell(r["dn"]),
