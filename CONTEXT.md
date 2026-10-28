@@ -22,6 +22,7 @@ git 저장소 — `origin https://github.com/gtjdbfla/stock_dashboard.git`, `mai
 - **외부 공개 = Tailscale Funnel 443 → localhost:8080 → Caddy → Streamlit 8501.** HTTPS는 Funnel이 처리하므로 Caddy는 평문만 받고, `127.0.0.1`에 묶어 직접 노출을 막는다. 현재 **로그인 없음**(되돌리려면 Caddyfile `basic_auth` + `.env`의 `DASHBOARD_USER`/`DASHBOARD_PASSWORD_HASH`).
 - `duckdns_update.sh`가 크론(`*/10`)으로 공인 IP 갱신.
 - **배포는 Claude가 직접 한다**(사용자 상시 위임): 소스 디렉터리 반영 → `docker compose build && up -d` → md5 대조·헬스체크. **`docker cp`로 컨테이너만 패치 금지**(재빌드에 날아간다).
+- **GitHub `main`과 홈서버 `~/stock_dashboard/`는 항상 같은 상태로 둔다**(사용자 지시, 2026-10-28). 서버에서 고치고 배포했으면 **같은 작업 안에서 커밋·`git push`까지 끝낸다.** 작업을 마칠 때 `git status`가 깨끗하고 `origin/main`과 어긋나지 않아야 한다. 서버에 반영만 하고 푸시를 빼먹거나, 커밋 안 된 수정을 남겨 두지 말 것.
 - `.env`는 gitignore. 필수 키는 `GEMINI_API_KEY` 하나. **값을 파일·커밋에 절대 쓰지 말 것.**
 
 ## 3. 파일 지도
