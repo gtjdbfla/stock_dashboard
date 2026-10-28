@@ -74,21 +74,35 @@ def save_tick(ticker: str, price: float, traded_at: object, session: str) -> Non
         _write(row)
 
 
+def _read_ticks() -> pd.DataFrame:
+    """tick CSV를 읽는다. 깨진 줄(시각을 못 읽는 행)은 버려서 '시각'이 항상 datetime이다."""
+    # 종목코드를 문자열로 읽어야 한다. 그냥 두면 '000660'이 정수 660이 되어
+    # 앞의 0이 날아가고, 중복 제거·조회에서 다른 종목처럼 취급된다.
+    ticks = pd.read_csv(TICK_FILE, dtype={"종목": str})
+    ticks["시각"] = pd.to_datetime(ticks["시각"], errors="coerce")
+    ticks["가격"] = pd.to_numeric(ticks["가격"], errors="coerce")
+    ticks = ticks.dropna(subset=["시각", "종목", "가격"])
+    ticks["종목"] = ticks["종목"].astype(str).str.zfill(6)
+    return ticks.reset_index(drop=True)
+
+
 def _write(row: pd.DataFrame) -> None:
     try:
         os.makedirs(os.path.dirname(TICK_FILE) or ".", exist_ok=True)
         if os.path.exists(TICK_FILE):
             # 종목코드를 문자열로 읽어야 한다. 그냥 두면 '000660'이 정수 660이 되어
             # 앞의 0이 날아가고, 중복 제거·조회에서 다른 종목처럼 취급된다.
-            ticks = pd.read_csv(TICK_FILE, parse_dates=["시각"], dtype={"종목": str})
-            ticks["종목"] = ticks["종목"].astype(str).str.zfill(6)
+            ticks = _read_ticks()
             ticks = pd.concat([ticks, row], ignore_index=True)
         else:
             ticks = row
         ticks = ticks.drop_duplicates(subset=["시각", "종목"], keep="last")
         cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=TICK_KEEP_DAYS)
         ticks = ticks[ticks["시각"] >= cutoff].sort_values("시각")
-        ticks.to_csv(TICK_FILE, index=False)
+        # 임시 파일에 다 쓴 뒤 교체한다. 직접 덮어쓰면 대시보드가 쓰는 도중의 잘린 파일을 읽는다.
+        tmp = TICK_FILE + ".tmp"
+        ticks.to_csv(tmp, index=False)
+        os.replace(tmp, TICK_FILE)
     except (OSError, ValueError):
         pass  # 기록 실패가 화면을 막지 않게 한다
 
@@ -110,13 +124,12 @@ def load_ticks(ticker: str, since_date: dt.date) -> pd.DataFrame:
     if not os.path.exists(TICK_FILE):
         return empty
     try:
-        ticks = pd.read_csv(TICK_FILE, parse_dates=["시각"], dtype={"종목": str})
-    except (OSError, ValueError):
+        ticks = _read_ticks()
+    except (OSError, ValueError, KeyError):
         return empty
     if ticks.empty:
         return empty
-    codes = ticks["종목"].astype(str).str.zfill(6)
-    same = ticks[(codes == str(ticker).zfill(6)) & (ticks["시각"].dt.date >= since_date)]
+    same = ticks[(ticks["종목"] == str(ticker).zfill(6)) & (ticks["시각"].dt.date >= since_date)]
     if same.empty:
         return empty
     return same[["시각", "가격", "세션"]].sort_values("시각").reset_index(drop=True)
