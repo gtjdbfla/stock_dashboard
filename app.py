@@ -93,6 +93,7 @@ from ai_inputs import (
     fetch_dram_module_prices,
     fetch_fnguide_page,
     fetch_foreign_desk,
+    fetch_holding_anchor,
     fetch_futures_foreign_history,
     fetch_futures_foreign_history_live,
     fetch_intraday_price,
@@ -156,6 +157,8 @@ _CACHED = {
     'fetch_fnguide_page': dict(ttl=6 * 3600, show_spinner="재무 데이터를 가져오는 중..."),
     'fetch_foreign_desk': dict(ttl=20, show_spinner=False),
     'fetch_foreign_hold_ratio': dict(ttl=600, show_spinner=False),
+    # 외국인 보유율 장기 복원의 기준점(KIS 2회 호출). 하루에 몇 번 안 바뀌는 값이라 10분이면 넉넉하다.
+    'fetch_holding_anchor': dict(ttl=600, show_spinner=False),
     # 코스피200 선물 외국인 이력. 티커와 무관한 시장 전체 지표라 하루 한 번이면 충분하다.
     'fetch_futures_foreign_history': dict(ttl=24 * 3600, show_spinner="불러오는 중..."),
     'fetch_intraday_price': dict(ttl=10, show_spinner="불러오는 중..."),
@@ -2640,6 +2643,82 @@ community_summary = "커뮤니티 심리 데이터를 가져오지 못함"
 # 돌았고, 보이는 탭 8개가 통째로 재렌더됐다(실측: DRAM 표시 품목 전환에 13.7초).
 # 안쪽에 또 프래그먼트를 두면 안 된다 — 중첩은 Streamlit이 막는다.
 @st.fragment
+def _render_holding_ratio_section() -> None:
+    """투자자별 보유 비율(추정). 외국인은 보유율을 21년치로 복원하고, 기관·개인은 순매수 누적이 상장주식수의
+    몇 %p인지(변화)만 보인다. 2026-11-09 검증에서 이 값은 저평가·고평가를 예측하지 못했으므로 참고용이다."""
+    try:
+        hist = fetch_long_history_live(TICKER, years=25)
+        anchor = fetch_holding_anchor(TICKER)
+    except Exception:
+        return
+    if hist is None or len(hist) < 700 or not anchor:
+        return
+    try:
+        ratio = signal_lab.reconstruct_foreign_holding(
+            hist, anchor["shares"], anchor["ratio_by_date"], anchor.get("scale", 1.0))
+        ratio = ratio[ratio.index >= signal_lab.HOLDING_SHARES_RELIABLE_FROM]
+        if len(ratio) < 500:
+            return
+        chg = signal_lab.net_buy_share_change(hist, anchor["shares"])
+    except Exception:
+        return
+
+    st.divider()
+    _subheader_with_help(
+        "투자자별 보유 비율(추정) — 참고용",
+        "**외국인**: 일별 보유율은 최근 30~60일만 공개돼서, 지금의 보유율을 기준점으로 21년치 일별 외국인 순매수를 더하고 빼 "
+        "거꾸로 복원했습니다(최근 60거래일 실제 값과 평균 0.14%p 차이). 2013년 이전은 상장주식수 변화가 커서 뺐습니다.\n\n"
+        "**기관·개인**: 일별 보유 비율은 공개되지 않습니다. 순매수 누적이 상장주식수의 몇 %p인지(= 보유 비율의 *변화*)만 알 수 있고 "
+        "*수준*은 모릅니다. 개인·기관·외국인 외에 법인·국가 등이 있어 세 값의 합은 0이 아닙니다.\n\n"
+        "**한계**: 이 수치로 저평가·고평가를 판단할 수는 없었습니다(아래 '검증 결과').",
+        key="holding",
+    )
+    cur, last_day = float(ratio.iloc[-1]), ratio.index[-1]
+
+    def _lag(n: int) -> float | None:
+        return cur - float(ratio.iloc[-1 - n]) if len(ratio) > n else None
+
+    d60, d250 = _lag(60), _lag(250)
+    pos = float((ratio.iloc[:-1] < cur).mean())
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric(f"외국인 보유율 ({last_day:%m-%d})", f"{cur:.2f}%",
+               delta=f"60거래일 {d60:+.2f}%p" if d60 is not None else None, delta_color="off")
+    mc2.metric("250거래일 변화", f"{d250:+.2f}%p" if d250 is not None else "-")
+    mc3.metric("2013년 이후 위치", f"{pos * 100:.0f}백분위",
+               help="2013년 이후 일별 보유율 중 지금보다 낮았던 날의 비율입니다. 낮을수록 외국인이 평소보다 적게 들고 있다는 뜻일 뿐, 싸다는 뜻이 아닙니다.")
+
+    price = hist.assign(날짜=pd.to_datetime(hist["날짜"])).set_index("날짜")["종가"]
+    price = price[price.index >= ratio.index[0]]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(x=ratio.index, y=ratio.values, name="외국인 보유율", line=dict(color="#1f77b4"),
+                             hovertemplate="%{x|%Y-%m-%d}  %{y:.2f}%<extra>보유율</extra>"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=price.index, y=price.values, name="종가", line=dict(color="#d62728", width=1),
+                             opacity=0.55, hovertemplate="%{x|%Y-%m-%d}  %{y:,.0f}원<extra>종가</extra>"), secondary_y=True)
+    _style_chart_mobile(fig, title="외국인 보유율(복원) vs 종가")
+    fig.update_yaxes(title_text="보유율(%)", ticksuffix="%", secondary_y=False)
+    fig.update_yaxes(title_text="종가(원)", type="log", secondary_y=True)
+    st.plotly_chart(fig, width="stretch", key="chart_foreign_hold", config=PLOTLY_CONFIG)
+
+    show = pd.DataFrame({"투자자": chg["투자자"]})
+    for w in (60, 250):
+        show[f"최근 {w}일 순매수(주식수 대비)"] = chg[f"{w}일 변화(%p)"].map(lambda v: f"{v:+.2f}%p" if pd.notna(v) else "-")
+    show["250일 기준 위치(2013년~)"] = chg["250일 백분위"].map(lambda v: f"{v * 100:.0f}백분위" if pd.notna(v) else "-")
+    st.dataframe(show, hide_index=True, width="stretch")
+    st.caption("순매수 누적을 상장주식수로 나눈 값입니다. 양수 = 그 기간에 그만큼 더 들고 갔다는 뜻(추정).")
+
+    with st.expander("검증 결과 — 이 수치로 저평가를 알 수 있나? (SK하이닉스, 2026-11-09)"):
+        st.markdown(
+            "**아니요.** 결과를 보기 전에 정한 방식으로 검증했습니다.\n\n"
+            "- 외국인 보유율 수준, 외국인·기관·개인의 60/250일 순매수 비중 등 7개 지표 × 이후 60·120·250일 수익을 21년 이력으로 "
+            "검증했으나 전체 기준 **p=0.21**로 통과하지 못했습니다(개별 최고 p=0.025도 전체로 보정하면 우연 수준).\n"
+            "- 국내 대형주 22종목에 같은 지표를 적용하면 평균 상관이 0 근처이고, 하이닉스와 부호가 같은 비율은 41~59%(동전 던지기 수준)였습니다.\n"
+            "- 외국인이 많이 사면 오른다는 가설과 **반대 방향**(통계적으로는 우연)이었습니다.\n"
+            "- 지금 값은 \"외국인이 평소보다 적게 들고 있고 최근 많이 팔았다\"는 **현황**일 뿐, 쌀 때인지 비쌀 때인지는 알려주지 않습니다.\n"
+            "- 싼지 여부는 이익 전망에 달려 있습니다. **재무 데이터** 탭의 선행 PER·PBR을 보되, 컨센서스 이익 한 숫자에 좌우되고 "
+            "사이클 정점의 낮은 PER는 함정일 수 있습니다."
+        )
+
+
 def _render_tab_supply():
     global investor_df
 
@@ -2748,6 +2827,8 @@ def _render_tab_supply():
             st.table(slope_df, width="stretch", hide_index=True)
     except Exception as e:
         st.error(f"투자자 수급 데이터 조회에 실패했습니다: {e}")
+
+    _render_holding_ratio_section()
 
 # 탭 하나를 프래그먼트로 둔다. 안에 있는 위젯(표시 품목·기간 슬라이더 등)을 건드리면
 # 이 탭만 다시 그린다. 예전에는 전부 모듈 수준이라 위젯 하나에 스크립트 전체가 다시

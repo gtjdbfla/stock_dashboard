@@ -1594,6 +1594,49 @@ def fetch_foreign_desk(ticker: str) -> dict:
     return {"매도": sell, "매수": buy, "순매수": net, "기준": stamp}
 
 
+def fetch_holding_anchor(ticker: str) -> dict:
+    """외국인 보유율 장기 복원의 기준점: 상장주식수, 날짜별 보유율(KIS 일별 시세 최근 30일), 소진율→보유율 보정.
+
+    일별 보유율을 주는 곳은 외국인뿐이고 그것도 최근 30일(KIS)·60일(네이버)이다. 긴 이력은 이 기준점에
+    21년치 일별 외국인 순매수를 더하고 빼서 복원한다(signal_lab.reconstruct_foreign_holding).
+    `hts_frgn_ehrt`는 취득한도 대비 소진율이라 한도가 100%가 아닌 종목은 보유율과 다르다 — 현재 보유수량
+    (frgn_hldn_qty / lstn_stcn)과 오늘 소진율의 비를 scale로 돌려줘 맞춘다(한도 100%면 1.0).
+    """
+    token = _kis_get_token()
+    if not token:
+        return {}
+
+    def get(path: str, tr_id: str, params: dict) -> dict:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {token}",
+            "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET, "tr_id": tr_id,
+        }
+        r = requests.get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/{path}",
+                         headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        body = r.json()
+        return body if body.get("rt_cd") == "0" else {}
+
+    base = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
+    now = (get("inquire-price", "FHKST01010100", base).get("output") or {})
+    daily = (get("inquire-daily-price", "FHKST01010400",
+                 {**base, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "1"}).get("output") or [])
+    shares, hold_now = _to_number(now.get("lstn_stcn")), _to_number(now.get("frgn_hldn_qty"))
+    ehrt_today = _to_number(now.get("hts_frgn_ehrt"))
+    if not shares or not daily:
+        return {}
+    ratio_by_date = {}
+    for row in daily:
+        v = _to_number(row.get("hts_frgn_ehrt"))
+        d = str(row.get("stck_bsop_date") or "")
+        if v is not None and len(d) == 8:
+            ratio_by_date[dt.datetime.strptime(d, "%Y%m%d").date()] = v
+    scale = 1.0
+    if hold_now and ehrt_today:
+        scale = (hold_now / shares * 100) / ehrt_today
+    return {"shares": shares, "ratio_by_date": ratio_by_date, "scale": scale}
+
+
 _US_DAILY_CACHE: dict = {}
 
 

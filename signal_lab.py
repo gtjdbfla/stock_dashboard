@@ -742,3 +742,59 @@ def deviation_robustness(hist: pd.DataFrame, ma_window: int = 80, horizon: int =
         rows.append({"기간": label, "시작": d0, "기저 하락": base, "하위5%": r[0], "하위10%": r[1], "하위15%": r[2], "하위20%": r[3],
                      "상위20%": r[4], "상위15%": r[5], "상위10%": r[6], "상위5%": r[7], "순위상관": rho, "상위5% 독립사건": ev})
     return pd.DataFrame(rows)
+
+
+# ── 투자자별 보유 비율(추정) ───────────────────────────────────────────────────
+# 2026-11-09 검증(CONTEXT.md §5): 이 값은 수급의 '수준'을 보여줄 뿐, 이후 수익(저평가/고평가)을
+# 예측하지 못했다(사전 등록 7지표 가족 p=0.21, 국내 대형주 22종목 재현 안 됨). 화면에는 참고용으로만 쓴다.
+HOLDING_SHARES_RELIABLE_FROM = "2013-01-01"   # 그 전엔 상장주식수 변화가 커서 복원 수준이 틀어진다
+
+
+def reconstruct_foreign_holding(hist: pd.DataFrame, shares: float, ratio_by_date: dict, scale: float = 1.0) -> pd.Series:
+    """외국인 보유율(%) 일별 시계열을 복원한다. index=날짜(datetime), 값=%.
+
+    기준점: KIS 일별 시세가 준 날짜별 보유율 중 장기 이력(hist)과 겹치는 날짜 가운데 **끝에서 두 번째**
+    (가장 최근 날은 장중 값일 수 있어 피한다). 그 날의 보유수량 = 보유율 × 상장주식수이고, 다른 날은
+    일별 외국인 순매수(주)의 누적 차이로 앞뒤로 잇는다. 상장주식수는 일정하다고 본다.
+    검증: 2026-11-09 SK하이닉스 최근 60거래일 네이버 실제 보유율과 평균 -0.14%p·최대 0.30%p 차이.
+    """
+    if hist is None or hist.empty or not shares or not ratio_by_date or "외국인" not in hist.columns:
+        return pd.Series(dtype=float)
+    h = hist[["날짜", "외국인"]].dropna().copy()
+    h["날짜"] = pd.to_datetime(h["날짜"])
+    h = h.sort_values("날짜").drop_duplicates("날짜", keep="last").reset_index(drop=True)
+    have = set(h["날짜"])
+    common = sorted(d for d in ratio_by_date if pd.Timestamp(d) in have)
+    if len(common) < 2:
+        return pd.Series(dtype=float)
+    anchor_day = pd.Timestamp(common[-2])
+    anchor_hold = ratio_by_date[common[-2]] * scale / 100 * shares
+    cum = h["외국인"].astype(float).cumsum()
+    a = int(h.index[h["날짜"] == anchor_day][0])
+    hold = anchor_hold + (cum - cum.iloc[a])
+    return pd.Series((hold / shares * 100).to_numpy(), index=h["날짜"])
+
+
+def net_buy_share_change(hist: pd.DataFrame, shares: float, windows=(60, 250)) -> pd.DataFrame:
+    """투자자별 순매수 누적이 상장주식수의 몇 %p인지(보유 비율 '변화'의 추정).
+
+    행=투자자(외국인·기관·개인), 열=window별 최근 값과 HOLDING_SHARES_RELIABLE_FROM 이후 분포에서의 백분위.
+    기관·개인은 일별 보유 비율이 공개되지 않아 이 변화량만 알 수 있다(수준은 모른다).
+    """
+    h = hist.copy()
+    h["날짜"] = pd.to_datetime(h["날짜"])
+    h = h.sort_values("날짜").reset_index(drop=True)
+    out = []
+    for who in ("외국인", "기관", "개인"):
+        if who not in h.columns:
+            continue
+        row = {"투자자": who}
+        nb = h[who].astype(float)
+        for w in windows:
+            chg = nb.rolling(w).sum() / shares * 100
+            ref = chg[(h["날짜"] >= HOLDING_SHARES_RELIABLE_FROM)].dropna()
+            cur = chg.iloc[-1]
+            row[f"{w}일 변화(%p)"] = float(cur) if pd.notna(cur) else np.nan
+            row[f"{w}일 백분위"] = float((ref < cur).mean()) if len(ref) >= 500 and pd.notna(cur) else np.nan
+        out.append(row)
+    return pd.DataFrame(out)
