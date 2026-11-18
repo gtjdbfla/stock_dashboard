@@ -2023,6 +2023,15 @@ def render_intraday_chart():
                     )
             _bold_label_with_help("장중 주가 추이", "\n\n".join(help_lines), key="intraday")
             st.plotly_chart(fig_intraday, width="stretch", key="chart_intraday_price", config=PLOTLY_CONFIG)
+            # 야후 분봉이 거래 시간 중에 멈추면 ai_inputs가 네이버 최신 체결가 몇 점을 이어 붙인다(출처 열). 그 사실을 숨기면
+            # 직선 구간을 실제 흐름으로 읽게 되므로 ADR 화면일 때 밝힌다.
+            if not show_host_first and not adr_df.empty and "출처" in adr_df.columns:
+                from_naver = adr_df[adr_df["출처"] == "네이버"]
+                if not from_naver.empty:
+                    yahoo_last = adr_df[adr_df["출처"] != "네이버"]["시각"].max()
+                    st.caption(
+                        f":orange[야후 분봉이 {yahoo_last:%m-%d %H:%M}(KST)에서 멈춰 있어, 그 뒤는 네이버 최신 체결가 "
+                        f"{len(from_naver)}점만 이어 붙였습니다. 사이의 직선은 실제 흐름이 아닙니다.]")
     except Exception as exc:
         _note_optional_failure("장중 주가 추이", exc)
 

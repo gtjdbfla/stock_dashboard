@@ -3622,6 +3622,45 @@ _NEWS_WHEN_PAT = re.compile(r"^(\d+\s*(?:분|시간|일|주|개월)\s*전|\d{4}\
 load_over_market_ticks = om.load_ticks
 
 
+ADR_STALE_MIN = 15      # 거래 시간인데 마지막 야후 봉이 이보다 오래됐으면 야후 분봉이 멈춘 것으로 본다
+
+
+def _fetch_adr_naver_points() -> list[dict]:
+    """네이버 해외주식의 최신 체결가를 (정규장 종가, 시간외 최신가)로 돌려준다. 야후 분봉이 멈췄을 때만 쓴다.
+
+    2026-11-18 실측: 야후가 10:52 ET부터 SKHY 봉을 전부 null로 줬고(정규장 끝·애프터장까지 153개) meta도 10:52에
+    멈췄는데, 네이버는 정규장 종가 $122.47(16:00 ET)과 애프터장 $122.92(18:11 ET)를 정상으로 줬다. 그동안 화면은
+    야후의 마지막 값 $121.06을 '정규장·개장 중'으로 계속 보였다. 분봉이 아니라 점 몇 개뿐이라 흐름은 못 채운다.
+    """
+    try:
+        r = requests.get(f"https://api.stock.naver.com/stock/{ADR_SYMBOL}.O/basic", timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.stock.naver.com/"})
+        r.raise_for_status()
+        j = r.json()
+    except Exception:
+        return []
+    et = ZoneInfo("America/New_York")
+    pts = []
+
+    def point(price, when, session):
+        price = _to_number(price)
+        if price is None or not when:
+            return
+        t = dt.datetime.fromisoformat(str(when)).astimezone(et)
+        pts.append({"시각": t.astimezone(om.KST).replace(tzinfo=None), "가격": float(price), "세션": session,
+                    "거래일": t.date(), "출처": "네이버"})
+
+    try:
+        point(j.get("closePrice"), j.get("localTradedAt"), "정규장")
+        over = j.get("overMarketPriceInfo") or {}
+        if over.get("overMarketStatus") == "OPEN":
+            kind = str(over.get("tradingSessionType") or "")
+            point(over.get("overPrice"), over.get("localTradedAt"), "프리장" if kind.startswith("PRE") else "애프터장")
+    except Exception:
+        return []
+    return pts
+
+
 def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
     """SKHY 분봉을 여러 거래일치 받아 세션·거래일까지 붙여서 돌려준다.
 
@@ -3672,7 +3711,18 @@ def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
                 # 프리장 04:00 ~ 애프터장 20:00은 모두 같은 미국 날짜라 이 값으로 하루가 갈린다
                 "거래일": et_dt.date(),
             })
-        return pd.DataFrame(rows).sort_values("시각").reset_index(drop=True) if rows else empty
+        if not rows:
+            return empty
+        df = pd.DataFrame(rows).sort_values("시각").reset_index(drop=True)
+        # 야후 분봉이 거래 시간 중에 멈췄으면 네이버 최신 체결가로 이어 붙인다(출처 열로 구분).
+        now_et = dt.datetime.now(et_tz)
+        if now_et.weekday() < 5 and dt.time(4, 0) <= now_et.time() < dt.time(20, 0):
+            last_et = df["시각"].iloc[-1].replace(tzinfo=om.KST).astimezone(et_tz)
+            if (now_et - last_et) > dt.timedelta(minutes=ADR_STALE_MIN):
+                extra = [p for p in _fetch_adr_naver_points() if p["시각"] > df["시각"].iloc[-1]]
+                if extra:
+                    df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True).sort_values("시각").reset_index(drop=True)
+        return df
     except Exception:
         return empty
 
