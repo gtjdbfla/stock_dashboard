@@ -162,6 +162,9 @@ _CACHED = {
     # 코스피200 선물 외국인 이력. 티커와 무관한 시장 전체 지표라 하루 한 번이면 충분하다.
     'fetch_futures_foreign_history': dict(ttl=24 * 3600, show_spinner="불러오는 중..."),
     'fetch_intraday_price': dict(ttl=10, show_spinner="불러오는 중..."),
+    # 한 번 그릴 때 수급 현황·가격 과열도 탭이 서로 다른 곳에서 3번쯤 부른다(호출당 0.3~0.5초: 파일 + 최근 봉 + KIS 확정 수급
+    # 덧씌우기). 20초면 같은 렌더 안의 중복만 걷어내고, 새 값이 20초 넘게 묵지는 않는다. ai_inputs 쪽은 그대로 캐시 없음.
+    'fetch_long_history_live': dict(ttl=20, show_spinner=False),
     # 아래 둘은 5초 프래그먼트 안에서 불린다. KIS는 초당 유량 제한이 있고 원자료도
     # 자주 안 바뀌므로(추정 가집계는 하루 몇 회, 일별 확정은 하루 한 번) 넉넉히 잡는다.
     'fetch_investor_estimate': dict(ttl=60, show_spinner=False),
@@ -2117,6 +2120,50 @@ def render_stock_investor_flow():
         _note_optional_failure("종목 투자자 동향", exc)
 
 _boot_lap("상단(사이드바·타이틀·CSS) 완료")
+
+
+def _prefetch_slow_caches(ticker: str) -> None:
+    """탭이 곧 부를 느린 외부 조회를 병렬로 미리 받아 캐시에 채운다.
+
+    첫 렌더(캐시가 빈 상태)는 탭을 위에서부터 하나씩 그리며 외부 조회를 순서대로 기다려서 12초 넘게 걸렸다
+    (2026-11-18 실측: DRAM 2.2초·과열도 3.9초·수급 2.1초 …). 이 조회들은 서로 독립이라 한꺼번에 던지면
+    위쪽 현재가·장중 차트를 그리는 동안 뒤에서 끝난다. 탭이 같은 인자로 부르면 캐시 적중이고, 아직 도는 중이면
+    그 호출을 기다릴 뿐 결과는 같다. **인자는 탭이 부르는 것과 정확히 같아야 캐시 키가 맞는다.**
+    화면에 안 보이는 탭의 조회는 던지지 않는다(아무도 안 보는 데이터로 외부 요청만 늘리지 않으려고).
+    """
+    shown = set(globals().get("visible_tab_labels") or ALL_TAB_LABELS)
+    jobs = [lambda: fetch_long_history_live(ticker, years=25)]     # 수급 현황·가격 과열도가 공유
+    jobs.append(lambda: fetch_investor_daily_kis(ticker))          # 상단 '종목 투자자 동향'이 곧 부른다
+    if "수급 현황" in shown:
+        lookback = st.session_state.get("lookback_days_slider", DEFAULT_LOOKBACK_DAYS)   # 탭이 읽는 것과 같은 값
+        jobs += [lambda: fetch_investor_netbuy(ticker, lookback), lambda: fetch_daily_ohlcv(ticker, lookback),
+                 lambda: fetch_holding_anchor(ticker)]
+    if any(lbl.startswith("DRAM") for lbl in shown):
+        jobs += [fetch_dram_module_prices, fetch_dram_chip_prices]
+    if "가격 과열도" in shown:
+        jobs.append(lambda: ai_inputs.fetch_us_daily("%5ESOX"))
+    if "빅테크 Capex" in shown:
+        jobs.append(fetch_bigtech_capex)
+    if "애널리스트" in shown:
+        jobs.append(lambda: fetch_analyst_reports(ticker, count=40))
+    if shown & {"재무 데이터", "애널리스트", "AI 분석"}:
+        jobs.append(lambda: fetch_stock_snapshot(ticker))
+    if "재무 데이터" in shown:
+        jobs.append(lambda: fetch_fnguide_page(ticker))
+
+    def _run(job) -> None:
+        try:
+            job()
+        except Exception:
+            pass     # 여기서 실패해도 탭이 자기 자리에서 다시 부르고 자기 방식으로 오류를 보인다
+
+    pool = _streamlit_pool(len(jobs))
+    for job in jobs:
+        pool.submit(_run, job)
+    pool.shutdown(wait=False)      # 기다리지 않는다 — 화면 그리기와 겹쳐서 도는 게 목적
+
+
+_prefetch_slow_caches(TICKER)
 
 # 셋을 따로 부른다. 각자 자기 주기로 돌고, 하나가 갱신돼도 나머지는 그대로 있는다.
 _lf_t = time.monotonic()
