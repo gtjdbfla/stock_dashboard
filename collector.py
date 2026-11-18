@@ -23,6 +23,7 @@ import futures_history
 import hbm
 import long_history
 import signal_ledger
+import keep_warm
 import over_market as om
 
 # 로그 한 줄 때문에 수집기가 죽는 일이 없게 한다.
@@ -70,6 +71,8 @@ _jobs = {
     # KIS 페이지를 180장쯤 넘겨 받는 첫 생성이 1~2분 걸린다. 메인 루프에서 돌리면 그동안 시세 기록이 멈춘다.
     "장기이력": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_LONG_HISTORY_STALL_LIMIT_SEC", "1800"))},
     "신호장부": {"thread": None, "started": None, "limit": int(os.environ.get("COLLECTOR_LEDGER_STALL_LIMIT_SEC", "900"))},
+    # 대시보드 스크립트를 한 번 돌리는 데 콜드로 7초쯤 걸린다. 메인 루프(시세 기록)를 붙잡지 않게 별도 스레드로 돌린다.
+    "캐시예열": {"thread": None, "started": None, "limit": 300},
 }
 
 
@@ -186,6 +189,9 @@ def main() -> None:
 
         # 낙폭 관리 규칙의 전향 검증 장부(마감 뒤 하루 한 줄, 수정·백필 금지 — signal_ledger 모듈 설명 참고).
         _tick_async("신호장부", lambda: signal_ledger.tick(now, log=log))
+
+        # 대시보드 캐시 예열: 몇 분마다 가짜 접속으로 스크립트를 돌려, 오랜만에 여는 사람이 캐시가 식은 7초짜리 첫 렌더를 안 겪게 한다.
+        _tick_async("캐시예열", lambda: keep_warm.tick(log=log))
 
         # 코스피200 선물 외국인 순매수 이력 파일. 옛 소스가 통째로 없어져서(HTTP 410)
         # 하루치씩만 주는 새 API로 갈아탔다 - 파일이 없는 최초 1회는 700일을 하루씩
