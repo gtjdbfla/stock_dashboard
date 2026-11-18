@@ -753,10 +753,17 @@ HOLDING_SHARES_RELIABLE_FROM = "2013-01-01"   # 그 전엔 상장주식수 변�
 def reconstruct_foreign_holding(hist: pd.DataFrame, shares: float, ratio_by_date: dict, scale: float = 1.0) -> pd.Series:
     """외국인 보유율(%) 일별 시계열을 복원한다. index=날짜(datetime), 값=%.
 
+    보유 **수량**을 먼저 이어 붙이고(상장주식수와 무관) 그 뒤에 그날의 상장주식수로 나눈다.
     기준점: KIS 일별 시세가 준 날짜별 보유율 중 장기 이력(hist)과 겹치는 날짜 가운데 **끝에서 두 번째**
-    (가장 최근 날은 장중 값일 수 있어 피한다). 그 날의 보유수량 = 보유율 × 상장주식수이고, 다른 날은
-    일별 외국인 순매수(주)의 누적 차이로 앞뒤로 잇는다. 상장주식수는 일정하다고 본다.
-    검증: 2026-11-09 SK하이닉스 최근 60거래일 네이버 실제 보유율과 평균 -0.14%p·최대 0.30%p 차이.
+    (가장 최근 날은 장중 값일 수 있어 피한다). 그 날의 보유수량 = 보유율 × 현재 상장주식수이고, 다른 날은
+    일별 외국인 순매수(주)의 누적 차이로 앞뒤로 잇는다.
+
+    상장주식수는 바뀐다(소각·증자). 2026-11-17에 730.5M → 706.8M(-3.2%)로 줄자 KIS 보유율이 하루 만에
+    47.85% → 49.39%로 뛰었는데, 주식수를 일정하다고 보고 나눴더니 과거 전체가 약 1.5%p 높게 그려졌다.
+    그래서 KIS 날짜별 보유율로 그날의 상장주식수를 역산(보유수량 ÷ 보유율)해, 현재 주식수와 1% 넘게 다른 날들을
+    '변경 전'으로 보고 그 이전 구간은 그때의 주식수로 나눈다. 한계: 이 창(최근 30일) 밖의 옛 변경은 알 수 없고,
+    변경이 바로 어제·오늘 일어났으면 다음 날까지 한 번 틀릴 수 있다.
+    검증: 2026-11-18 최근 16거래일 KIS 실제 보유율과 비교(주식수 변경 전후 모두).
     """
     if hist is None or hist.empty or not shares or not ratio_by_date or "외국인" not in hist.columns:
         return pd.Series(dtype=float)
@@ -771,8 +778,15 @@ def reconstruct_foreign_holding(hist: pd.DataFrame, shares: float, ratio_by_date
     anchor_hold = ratio_by_date[common[-2]] * scale / 100 * shares
     cum = h["외국인"].astype(float).cumsum()
     a = int(h.index[h["날짜"] == anchor_day][0])
-    hold = anchor_hold + (cum - cum.iloc[a])
-    return pd.Series((hold / shares * 100).to_numpy(), index=h["날짜"])
+    hold = pd.Series((anchor_hold + (cum - cum.iloc[a])).to_numpy(), index=h["날짜"])
+
+    shares_t = pd.Series(float(shares), index=h["날짜"])
+    kis = pd.Series({pd.Timestamp(d): ratio_by_date[d] * scale / 100 for d in common})
+    implied = hold.reindex(kis.index) / kis                      # KIS가 준 날짜별 보유율로 역산한 그날의 상장주식수
+    before = implied[(implied / shares - 1).abs() > 0.01]        # 현재 주식수와 다르면 변경 전 날
+    if len(before):
+        shares_t[shares_t.index <= before.index.max()] = float(before.median())
+    return (hold / shares_t * 100).rename(None)
 
 
 def net_buy_share_change(hist: pd.DataFrame, shares: float, windows=(60, 250)) -> pd.DataFrame:
