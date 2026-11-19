@@ -3716,12 +3716,26 @@ def _fetch_adr_bars(days: int = 5) -> pd.DataFrame:
         df = pd.DataFrame(rows).sort_values("시각").reset_index(drop=True)
         # 야후 분봉이 거래 시간 중에 멈췄으면 네이버 최신 체결가로 이어 붙인다(출처 열로 구분).
         now_et = dt.datetime.now(et_tz)
-        if now_et.weekday() < 5 and dt.time(4, 0) <= now_et.time() < dt.time(20, 0):
-            last_et = df["시각"].iloc[-1].replace(tzinfo=om.KST).astimezone(et_tz)
-            if (now_et - last_et) > dt.timedelta(minutes=ADR_STALE_MIN):
-                extra = [p for p in _fetch_adr_naver_points() if p["시각"] > df["시각"].iloc[-1]]
-                if extra:
-                    df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True).sort_values("시각").reset_index(drop=True)
+        to_et = lambda t: t.replace(tzinfo=om.KST).astimezone(et_tz)
+        last_et = to_et(df["시각"].iloc[-1])
+        stale_live = (now_et.weekday() < 5 and dt.time(4, 0) <= now_et.time() < dt.time(20, 0)
+                      and (now_et - last_et) > dt.timedelta(minutes=ADR_STALE_MIN))
+        # 야후가 정규장 한가운데만 비우고 애프터장 봉은 주는 경우(2026-11-18 밤: 10:52~16:00 ET 빔)도 있다 — 마지막 봉이 최신이라
+        # 위 검사로는 안 잡힌다. 그러면 정규장 마지막 봉이 종가 시각(16:00)보다 한참 이른 채로 '본장 종가'가 틀어진다.
+        day = df["거래일"].iloc[-1]
+        reg = df[(df["거래일"] == day) & (df["세션"] == "정규장")]
+        need_close = (not reg.empty and to_et(reg["시각"].iloc[-1]).time() < dt.time(15, 50)
+                      and (now_et.date() > day or now_et.time() >= dt.time(16, 0)))
+        if stale_live or need_close:
+            extra = []
+            for pt in _fetch_adr_naver_points():
+                if pt["세션"] == "정규장":
+                    if pt["거래일"] == day and (need_close or pt["시각"] > df["시각"].iloc[-1]):
+                        extra.append(pt)
+                elif pt["시각"] > df["시각"].iloc[-1]:
+                    extra.append(pt)
+            if extra:
+                df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True).sort_values("시각").reset_index(drop=True)
         return df
     except Exception:
         return empty

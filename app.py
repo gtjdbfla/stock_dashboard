@@ -2028,10 +2028,10 @@ def render_intraday_chart():
             if not show_host_first and not adr_df.empty and "출처" in adr_df.columns:
                 from_naver = adr_df[adr_df["출처"] == "네이버"]
                 if not from_naver.empty:
-                    yahoo_last = adr_df[adr_df["출처"] != "네이버"]["시각"].max()
+                    yahoo_last = adr_df[(adr_df["출처"] != "네이버") & (adr_df["시각"] < from_naver["시각"].min())]["시각"].max()
                     st.caption(
-                        f":orange[야후 분봉이 {yahoo_last:%m-%d %H:%M}(KST)에서 멈춰 있어, 그 뒤는 네이버 최신 체결가 "
-                        f"{len(from_naver)}점만 이어 붙였습니다. 사이의 직선은 실제 흐름이 아닙니다.]")
+                        f":orange[야후 분봉이 {yahoo_last:%m-%d %H:%M}(KST) 이후 비어 있어, 네이버 체결가 "
+                        f"{len(from_naver)}점을 이어 붙였습니다. 점 사이의 직선은 실제 흐름이 아닙니다.]")
     except Exception as exc:
         _note_optional_failure("장중 주가 추이", exc)
 
